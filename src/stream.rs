@@ -184,6 +184,7 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // the parse bench's batched layer
     #[inline(never)]
     fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
         for f in rows {
@@ -205,6 +206,52 @@ impl Decoder<'_, '_> {
             v.push(Event { key, val });
         }
         out.candidate(id, sec, at_row, self.b);
+    }
+
+    /// `event` for a record from `wire::rows_fused`: `padded` records have
+    /// `wire::PAD` readable bytes past every field start, so the type is
+    /// checked as a whole word and the timestamp form is selected, not
+    /// branched on. The flag is constant per call site and folds.
+    #[inline(always)]
+    fn event_row(&self, f: &[&[u8]; 7], padded: bool, out: &mut Scan) {
+        if !padded {
+            return self.event(f, out);
+        }
+        let Some(id) = event_key(self.s, f[0]) else { return };
+        let Some(sec) = self.clock.ingest_s(f[3]) else { return };
+        let mut at_row = None;
+        if let Some(val) = self.payload_padded(f, sec * 1000) {
+            let key = hash(user_key(self.s, f[1]));
+            let bin = (key >> (64 - self.b.user)) as usize;
+            let v = &mut out.ev[bin];
+            at_row = Some((bin, v.len()));
+            v.push(Event { key, val });
+        }
+        out.candidate(id, sec, at_row, self.b);
+    }
+
+    /// `payload` with the fixed-sequence checks `event_row` describes.
+    #[inline(always)]
+    fn payload_padded(&self, f: &[&[u8]; 7], at: i64) -> Option<u64> {
+        const { assert!(wire::PAD >= 25) };
+        let t = f[4];
+        // SAFETY: PAD >= 8 bytes are readable from the field's start.
+        let w = unsafe { u64::from_le_bytes(t.as_ptr().cast::<[u8; 8]>().read_unaligned()) };
+        let n = t.len();
+        let plain = (n == 4) & ((w as u32 == VIEW) | (w as u32 == CART));
+        let purchase = (n == 8) & (w == PURCHASE);
+        // SAFETY: PAD >= 25 bytes are readable from the field's start.
+        let (ts, sure) = unsafe { self.clock.select(f[2]) };
+        let ts = if sure { ts } else { self.clock.parse(f[2])? };
+        // In-window instants never overflow the lateness difference; outside
+        // the window the flag is already false.
+        let ok = (plain | purchase) & !f[1].is_empty() & !f[5].is_empty()
+            & ((ts.wrapping_sub(self.start) as u64) < self.span) & (at.wrapping_sub(ts) <= DAY_MS);
+        if !ok {
+            return None;
+        }
+        let pay = if purchase { parse_price(f[6])? | u32::from(product_cat(self.cx, f[5])) << 24 } else { 0 };
+        Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
     #[inline(always)]
@@ -575,7 +622,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
+                    0=>wire::rows_fused::<7>(buf,|f,padded|dec.event_row(&f,padded,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
