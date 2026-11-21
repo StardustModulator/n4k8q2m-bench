@@ -54,6 +54,20 @@ impl Clock {
         Self { days }
     }
 
+    /// `parse` for a field already known to have F1's length.
+    #[inline(always)]
+    pub(super) fn parse20(&self, b: &[u8; 20]) -> Option<i64> {
+        if b[19] != b'Z' { return epoch_ms(b); }
+        Some(self.iso::<20>(b)? * 1000)
+    }
+
+    /// `parse` for a field already known to have F2's length.
+    #[inline(always)]
+    pub(super) fn parse25(&self, b: &[u8; 25]) -> Option<i64> {
+        if !matches!(b[19], b'+' | b'-') { return epoch_ms(b); }
+        Some(self.iso::<25>(b)? * 1000)
+    }
+
     /// F1, F2 or unsigned ASCII epoch milliseconds (F3).
     #[inline(always)]
     pub(super) fn parse(&self, b: &[u8]) -> Option<i64> {
