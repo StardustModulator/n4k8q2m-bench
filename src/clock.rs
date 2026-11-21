@@ -106,6 +106,59 @@ impl Clock {
     }
 }
 
+impl Clock {
+    /// The day-table probe of twelve bytes at `p`: whether "YYYY-MM-DDT" is
+    /// a cached date, and that date's midnight in seconds (a real date even
+    /// on a miss, so callers may compute with it and test the flag later).
+    ///
+    /// # Safety
+    /// `p` must point at twelve readable bytes.
+    #[inline(always)]
+    pub(super) unsafe fn probe(&self, p: *const u8) -> (bool, i64) {
+        // SAFETY: twelve bytes are readable by contract.
+        let (lo, hi) = unsafe { (p.cast::<u64>().read_unaligned(), p.add(8).cast::<u32>().read_unaligned()) };
+        let lo = u64::from_le(lo);
+        let hi = u32::from_le(hi);
+        let dd = (hi as u16).wrapping_mul(2561) >> 8;
+        let day = &self.days[(((lo >> 48) & 1) << 5) as usize | usize::from(dd & 31)];
+        ((day.lo == lo) & (day.hi == hi & 0xff_ffff), day.midnight)
+    }
+}
+
+/// `hms_s` without the early return: the flag says whether the seconds are
+/// meaningful.
+#[inline(always)]
+pub(super) fn hms(raw: u64) -> (bool, i64) {
+    let digits = raw.wrapping_sub(HMS_MIN);
+    let bad = (digits | raw.wrapping_add(HMS_BIAS)) & HIGH;
+    let pairs = digits.wrapping_mul(2561) >> 8;
+    let h = i64::from(pairs as u8);
+    let m = i64::from((pairs >> 24) as u8);
+    let s = i64::from((pairs >> 48) as u8);
+    ((bad == 0) & (h <= 23), (h * 60 + m) * 60 + s)
+}
+
+/// The offset "±HH:MM" loaded as the eight bytes from the seconds on:
+/// "SS±HH:MM" becomes the HH:MM:00 the same decoder checks.
+#[inline(always)]
+pub(super) fn offset(raw_from_seconds: u64) -> (bool, i64) {
+    hms((raw_from_seconds >> 24) | (HMS_MIN & (u64::MAX << 40)))
+}
+
+/// `epoch_ms` for 9 to 16 digits given its two overlapping words (the first
+/// eight bytes and the last eight) without the early returns; the flag is
+/// meaningless outside that length range.
+#[inline(always)]
+pub(super) fn epoch16(a: u64, z: u64, n: usize) -> (bool, i64) {
+    const ZERO: u64 = u64::from_le_bytes(*b"00000000");
+    const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
+    let hi = a.wrapping_sub(ZERO);
+    let lo = z.wrapping_sub(ZERO);
+    let ok = (hi | lo | a.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
+    let prefix = hi.wrapping_shl((16usize.wrapping_sub(n) as u32).wrapping_mul(8));
+    (ok, (decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64)
+}
+
 // Keep the general calendar conversion off the row-parsing hot path. ISO
 // forms are whole seconds (offsets are whole minutes), so the division is exact.
 #[cold]
