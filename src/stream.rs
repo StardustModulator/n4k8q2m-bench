@@ -60,10 +60,78 @@ fn sized<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
+/// Bytes of staged rows per bin: two cache lines.
+const STAGE: usize = 128;
+
+/// Rows bound for one bin gather in a two-line buffer and move to its vector
+/// together. A row then costs one write into a small resident area; the far
+/// apart bin streams, each on its own page, see one burst per `K` rows. With
+/// hundreds of bins per worker the per-row stream writes miss the L1 and the
+/// TLB on every row, and that, not decoding, dominated the parse on x86.
+struct Scatter<T: Copy> {
+    buf: Vec<T>,  // bins * K
+    fill: Vec<u8>, // staged rows per bin
+    bins: Vec<Vec<T>>,
+}
+
+impl<T: Copy> Scatter<T> {
+    const K: usize = STAGE / size_of::<T>();
+
+    fn new(n: usize, cap: usize, zero: T) -> Self {
+        Self { buf: vec![zero; n * Self::K], fill: vec![0; n], bins: sized(n, cap) }
+    }
+
+    /// Index the next row pushed to `bin` will have in its vector.
+    #[inline(always)]
+    fn len(&self, bin: usize) -> usize {
+        debug_assert!(bin < self.bins.len());
+        // SAFETY: bin < bins.len() == fill.len(); bins are powers of two
+        // and bin is `key >> (64 - bits)`.
+        unsafe { self.bins.get_unchecked(bin).len() + usize::from(*self.fill.get_unchecked(bin)) }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, bin: usize, row: T) {
+        debug_assert!(bin < self.bins.len());
+        // SAFETY: bin < bins.len(), fill < K, so the slot is inside `buf`.
+        unsafe {
+            let f = usize::from(*self.fill.get_unchecked(bin));
+            *self.buf.get_unchecked_mut(bin * Self::K + f) = row;
+            *self.fill.get_unchecked_mut(bin) = (f + 1) as u8;
+            if f + 1 == Self::K {
+                self.flush(bin);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn flush(&mut self, bin: usize) {
+        let staged = &self.buf[bin * Self::K..][..usize::from(self.fill[bin])];
+        let v = &mut self.bins[bin];
+        if v.capacity() - v.len() < Self::K {
+            v.reserve(v.len() / 2 + Self::K);
+        }
+        // SAFETY: capacity for K rows was just ensured; `staged` is in `buf`,
+        // disjoint from `v`'s heap buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(staged.as_ptr(), v.as_mut_ptr().add(v.len()), staged.len());
+            v.set_len(v.len() + staged.len());
+        }
+        self.fill[bin] = 0;
+    }
+
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for bin in 0..self.bins.len() {
+            self.flush(bin);
+        }
+        self.bins
+    }
+}
+
 struct Scan {
-    ev: Vec<Vec<Event>>,  // by raw user
-    cl: Vec<Vec<Click>>,  // by raw user
-    cand: Vec<Vec<Cand>>, // by event ID
+    ev: Scatter<Event>,  // by raw user
+    cl: Scatter<Click>,  // by raw user
+    cand: Scatter<Cand>, // by event ID
     wide: Vec<Vec<Wide>>, // by event ID; allocated on first use
     links: Vec<(u64, u64)>,
 }
@@ -78,7 +146,7 @@ impl Scan {
             Some((bin, row)) => (row as u64) << b.user | bin as u64,
         };
         if (loc < DEAD as u64 || at_row.is_none()) && (0..=u32::MAX as i64).contains(&sec) {
-            self.cand[part].push(Cand { h, sec: sec as u32, loc: loc as u32 });
+            self.cand.push(part, Cand { h, sec: sec as u32, loc: loc as u32 });
         } else {
             self.push_wide(part, Wide { h, at: sec * 1000, at_row });
         }
@@ -88,7 +156,7 @@ impl Scan {
     #[inline(never)]
     fn push_wide(&mut self, part: usize, w: Wide) {
         if self.wide.is_empty() {
-            self.wide = bins(self.cand.len());
+            self.wide = bins(self.cand.bins.len());
         }
         self.wide[part].push(w);
     }
@@ -200,9 +268,8 @@ impl Decoder<'_, '_> {
             // Mixed until renaming.
             let key = hash(user_key(self.s, f[1]));
             let bin = (key >> (64 - self.b.user)) as usize;
-            let v = &mut out.ev[bin];
-            at_row = Some((bin, v.len()));
-            v.push(Event { key, val });
+            at_row = Some((bin, out.ev.len(bin)));
+            out.ev.push(bin, Event { key, val });
         }
         out.candidate(id, sec, at_row, self.b);
     }
@@ -247,7 +314,7 @@ impl Decoder<'_, '_> {
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
         let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
-        out.cl[(key >> (64 - self.b.user)) as usize].push(Click { key, hit });
+        out.cl.push((key >> (64 - self.b.user)) as usize, Click { key, hit });
     }
 
     /// `campaign_of` with the number decoded in one word.
@@ -556,8 +623,10 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     }
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
-    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048);
-    let pb=(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512);
+    let knob=|name:&str,default:usize|std::env::var(name).ok().and_then(|s|s.parse::<usize>().ok())
+        .filter(|&n|n.is_power_of_two()).unwrap_or(default);
+    let eb=knob("SS_EB",(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048));
+    let pb=knob("SS_PB",(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512));
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
     let next=AtomicUsize::new(0);
@@ -568,8 +637,9 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let share=|bytes:usize,row:usize,n:usize|bytes/row/threads*5/4/n+64;
     let scans=thread::scope(|scope|{
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
-            let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
-                cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
+            let mut out=Scan{ev:Scatter::new(pb,share(event_bytes,77,pb),Event{key:0,val:0}),
+                cl:Scatter::new(pb,share(bytes[1],47,pb),Click{key:0,hit:Hit{id:0,ts:0,camp:0}}),
+                cand:Scatter::new(eb,share(event_bytes,77,eb),Cand{h:0,sec:0,loc:0}),wide:Vec::new(),links:Vec::new()};
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
@@ -595,10 +665,10 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let mut cands:Vec<(Vec<Vec<Cand>>,Vec<Vec<Wide>>)>=(0..eb).map(|_|(Vec::new(),Vec::new())).collect();
     let mut lks=Vec::with_capacity(threads);
     for mut s in scans {
-        evs.push(s.ev);
-        cls.push(s.cl);
+        evs.push(s.ev.finish());
+        cls.push(s.cl.finish());
         s.wide.resize_with(eb,Vec::new);
-        for ((c,wd),(cv,wv)) in cands.iter_mut().zip(s.cand.into_iter().zip(s.wide)) {c.push(cv);wd.push(wv);}
+        for ((c,wd),(cv,wv)) in cands.iter_mut().zip(s.cand.finish().into_iter().zip(s.wide)) {c.push(cv);wd.push(wv);}
         lks.push(s.links);
     }
     let aliases=links::build(lks,&slow,threads,pb);
@@ -811,10 +881,12 @@ mod bench {
             std::hint::black_box(acc);
         });
         report("scan_events", &mut || {
-            let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
-                                 cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
+            let mut out = Scan { ev: Scatter::new(1 << b.user, rows_n >> b.user << 1, Event { key: 0, val: 0 }),
+                                 cl: Scatter::new(1, 0, Click { key: 0, hit: Hit { id: 0, ts: 0, camp: 0 } }),
+                                 cand: Scatter::new(1 << b.id, rows_n >> b.id << 1, Cand { h: 0, sec: 0, loc: 0 }),
+                                 wide: Vec::new(), links: Vec::new() };
             batched::<7>(body, |rows| dec.events(rows, &mut out));
-            std::hint::black_box(&out.ev);
+            std::hint::black_box(&out.ev.bins);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
