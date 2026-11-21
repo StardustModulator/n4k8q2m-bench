@@ -573,7 +573,12 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
-                let buf=&maps[c.file as usize][c.start..c.end];
+                let m=&maps[c.file as usize];
+                // Map the chunk's pages in one call rather than by fault-around
+                // exceptions every 16 pages; an old kernel just refuses.
+                #[cfg(target_os="linux")]
+                let _=m.advise_range(Advice::PopulateRead,c.start,c.end-c.start);
+                let buf=&m[c.start..c.end];
                 match c.kind {
                     0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
