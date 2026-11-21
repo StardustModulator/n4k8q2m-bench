@@ -18,6 +18,16 @@ pub(super) fn hash(x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// One multiply by an odd constant: a bijection whose top bits depend on
+/// every bit of the key, while its low bits depend only on low key bits.
+/// Event ids put their entropy in the id's bytes, so the top bits of the
+/// product pick partitions and filter slots well; anything indexing by other
+/// bits mixes further first.
+#[inline(always)]
+fn mix(x: u64) -> u64 {
+    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// The inverse of `hash`.
 fn unhash(x: u64) -> u64 {
     let x = x ^ (x >> 31) ^ (x >> 62);
@@ -32,7 +42,7 @@ fn unhash(x: u64) -> u64 {
 /// event in its worker's bins, or DEAD when the row failed validation.
 #[derive(Clone, Copy)]
 struct Cand {
-    h: u64,   // hash(event key): top bits pick the partition
+    h: u64,   // mix(event key): top bits pick the partition
     sec: u32, // ingest seconds; F1 has no fraction
     loc: u32,
 }
@@ -71,7 +81,7 @@ struct Scan {
 impl Scan {
     #[inline(always)]
     fn candidate(&mut self, id: u64, sec: i64, at_row: Option<(usize, usize)>, b: Bits) {
-        let h = hash(id);
+        let h = mix(id);
         let part = (h >> (64 - b.id)) as usize;
         let loc = match at_row {
             None => DEAD as u64,
@@ -156,10 +166,23 @@ struct Rec<const N: usize> {
     ends: [u16; N],
 }
 
+/// A row decoder. A trait rather than a closure so the implementation can
+/// demand inlining into the batch loop, where its constants stay in registers.
+trait Decode<'b, const N: usize> {
+    fn row(&mut self, f: &[&'b [u8]; N]);
+}
+
+impl<'b, const N: usize, D: Decode<'b, N>> Decode<'b, N> for &mut D {
+    #[inline(always)]
+    fn row(&mut self, f: &[&'b [u8]; N]) {
+        (**self).row(f);
+    }
+}
+
 /// Gathers fast-path records of one window into a batch and decodes them in
 /// bulk; slow-path records are decoded as they come. Rows are independent,
 /// so the interleaving does not matter.
-struct Batch<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> {
+struct Batch<'b, const N: usize, D: Decode<'b, N>> {
     decode: D,
     base: *const u8,
     n: usize,
@@ -167,7 +190,7 @@ struct Batch<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> {
     _buf: std::marker::PhantomData<&'b [u8]>,
 }
 
-impl<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> Batch<'b, N, D> {
+impl<'b, const N: usize, D: Decode<'b, N>> Batch<'b, N, D> {
     fn new(decode: D) -> Self {
         Batch { decode, base: std::ptr::null(), n: 0, recs: [Rec { row: 0, ends: [0; N] }; BATCH], _buf: std::marker::PhantomData }
     }
@@ -178,13 +201,18 @@ impl<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> Batch<'b, N, D> {
             // SAFETY: every record was handed over by the scanner for the
             // window at `base` (see `wire::Sink::fast`).
             let f: [&'b [u8]; N] = unsafe { wire::unquoted(self.base, r.row as usize, &r.ends) };
-            (self.decode)(&f);
+            self.decode.row(&f);
         }
         self.n = 0;
     }
+
+    #[inline(never)]
+    fn slow_row(&mut self, f: [&'b [u8]; N]) {
+        self.decode.row(&f);
+    }
 }
 
-impl<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> wire::Sink<'b, N> for Batch<'b, N, D> {
+impl<'b, const N: usize, D: Decode<'b, N>> wire::Sink<'b, N> for Batch<'b, N, D> {
     #[inline(always)]
     fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; N]) {
         if self.n == BATCH || base != self.base {
@@ -196,7 +224,7 @@ impl<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> wire::Sink<'b, N> for Batch<'
     }
     #[inline(always)]
     fn slow(&mut self, f: [&'b [u8]; N]) {
-        (self.decode)(&f);
+        self.slow_row(f);
     }
     fn finish(&mut self) {
         self.flush();
@@ -204,8 +232,33 @@ impl<'b, const N: usize, D: FnMut(&[&'b [u8]; N])> wire::Sink<'b, N> for Batch<'
 }
 
 #[inline(always)]
-fn batched<'b, const N: usize>(buf: &'b [u8], decode: impl FnMut(&[&'b [u8]; N])) {
+fn batched<'b, const N: usize>(buf: &'b [u8], decode: impl Decode<'b, N>) {
     wire::records::<N>(buf, wire::WINDOW, Batch::new(decode));
+}
+
+struct EventRows<'a, 'c, 'd> {
+    dec: &'a Decoder<'c, 'd>,
+    out: &'a mut Scan,
+}
+
+impl<'b> Decode<'b, 7> for EventRows<'_, '_, '_> {
+    #[inline(always)]
+    fn row(&mut self, f: &[&'b [u8]; 7]) {
+        self.dec.event(f, self.out);
+    }
+}
+
+struct ClickRows<'a, 'b, 'c, 'd> {
+    dec: &'a Decoder<'c, 'd>,
+    out: &'a mut Scan,
+    buf: &'b [u8],
+}
+
+impl<'b> Decode<'b, 4> for ClickRows<'_, 'b, '_, '_> {
+    #[inline(always)]
+    fn row(&mut self, f: &[&'b [u8]; 4]) {
+        self.dec.click(self.buf, f, self.out);
+    }
 }
 
 /// Everything a row decoder reads, hoisted out of the shared context.
@@ -219,15 +272,13 @@ struct Decoder<'a, 'c> {
     click_start: i64,
     click_span: u64,
     b: Bits,
-    ts_fast: bool,
 }
 
 impl Decoder<'_, '_> {
     fn new<'a, 'c>(cx: &'a Ctx<'c>, clock: &'a Clock, s: &'a Shared, origin: i64, b: Bits) -> Decoder<'a, 'c> {
         let w = cx.window;
         Decoder { cx, clock, s, origin, start: w.start, span: (w.end - w.start) as u64,
-                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b,
-                  ts_fast: std::env::var_os("TSFAST").is_some() }
+                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
     #[inline(always)]
@@ -259,16 +310,7 @@ impl Decoder<'_, '_> {
             _ => return None,
         };
         if f[1].is_empty() || f[5].is_empty() { return None; }
-        let ts = if self.ts_fast {
-            // The record runs on past the ts field through the price field:
-            // with 32 bytes of it after the ts start, the branch-free decoder
-            // may load them all (fields are consecutive within one record).
-            let avail = f[6].as_ptr() as usize + f[6].len() - f[2].as_ptr() as usize;
-            // SAFETY: avail bytes from f[2] lie inside the record.
-            if avail >= 32 { unsafe { self.clock.parse_fast(f[2].as_ptr(), f[2].len()) } } else { self.clock.parse(f[2]) }
-        } else {
-            self.clock.parse(f[2])
-        }?;
+        let ts = self.clock.parse(f[2])?;
         // One unsigned compare per bound pair; no instant overflows i64 here.
         if ts.wrapping_sub(self.start) as u64 >= self.span || at - ts > DAY_MS {
             return None;
@@ -374,8 +416,9 @@ fn dedup(parts: Vec<Vec<Cand>>, wide: Vec<Vec<Wide>>, rows: &Rows, id_bits: u32)
         suspects -= (m[0] ^ m[1]).count_ones() as usize;
     }
     if suspects == 0 { return; }
-    // Slot value: part index + 1 in the high half, row in the low half. The
-    // low hash bits are independent of the prefix bits used above.
+    // Slot value: part index + 1 in the high half, row in the low half. Only
+    // suspects reach the table, so mixing `h` once more here is cheap and
+    // makes the slot independent of the prefix bits used above.
     let mask = (suspects * 2).next_power_of_two() - 1;
     let mut table = vec![0u64; mask + 1];
     for (p, part) in parts.iter().enumerate() {
@@ -383,7 +426,7 @@ fn dedup(parts: Vec<Vec<Cand>>, wide: Vec<Vec<Wide>>, rows: &Rows, id_bits: u32)
             let (w, bit) = probe(c.h);
             if marks[w][1] & bit == 0 { continue; }
             let me = ((p as u64 + 1) << 32) | i as u64;
-            let mut s = c.h as usize & mask;
+            let mut s = hash(c.h) as usize & mask;
             loop {
                 let ptr = table[s];
                 if ptr == 0 {
@@ -606,8 +649,11 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
     let env_pow2=|k:&str,d:usize|std::env::var(k).ok().and_then(|s|s.parse::<usize>().ok()).map_or(d,|v|v.next_power_of_two().clamp(2,1<<16));
-    let eb=env_pow2("SS_EB",(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048));
-    let pb=env_pow2("SS_PB",(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512));
+    // Few write streams: all bin headers and tails must stay in L1 while a
+    // row is decoded (x86 cores have 32-48 KiB). Dedup partitions are read
+    // back whole, so each should still fit L2: about 64 K candidates.
+    let eb=env_pow2("SS_EB",(event_bytes / (77 * 65536)).next_power_of_two().clamp(8,512));
+    let pb=env_pow2("SS_PB",(event_bytes / (77 * 131072)).next_power_of_two().clamp(16,256));
     let abl=std::env::var("ABL").ok().and_then(|s|s.parse::<u8>().ok()).unwrap_or(0);
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
@@ -630,8 +676,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 match (c.kind,abl) {
                     (0,1)=>wire::rows::<7>(buf,|f|acc+=(f[0].len()+f[6].len()) as u64),
                     (1,1)=>wire::rows::<4>(buf,|f|acc+=(f[0].len()+f[3].len()) as u64),
-                    (0,_)=>batched::<7>(buf,|f|dec.event(f,&mut out)),
-                    (1,_)=>batched::<4>(buf,|f|dec.click(buf,f,&mut out)),
+                    (0,_)=>batched::<7>(buf,EventRows{dec:&dec,out:&mut out}),
+                    (1,_)=>batched::<4>(buf,ClickRows{dec:&dec,out:&mut out,buf}),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));
@@ -825,9 +871,14 @@ mod bench {
             std::hint::black_box(acc);
         });
         report("batch", &mut || {
-            let mut acc = 0usize;
-            batched::<7>(body, |f| acc += f[0].len() + f[6].len());
-            std::hint::black_box(acc);
+            struct Len(usize);
+            impl<'b> Decode<'b, 7> for Len {
+                #[inline(always)]
+                fn row(&mut self, f: &[&'b [u8]; 7]) { self.0 += f[0].len() + f[6].len(); }
+            }
+            let mut acc = Len(0);
+            wire::records::<7>(body, wire::WINDOW, Batch::new(&mut acc));
+            std::hint::black_box(acc.0);
         });
         // Per-field decoder costs over pre-extracted fields: includes each
         // field's own branch behaviour but no scanning.
@@ -849,7 +900,6 @@ mod bench {
         per("f:event_key", &mut |f| event_key(&shared, f[0]).unwrap_or(0));
         per("f:user_key", &mut |f| user_key(&shared, f[1]));
         per("f:ts", &mut |f| clock.parse(f[2]).unwrap_or(0) as u64);
-        per("f:ts_fast", &mut |f| unsafe { clock.parse_fast(f[2].as_ptr(), f[2].len()) }.unwrap_or(0) as u64);
         per("f:ingest", &mut |f| clock.ingest_s(f[3]).unwrap_or(0) as u64);
         per("f:payload", &mut |f| dec.payload(f, 0).unwrap_or(0));
         report("+id", &mut || {
@@ -890,7 +940,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |f| dec.event(f, &mut out));
+            batched::<7>(body, EventRows { dec: &dec, out: &mut out });
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());
