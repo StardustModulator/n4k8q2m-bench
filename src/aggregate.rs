@@ -32,6 +32,7 @@ pub(super) struct Acc {
     pub(super) rows: Vec<UserRow>,
     pub(super) stats: Vec<[i64; 4]>,
     pub(super) scratch: crate::group::Scratch,
+    pub(super) phases: Phases,
     ndays: usize,
     organic: usize,
     n_cats: usize,
@@ -109,6 +110,7 @@ impl Acc {
             rows: Vec::new(),
             stats: vec![[0; 4]; n_camps * ndays],
             scratch: Default::default(),
+            phases: Phases([0; 3]),
             ndays,
             organic,
             n_cats,
@@ -446,6 +448,20 @@ impl Acc {
                 revenue: day.revenue,
                 top: day.top,
             });
+        }
+    }
+}
+
+/// Nanoseconds a worker spent numbering, scattering and summarizing persons.
+/// The stage report in `stream` has no view inside the bins; each worker's
+/// split is reported when the report is asked for.
+pub(super) struct Phases(pub(super) [u64; 3]);
+
+impl Drop for Phases {
+    fn drop(&mut self) {
+        if self.0 != [0; 3] && std::env::var_os("STAGES").is_some() {
+            let [a, b, c] = self.0.map(|n| n / 1_000_000);
+            eprintln!("group phases ms number={a} scatter={b} person={c}");
         }
     }
 }

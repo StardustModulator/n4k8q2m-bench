@@ -49,7 +49,6 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     let ne = parts.iter().map(|p| p.ev.len()).sum::<usize>();
     if ne == 0 { return; }
     let nc = parts.iter().map(|p| p.cl.len()).sum::<usize>();
-    #[cfg(test)]
     let t0 = Instant::now();
     let mut bits = (ne / 8).max(64).next_power_of_two().trailing_zeros();
     let mut sc = std::mem::take(&mut acc.scratch);
@@ -63,7 +62,6 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         slots.fill(Slot::default());
         bits += 1;
     }
-    #[cfg(test)]
     let t1 = Instant::now();
     let (mut es, mut cs) = (0u32, 0u32);
     for p in &mut slots {
@@ -94,7 +92,6 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
             *cursor += 1;
         }
     }
-    #[cfg(test)]
     let t2 = Instant::now();
     let (mut e0, mut c0) = (0, 0);
     for p in &mut slots {
@@ -108,8 +105,12 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     }
     sc.slots = slots;
     acc.scratch = sc;
+    let t3 = Instant::now();
     #[cfg(test)]
-    bench::phase([t0, t1, t2, Instant::now()]);
+    bench::phase([t0, t1, t2, t3]);
+    for (p, (a, b)) in acc.phases.0.iter_mut().zip([(t0, t1), (t1, t2), (t2, t3)]) {
+        *p += (b - a).as_nanos() as u64;
+    }
 }
 
 // Open addressing with linear probing; a slot number is a person's number.
