@@ -270,6 +270,7 @@ fn finish(b: usize, bins: &[Bin], mut spans: Vec<Span>, acc: &mut Acc, sc: &mut 
 pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usize, shift: u32,
                   acc: impl Fn() -> Acc + Sync, cats: &[Vec<u8>], slow: &SlowIntern, first_day: i32) -> Vec<Acc> {
     let nbins = by_user.len();
+    let t0 = std::time::Instant::now();
     let mut jobs: Vec<(usize, Vec<Histories>)> = by_user.into_iter().enumerate().collect();
     jobs.sort_unstable_by_key(|(_, p)| std::cmp::Reverse(p.iter().map(|h| h.ev.len() + h.cl.len()).sum::<usize>()));
     let grouped = consume(jobs, threads, || (Vec::new(), (0..nbins).map(|_| Vec::new()).collect::<Vec<Vec<Span>>>()),
@@ -287,10 +288,15 @@ pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usiz
         }
     }
     let bins: Vec<Bin> = bins.into_iter().map(|b| b.unwrap_or_else(Bin::empty)).collect();
+    let t1 = std::time::Instant::now();
     let mut jobs: Vec<(usize, Vec<Span>)> = incoming.into_iter().enumerate().collect();
     jobs.sort_unstable_by_key(|(b, s)| std::cmp::Reverse(bins[*b].ev.len() + s.len()));
     let bins = &bins;
-    consume(jobs, threads, || (acc(), Scratch::default()),
+    let out = consume(jobs, threads, || (acc(), Scratch::default()),
         |(a, sc), (b, spans)| finish(b, bins, spans, a, sc, cats, slow, first_day))
-        .into_iter().map(|(a, _)| a).collect()
+        .into_iter().map(|(a, _)| a).collect();
+    if std::env::var_os("STAGES").is_some() {
+        eprintln!("persons gather={} finish={}", (t1 - t0).as_millis(), t1.elapsed().as_millis());
+    }
+    out
 }
