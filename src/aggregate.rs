@@ -64,9 +64,10 @@ pub(super) struct Acc {
     first: Vec<u32>,
     next: Vec<u32>,
     leave: Vec<u32>,
-    // Per campaign: epoch << 32 | sessions already counted as assisted (long
-    // path) or its local number (short path).
-    covered: Vec<u64>,
+    // Per campaign: a 16-bit epoch tag << 16 | sessions already counted as
+    // assisted (long path) or its local number (short path). The table is
+    // cleared whenever the tag wraps, so a stale entry never matches.
+    covered: Vec<u32>,
     // Short path: per entry session the best click, tagged with the epoch;
     // per local campaign its number and assisted sessions.
     top: Vec<(u64, u64, u16)>,
@@ -142,6 +143,18 @@ impl Acc {
         }
     }
 
+    /// A fresh epoch for this person; its 16-bit tag is never zero, and the
+    /// campaign table is cleared each time the tag wraps.
+    #[inline]
+    fn next_tag(&mut self) -> u32 {
+        self.epoch += 1;
+        if self.epoch & 0xffff == 0 {
+            self.covered.fill(0);
+            self.epoch += 1;
+        }
+        (self.epoch & 0xffff) as u32
+    }
+
     /// Credit session `i` to a campaign and add it to its day.
     #[inline]
     fn credit(&mut self, i: usize, camp: usize, d: usize) {
@@ -163,7 +176,7 @@ impl Acc {
         // Pad the starts to whole groups of eight for the counting.
         let p = (ns + 7) & !7;
         self.starts[ns..p].fill(u32::MAX);
-        self.epoch += 1;
+        let tag = self.next_tag();
         let epoch = self.epoch;
         let mut nl = 0usize;
         let starts = &self.starts[..p];
@@ -184,10 +197,10 @@ impl Acc {
             *top = (if better { t2 } else { t }, if better { h.id } else { id }, if better { h.camp } else { camp });
             let k = usize::from(h.camp);
             let c = self.covered[k];
-            let new = c >> 32 != epoch;
-            let x = if new { nl } else { c as u32 as usize };
+            let new = c >> 16 != tag;
+            let x = if new { nl } else { (c & 0xffff) as usize };
             nl += usize::from(new);
-            self.covered[k] = epoch << 32 | x as u64;
+            self.covered[k] = tag << 16 | x as u32;
             // A new local number starts from an empty mask.
             let keep = u64::from(new).wrapping_sub(1);
             self.local[x] = h.camp;
@@ -268,8 +281,7 @@ impl Acc {
             self.next[j] = self.first[a];
             self.first[a] = j as u32;
         }
-        self.epoch += 1;
-        let epoch = self.epoch << 32;
+        let tag = self.next_tag();
         // Latest click at or before the current start; ties go to the smaller ID.
         let (mut best_ts, mut best_id, mut best_camp) = (-1i64, 0u64, 0usize);
         let mut mask = 0u64;
@@ -283,10 +295,11 @@ impl Acc {
                 }
                 let k = usize::from(h.camp);
                 let c = self.covered[k];
-                let from = if c & !0xffff_ffff == epoch { (c as u32).max(i as u32) } else { i as u32 };
+                let from = if c >> 16 == tag { (c & 0xffff).max(i as u32) } else { i as u32 };
                 let to = self.leave[j as usize];
                 if to > from {
-                    self.covered[k] = epoch | u64::from(to);
+                    // Sessions number at most the buckets, far below 2^16.
+                    self.covered[k] = tag << 16 | to;
                     let mut x = from as usize;
                     while x < to as usize {
                         let y = (self.run_end[x] as usize).min(to as usize);
@@ -756,6 +769,47 @@ mod tests {
         assert_eq!(row(&acc.rows[1]), (2, 7, 1, 1, 2, 0));
         assert_eq!(row(&acc.rows[2]), (3, 7, 1, 1, 0, u16::MAX));
         assert_eq!(acc.stats, [[1, 1, 2, 2], [3, 3, 40, 3], [1, 0, 0, 0]]);
+    }
+
+    // The campaign table's epoch tag wraps after 65535 persons with clicks.
+    // A campaign last touched under the same tag one wrap earlier must not
+    // look current: persons right at the wrap, on the short and the long
+    // path, must get what fresh accumulators give them.
+    #[test]
+    fn campaign_table_survives_the_epoch_wrap() {
+        let slow = SlowIntern::new();
+        let cats = vec![b"a".to_vec()];
+        let short_ev = [ev(WEEK + 5, 0, 7), ev(WEEK + GAP + 6, 0, 0)];
+        let short_cl = |c: [u16; 2]| [Hit { ts: WEEK, id: 1, camp: c[0] }, Hit { ts: WEEK + 1, id: 2, camp: c[1] }, Hit { ts: 3, id: 3, camp: c[0] }];
+        let long_ev: Vec<u64> = (0..70u32).map(|i| ev(WEEK + i * (GAP + 1), 0, u32::from(i % 3 == 0))).collect();
+        let long_cl = |c: [u16; 2]| -> Vec<Hit> {
+            (0..40u32).map(|j| Hit { ts: WEEK + j * 3 * (GAP + 1) / 2, id: 10 + u64::from(j), camp: c[(j % 2) as usize] }).collect()
+        };
+        let (a, b) = ([2u16, 5], [0u16, 1]);
+        let one = |evs: &[u64], cls: &[Hit]| {
+            let mut acc = Acc::new(7, 3, cats.len());
+            acc.person(1, &mut evs.to_vec(), &mut cls.to_vec(), &cats, &slow, 0);
+            acc.stats
+        };
+        let (sa, sb, la) = (one(&short_ev, &short_cl(a)), one(&short_ev, &short_cl(b)), one(&long_ev, &long_cl(a)));
+        assert!(la.iter().any(|c| c[3] > 1), "the long path must assist");
+        let mut acc = Acc::new(7, 3, cats.len());
+        let (mut na, mut nb) = (0i64, 0i64);
+        // Campaigns 2 and 5 are touched under tag 1, then again by the first
+        // person after each wrap, whose tag is 1 as well.
+        for i in 0..=2 * 65535 {
+            let wrap = i == 0 || i == 65535;
+            if i == 2 * 65535 {
+                acc.person(i + 1, &mut long_ev.clone(), &mut long_cl(a), &cats, &slow, 0);
+            } else {
+                let c = if wrap { a } else { b };
+                acc.person(i + 1, &mut short_ev.to_vec(), &mut short_cl(c), &cats, &slow, 0);
+                if wrap { na += 1 } else { nb += 1 }
+            }
+        }
+        let expected: Vec<[i64; 4]> =
+            (0..sa.len()).map(|c| std::array::from_fn(|f| sa[c][f] * na + sb[c][f] * nb + la[c][f])).collect();
+        assert_eq!(acc.stats, expected);
     }
 
     // By the 0-1 principle a network that sorts every 0/1 input sorts all.
