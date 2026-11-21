@@ -386,7 +386,6 @@ impl Acc {
                 prev = max;
             }
         }
-        if ns < 1_000_000 { return; }
         self.cents[..ns].fill(0);
         for &(b, pay) in &self.purchases {
             let i = self.bsess[b as usize] as usize;
