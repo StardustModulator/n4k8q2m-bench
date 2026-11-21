@@ -1,0 +1,79 @@
+name: x86 bench
+on:
+  workflow_dispatch:
+    inputs:
+      commits:
+        description: space-separated solver commits; the first is the baseline
+        required: true
+      events: { default: "20000000" }
+      clicks: { default: "5000000" }
+      seed: { default: "20" }
+      runs: { default: "5" }
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L2|L3'
+          grep -o -w -E 'avx2|avx512[a-z]*|bmi2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          free -g | head -2; df -h / | tail -1; docker --version
+      - uses: actions/cache@v4
+        id: data
+        with:
+          path: |
+            data
+            dev
+          key: data-v1-${{ inputs.seed }}-${{ inputs.events }}-${{ inputs.clicks }}
+      - name: Generate
+        if: steps.data.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --manifest-path generator/Cargo.toml
+          G=generator/target/release/generate
+          $G --seed 1 --events 1000000 --clicks 250000 --output dev --threads 4
+          $G --seed ${{ inputs.seed }} --events ${{ inputs.events }} --clicks ${{ inputs.clicks }} --output data --threads 4
+          du -sh data dev
+      - name: Build images
+        run: |
+          for c in ${{ inputs.commits }}; do
+            git clone -q https://github.com/StardustModulator/n4k8q2m solver-$c
+            git -C solver-$c checkout -q $c
+            docker build -q -t solver:$c solver-$c
+          done
+      - name: Dev-set check
+        run: |
+          for c in ${{ inputs.commits }}; do
+            rm -rf out && mkdir out && chmod 777 out
+            docker run --rm -e NCPU=4 -e WRITE_CSV=1 -v $PWD/dev:/data:ro -v $PWD/out:/output solver:$c
+            echo "== $c"; python3 compare.py out dev-answer
+          done
+      - name: Time
+        run: |
+          : > times.txt
+          for r in $(seq ${{ inputs.runs }}); do
+            for c in ${{ inputs.commits }}; do
+              rm -rf out && mkdir out && chmod 777 out
+              t0=$(date +%s%N)
+              inner=$(docker run --rm -e NCPU=4 -e STAGES=1 -v $PWD/data:/data:ro -v $PWD/out:/output solver:$c 2>&1 | tr '\n' ' ')
+              t1=$(date +%s%N)
+              echo "$c wall_ms=$(( (t1 - t0) / 1000000 )) $inner" | tee -a times.txt
+            done
+          done
+      - name: Summary
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re, collections, statistics as st
+          wall = collections.defaultdict(list); inner = collections.defaultdict(list)
+          for l in open("times.txt"):
+              c = l.split()[0]
+              wall[c].append(int(re.search(r"wall_ms=(\d+)", l).group(1)))
+              m = re.search(r"total_ms=(\d+)", l)
+              if m: inner[c].append(int(m.group(1)))
+          print("| commit | wall min | wall median | binary min | binary median |")
+          print("|---|---|---|---|---|")
+          for c in wall:
+              w, b = wall[c], inner[c] or [0]
+              print(f"| {c[:12]} | {min(w)} | {st.median(w):.0f} | {min(b)} | {st.median(b):.0f} |")
+          PY
