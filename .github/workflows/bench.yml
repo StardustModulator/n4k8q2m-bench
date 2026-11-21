@@ -111,13 +111,12 @@ jobs:
             id=$(docker create solver:$c) && docker cp $id:/solve ./solve-$c && docker rm $id >/dev/null
             rm -rf out && mkdir out
             echo "=== perf stat $c (NCPU=1)"
-            $PERF stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses \
+            $PERF stat -e task-clock,context-switches,cpu-migrations,page-faults \
               env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 STAGES=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>&1 | grep -vE "^\s*$"
             rm -rf out && mkdir out
             echo "=== perf record top symbols $c (NCPU=1)"
-            $PERF record -q -F 1999 -g -o perf-$c.data env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>/dev/null >/dev/null || true
+            $PERF record -q -e cpu-clock -F 1999 -g -o perf-$c.data env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>/dev/null >/dev/null || true
             $PERF report -i perf-$c.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | head -40
-            echo "=== perf annotate hottest symbol (branch-misses) $c"
-            $PERF record -q -e branch-misses -F 1999 -o bm-$c.data env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>/dev/null >/dev/null || true
-            $PERF report -i bm-$c.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | head -25
+            echo "=== perf top symbols with callers $c"
+            $PERF report -i perf-$c.data --children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | head -30
           done
