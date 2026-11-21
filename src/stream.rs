@@ -704,7 +704,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     }
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
-    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048);
+    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,512);
     let pb=(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512);
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
