@@ -70,6 +70,12 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     let ne = parts.iter().map(|p| p.ev.len()).sum::<usize>();
     if ne == 0 { return; }
     let nc = parts.iter().map(|p| p.cl.len()).sum::<usize>();
+    // Rows grow by a large step so the vector rarely moves; a bin yields a
+    // small fraction of its events in rows, and untouched capacity costs no
+    // pages.
+    if acc.rows.capacity() - acc.rows.len() < ne {
+        acc.rows.reserve(ne * 64);
+    }
     let t0 = Instant::now();
     let mut sc = std::mem::take(&mut acc.scratch);
     // Half-full at the previous bin's person count (events over 16 for the
