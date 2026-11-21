@@ -176,7 +176,8 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
             // A person without events has no sessions to credit.
             let found = slots[id].key == key;
             if found { slots[id].cl += 1; }
-            // SAFETY: as for events.
+            // SAFETY: the caller sizes `ids` to the events plus the clicks,
+            // and n counts them in that order, so n < ids.len().
             unsafe { *ids.get_unchecked_mut(n) = if found { id as u32 } else { u32::MAX } };
             n += 1;
         }

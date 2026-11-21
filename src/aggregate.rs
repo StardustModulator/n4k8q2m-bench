@@ -346,8 +346,10 @@ impl Acc {
             ns += usize::from(new);
             ends[ns] = i as u32 + 1;
             prev = ts;
+            // Only the price marks a purchase: the contract leaves the
+            // category bits of a view or cart unspecified.
             let pay = e as u32;
-            if pay != 0 {
+            if pay & 0x00ff_ffff != 0 {
                 purchases.push((ns as u32 - 1, pay));
             }
         }
@@ -376,8 +378,9 @@ impl Acc {
                 bcnt[b] += 1;
                 occupied[b / 64] |= 1 << (b % 64);
                 words |= 1 << (b / 64);
+                // Only the price marks a purchase (see `sessions_sorted`).
                 let pay = e as u32;
-                if pay != 0 {
+                if pay & 0x00ff_ffff != 0 {
                     purchases.push((b as u32, pay));
                 }
             }
@@ -705,6 +708,21 @@ mod tests {
         expected[1] = [2, 1, 110, 0];
         expected[15] = [1, 0, 0, 0];
         assert_eq!(acc.stats, expected);
+    }
+
+    // The contract fixes only the price of a view or cart at zero; on both
+    // the sorted and the bucketed path a category alone is no purchase.
+    #[test]
+    fn view_categories_are_not_purchases() {
+        let slow = SlowIntern::new();
+        let cats = vec![b"b".to_vec(), b"a".to_vec()];
+        let mut acc = Acc::new(1, 1, cats.len());
+        acc.person(5, &mut [ev(WEEK, 1, 0), ev(WEEK + 1, 0, 0)], &mut [], &cats, &slow, 0);
+        assert_eq!(acc.rows.iter().map(row).collect::<Vec<_>>(), [(5, 0, 1, 2, 0, u16::MAX)]);
+        let mut many: Vec<u64> = (0..20u32).map(|i| ev(WEEK + i * (GAP + 1), 1, 0)).collect();
+        acc.person(6, &mut many, &mut [], &cats, &slow, 0);
+        assert_eq!(row(&acc.rows[1]), (6, 0, 20, 20, 0, u16::MAX));
+        assert_eq!(acc.stats, [[21, 0, 0, 0]]);
     }
 
     #[test]
