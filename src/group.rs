@@ -39,6 +39,25 @@ pub(super) struct Scratch {
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Events whose destination line is fetched ahead of their turn.
+const AHEAD: usize = 16;
+
+/// Pull the line holding `p` towards the core; a hint, never a fault.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch hint has no effect beyond the caches.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast())
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch hint has no effect beyond the caches.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
 
 // Within a person shard the table and cursors fit in private caches: number
 // every row by its person's slot, count, then scatter each person's events
@@ -89,10 +108,15 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     let mut n = 0;
     for p in &parts {
         for r in &p.ev {
-            // SAFETY: n counts the events, which have one number each.
+            // SAFETY: n counts the events, which have one number each; the
+            // lookahead stays below ne.
             let id = unsafe { *ev_ids.get_unchecked(n) } as usize;
+            let later = unsafe { *ev_ids.get_unchecked((n + AHEAD).min(ne - 1)) } as usize;
             n += 1;
-            // SAFETY: see above.
+            // The line a later event lands on is fetched now; its cursor may
+            // still move a little, which keeps it on the same or next line.
+            // SAFETY: see above; cursors stay below es.
+            prefetch(unsafe { ev.get_unchecked(slots.get_unchecked(later).ev as usize) });
             let cursor = unsafe { &mut slots.get_unchecked_mut(id).ev };
             unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
             *cursor += 1;
