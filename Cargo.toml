@@ -9,6 +9,10 @@ publish = false
 name = "solve"
 path = "src/main.rs"
 
+[[bin]]
+name = "traingen"
+path = "src/bin/traingen.rs"
+
 [dependencies]
 memchr = "2"
 memmap2 = "0.9"
