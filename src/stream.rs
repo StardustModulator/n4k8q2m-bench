@@ -277,19 +277,7 @@ impl Decoder<'_, '_> {
             // both and selected. Their loads reach at most 25 bytes past the
             // content start, inside the ingest.
             let t = p.add((r2 + q2) as usize);
-            let (ts, ts_ok) = if l2 == 25 {
-                let (iso, ok) = self.clock.iso_raw(t);
-                let (off, ok2) = clock::offset_raw(t);
-                ((iso + off) * 1000, ok & ok2)
-            } else if (l2 == 20) | (l2.wrapping_sub(9) <= 7) {
-                let (iso, ok) = self.clock.iso_raw(t);
-                let (f3v, ok3) = clock::epoch_raw(t, l2);
-                let f1 = l2 == 20;
-                let m = -i64::from(f1);
-                ((iso.wrapping_mul(1000) & m) | (f3v & !m), (f1 & ok & (*t.add(19) == b'Z')) | (!f1 & ok3))
-            } else {
-                return false;
-            };
+            let (ts, ts_ok) = match self.clock.parse(slice(p, r2 + q2, l2)) { Some(v) => (v, true), None => (0, false) };
             // Type: the eight bytes ending at the field's end hold a 4- or
             // 8-byte word; they start inside the row, after the ingest.
             let r4 = e3 + 1;
