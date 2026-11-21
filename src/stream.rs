@@ -208,15 +208,11 @@ impl Decoder<'_, '_> {
         out.candidate(id, sec, at_row, self.b);
     }
 
-    /// `event` for a record from `wire::rows_fused`: `padded` records have
-    /// `wire::PAD` readable bytes past every field start, so the type is
-    /// checked as a whole word and the timestamp form is selected, not
-    /// branched on. The flag is constant per call site and folds.
+    /// `event` for a record from `wire::rows_fused`'s fast path: `wire::PAD`
+    /// bytes are readable past every field start, so the type is checked as
+    /// a whole word and the timestamp form is selected, not branched on.
     #[inline(always)]
-    fn event_row(&self, f: &[&[u8]; 7], padded: bool, out: &mut Scan) {
-        if !padded {
-            return self.event(f, out);
-        }
+    fn event_fast(&self, f: &[&[u8]; 7], out: &mut Scan) {
         let Some(id) = event_key(self.s, f[0]) else { return };
         let Some(sec) = self.clock.ingest_s(f[3]) else { return };
         let mut at_row = None;
@@ -230,7 +226,7 @@ impl Decoder<'_, '_> {
         out.candidate(id, sec, at_row, self.b);
     }
 
-    /// `payload` with the fixed-sequence checks `event_row` describes.
+    /// `payload` with the fixed-sequence checks `event_fast` describes.
     #[inline(always)]
     fn payload_padded(&self, f: &[&[u8]; 7], at: i64) -> Option<u64> {
         const { assert!(wire::PAD >= 25) };
@@ -276,11 +272,22 @@ impl Decoder<'_, '_> {
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(never)]
     fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
         for f in rows {
             self.click(buf, f, out);
         }
+    }
+
+    /// `click` for a record from `wire::rows_fused`'s fast path (see `event_fast`).
+    #[inline(always)]
+    fn click_fast(&self, buf: &[u8], f: &[&[u8]; 4], out: &mut Scan) {
+        if f[0].is_empty() || f[1].is_empty() { return; }
+        // SAFETY: PAD >= 25 bytes are readable from the field's start.
+        let (ts, sure) = unsafe { self.clock.select(f[3]) };
+        let Some(ts) = (if sure { Some(ts) } else { self.clock.parse(f[3]) }) else { return };
+        self.click_at(buf, f, ts, out);
     }
 
     // All copies of a click are identical. Window membership is existential
@@ -290,6 +297,11 @@ impl Decoder<'_, '_> {
     fn click(&self, buf: &[u8], f: &[&[u8]; 4], out: &mut Scan) {
         if f[0].is_empty() || f[1].is_empty() { return; }
         let Some(ts) = self.clock.parse(f[3]) else { return };
+        self.click_at(buf, f, ts, out);
+    }
+
+    #[inline(always)]
+    fn click_at(&self, buf: &[u8], f: &[&[u8]; 4], ts: i64, out: &mut Scan) {
         if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { return; }
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
@@ -622,8 +634,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>wire::rows_fused::<7>(buf,|f,padded|dec.event_row(&f,padded,&mut out)),
-                    1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
+                    0=>wire::rows_fused::<7,_>(buf,&mut out,#[inline(always)]|out,f|dec.event_fast(&f,out),#[inline(never)]|out,f|dec.event(&f,out)),
+                    1=>wire::rows_fused::<4,_>(buf,&mut out,#[inline(always)]|out,f|dec.click_fast(buf,&f,out),#[inline(never)]|out,f|dec.click(buf,&f,out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));

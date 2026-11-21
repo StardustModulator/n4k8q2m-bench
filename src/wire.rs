@@ -383,18 +383,23 @@ fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *con
     f(Fields { base, ends, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData }.all());
 }
 
-/// `rows`, with the row walk fused into the caller. `f` gets the same slices
-/// `rows` would pass, plus a flag that is true for every record a fixed
-/// instruction sequence certified (see `window_fused`) and false for the
-/// records the simple scanner handled. The flag is a constant at each call
-/// site, so a decoder's branch on it folds away.
+/// `rows`, with the row walk fused into the caller. `fast` receives every
+/// record that a fixed instruction sequence certified (see `window_fused`),
+/// `slow` every other well-formed record, through the simple scanner; both
+/// get the slices `rows` would pass, and the caller's state `s`. `fast` has
+/// one call site, so it inlines into the row loop.
 ///
-/// A record is flagged only when `PAD` bytes of `buf` follow its LF, so a
-/// decoder may read up to `PAD` bytes past any of its field starts without
+/// A record reaches `fast` only when `PAD` bytes of `buf` follow its LF, so
+/// a decoder may read up to `PAD` bytes past any of its field starts without
 /// leaving `buf`; the bytes past a field are the record's own later bytes or
 /// those after it.
 #[inline]
-pub(super) fn rows_fused<'b, const N: usize>(buf: &'b [u8], mut f: impl FnMut([&'b [u8]; N], bool)) {
+pub(super) fn rows_fused<'b, const N: usize, S: ?Sized>(
+    buf: &'b [u8],
+    s: &mut S,
+    mut fast: impl FnMut(&mut S, [&'b [u8]; N]),
+    mut slow: impl FnMut(&mut S, [&'b [u8]; N]),
+) {
     const { assert!(2 <= N && N <= 8) };
     let len = buf.len();
     // Slack for the unconditional writes, the EOF entry and the guards.
@@ -403,15 +408,15 @@ pub(super) fn rows_fused<'b, const N: usize>(buf: &'b [u8], mut f: impl FnMut([&
     // The first record goes to the simple scanner, so every window starts
     // just after an LF (stage 1 assumes a separator before the window).
     let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
-    rows_simple::<N>(buf, 0, start, &mut |r| f(r, false));
+    rows_simple::<N>(buf, 0, start, &mut |r| slow(s, r));
     while start < len {
         let end = (start + WINDOW).min(len);
-        let next = window_fused::<N>(buf, start, end, masks.as_mut_ptr(), lines.as_mut_ptr(), &mut f);
+        let next = window_fused::<N, S>(buf, start, end, masks.as_mut_ptr(), lines.as_mut_ptr(), s, &mut fast, &mut slow);
         if next > start {
             start = next;
         } else {
             let stop = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i + 1);
-            rows_simple::<N>(buf, start, stop, &mut |r| f(r, false));
+            rows_simple::<N>(buf, start, stop, &mut |r| slow(s, r));
             start = stop;
         }
     }
@@ -465,13 +470,15 @@ unsafe fn commas_at(cm: *const u64, origin: u32, lf: u32) -> (u64, u64) {
 /// 128 bytes, poisoned ones, those without `PAD` bytes after them and those
 /// failing the count take the simple scanner.
 #[inline(always)]
-fn window_fused<'b, const N: usize>(
+fn window_fused<'b, const N: usize, S: ?Sized>(
     buf: &'b [u8],
     start: usize,
     end: usize,
     cm: *mut u64,
     lp: *mut u32,
-    f: &mut impl FnMut([&'b [u8]; N], bool),
+    s: &mut S,
+    fast: &mut impl FnMut(&mut S, [&'b [u8]; N]),
+    slow: &mut impl FnMut(&mut S, [&'b [u8]; N]),
 ) -> usize {
     let len = buf.len();
     // SAFETY: capacity covers WINDOW / 64 blocks plus the guards.
@@ -566,16 +573,16 @@ fn window_fused<'b, const N: usize>(
             unsafe {
                 let rp = base.add(row as usize);
                 let mut fields = [&buf[..0]; N];
-                let mut s = 0u32;
+                let mut at = 0u32;
                 for (i, field) in fields.iter_mut().enumerate() {
-                    let w = u32::from(*rp.add(s as usize) == b'"');
-                    *field = std::slice::from_raw_parts(rp.add((s + w) as usize), (e[i] - s - 2 * w) as usize);
-                    s = e[i] + 1;
+                    let w = u32::from(*rp.add(at as usize) == b'"');
+                    *field = std::slice::from_raw_parts(rp.add((at + w) as usize), (e[i] - at - 2 * w) as usize);
+                    at = e[i] + 1;
                 }
-                f(fields, true);
+                fast(s, fields);
             }
         } else {
-            slow_row::<N>(buf, start + row as usize, (start + lf as usize + 1).min(len), f);
+            slow_row::<N, S>(buf, start + row as usize, (start + lf as usize + 1).min(len), s, slow);
         }
         row = lf + 1;
     }
@@ -585,8 +592,8 @@ fn window_fused<'b, const N: usize>(
 /// One record the fused walk did not certify, through the simple scanner.
 #[cold]
 #[inline(never)]
-fn slow_row<'b, const N: usize>(buf: &'b [u8], from: usize, to: usize, f: &mut impl FnMut([&'b [u8]; N], bool)) {
-    rows_simple::<N>(buf, from, to, &mut |r| f(r, false));
+fn slow_row<'b, const N: usize, S: ?Sized>(buf: &'b [u8], from: usize, to: usize, s: &mut S, f: &mut impl FnMut(&mut S, [&'b [u8]; N])) {
+    rows_simple::<N>(buf, from, to, &mut |r| f(s, r));
 }
 
 /// A block failed the quote check: poison its LFs, and return the poison for
@@ -830,11 +837,11 @@ mod tests {
         let want = owned::<N>(buf, false);
         assert_eq!(owned::<N>(buf, true), want, "input={buf:?}");
         let end = buf.as_ptr() as usize + buf.len();
-        let fused = collect::<N>(buf, |b, f| rows_fused::<N>(b, |r, fast| {
-            // A flagged record has PAD readable bytes after its LF.
-            assert!(!fast || r[N - 1].as_ptr() as usize + r[N - 1].len() + 1 + PAD <= end, "pad input={b:?}");
+        let fused = collect::<N>(buf, |b, f| rows_fused::<N, _>(b, f, |f, r| {
+            // A fast record has PAD readable bytes after its LF.
+            assert!(r[N - 1].as_ptr() as usize + r[N - 1].len() + 1 + PAD <= end, "pad input={b:?}");
             f(r)
-        }));
+        }, |f, r| f(r)));
         assert_eq!(fused, want, "fused input={buf:?}");
         assert_eq!(collect::<N>(buf, |b, f| rows_simple::<N>(b, 0, b.len(), &mut |r| f(r))), want, "simple input={buf:?}");
         for window in [64, 128, 192, 256] {
@@ -1094,3 +1101,24 @@ pub(super) unsafe fn masks64_for_bench(p: *const u8) -> (u64, u64, u64) {
     unsafe { masks64(p) }
 }
 
+
+#[cfg(test)]
+mod rate {
+    // cargo test --release --bin solve fused_rate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fused_rate() {
+        for (path, n) in [("/tmp/ss-20m/events/part-00043.csv", 7usize), ("/tmp/ss-20m/clicks/part-00003.csv", 4)] {
+            let buf = std::fs::read(path).unwrap();
+            let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
+            let (mut fast, mut slow) = (0usize, 0usize);
+            let mut c = (&mut fast, &mut slow);
+            if n == 7 {
+                super::rows_fused::<7, _>(body, &mut c, |c, _| *c.0 += 1, |c, _| *c.1 += 1);
+            } else {
+                super::rows_fused::<4, _>(body, &mut c, |c, _| *c.0 += 1, |c, _| *c.1 += 1);
+            }
+            eprintln!("{path}: fast={fast} slow={slow} rate={:.5}", slow as f64 / (fast + slow) as f64);
+        }
+    }
+}

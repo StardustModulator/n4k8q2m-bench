@@ -110,9 +110,12 @@ impl Clock {
         let (off, off_ok) = hms_flag(zone >> 24 | (HMS_MIN & (u64::MAX << 40)));
         let sign = (zone >> 16) as u8; // byte 19
         let minus = sign == b'-';
-        let iso25 = if minus { local + off } else { local - off };
-        let ok20 = (n == 20) & dated & hms_ok & (sign == b'Z');
-        let ok25 = (n == 25) & dated & hms_ok & off_ok & (minus | (sign == b'+'));
+        let is20 = n == 20;
+        let is25 = n == 25;
+        // The zone applies only to F2, with its sign: masks, not branches.
+        let neg = i64::from(minus) - 1; // 0 for '-', -1 otherwise
+        let adj = ((off ^ neg) - neg) & -i64::from(is25);
+        let iso_ok = dated & hms_ok & ((is20 & (sign == b'Z')) | (is25 & off_ok & (minus | (sign == b'+'))));
         // F3 as in `epoch_ms`: the last eight digits, and the rest left-padded.
         const ZERO: u64 = u64::from_le_bytes(*b"00000000");
         const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
@@ -122,9 +125,12 @@ impl Clock {
         let digits = (hi | lo | w0.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
         let ok3 = digits & (9..=16).contains(&n);
         let prefix = hi.wrapping_shl(16u32.wrapping_sub(n as u32).wrapping_mul(8));
-        let f3 = (decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64;
-        let ms = if n == 20 { local * 1000 } else if n == 25 { iso25 * 1000 } else { f3 };
-        (ms, ok20 | ok25 | ok3)
+        // Both candidates are opaque, so neither form's work can sink under a
+        // branch on the width: the choice stays one conditional move.
+        let iso = std::hint::black_box((local + adj) * 1000);
+        let f3 = std::hint::black_box((decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64);
+        let ms = if is20 | is25 { iso } else { f3 };
+        (ms, iso_ok | ok3)
     }
 
     /// Seconds since the epoch.
