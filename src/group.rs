@@ -26,22 +26,127 @@ pub(super) struct Histories {
     pub(super) cl: Vec<Click>,
 }
 
-#[derive(Clone, Copy, Default)]
+/// A person's records are chained in chunks of one cache line: seven values
+/// and, in the last position, the index of the chunk written before it, 0 at
+/// the start of the chain. A slot keeps only the write cursor; the cursor's
+/// chunk holds `cursor & 7` values, every earlier one is full. Chunk 0 is
+/// never written: an empty slot's cursor sits on its link position, so the
+/// first record opens a chunk like a full one does, linked to 0.
+const CHUNK: usize = 8;
+const FULL: u32 = CHUNK as u32 - 1;
+
+pub(super) trait Link: Copy {
+    fn link(self) -> usize;
+    fn mark(at: usize) -> Self;
+}
+
+impl Link for u64 {
+    #[inline(always)]
+    fn link(self) -> usize { self as usize }
+    #[inline(always)]
+    fn mark(at: usize) -> u64 { at as u64 }
+}
+
+impl Link for Hit {
+    #[inline(always)]
+    fn link(self) -> usize { self.id as usize }
+    #[inline(always)]
+    fn mark(at: usize) -> Hit { Hit { id: at as u64, ts: 0, camp: 0 } }
+}
+
+/// One person's records, read from the newest chunk back. The order of a
+/// person's records never matters to `aggregate`.
+#[derive(Clone, Copy)]
+pub(super) struct Chain<'a, T> {
+    arena: &'a [T],
+    cur: u32,
+}
+
+impl<'a, T: Link> Chain<'a, T> {
+    #[inline(always)]
+    pub(super) fn is_empty(&self) -> bool { self.cur == FULL }
+
+    /// The newest chunk's values and the index of the one before it.
+    #[inline(always)]
+    pub(super) fn last(&self) -> (&'a [T], usize) {
+        let cur = self.cur as usize;
+        let base = cur & !(CHUNK - 1);
+        (&self.arena[base..cur], self.arena[base + CHUNK - 1].link())
+    }
+
+    /// The values of the full chunk at `at` and the index of the one before it.
+    #[inline(always)]
+    pub(super) fn full(&self, at: usize) -> (&'a [T], usize) {
+        (&self.arena[at..at + CHUNK - 1], self.arena[at + CHUNK - 1].link())
+    }
+
+    /// Every chunk's values, newest first. Not for an empty chain.
+    #[inline(always)]
+    pub(super) fn for_each_chunk(&self, mut f: impl FnMut(&[T])) {
+        let (mut vals, mut prev) = self.last();
+        loop {
+            f(vals);
+            if prev == 0 { return; }
+            (vals, prev) = self.full(prev);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn for_each(&self, mut f: impl FnMut(&T)) {
+        self.for_each_chunk(|c| c.iter().for_each(&mut f));
+    }
+
+    /// Build one from values, for tests and the long-history copies.
+    #[cfg(test)]
+    pub(super) fn build(vals: &[T], arena: &'a mut Vec<T>) -> Self {
+        arena.clear();
+        // Room for the chain plus the free chunk every append links.
+        arena.resize(CHUNK * (vals.len() / (CHUNK - 1) + 3), T::mark(0));
+        let (mut top, mut cur) = (CHUNK as u32, FULL);
+        for &v in vals {
+            append(arena, &mut top, &mut cur, v);
+        }
+        Chain { arena, cur }
+    }
+}
+
+/// Write one record at a slot's cursor, opening a chunk when it is full.
+/// The arena holds at least `top + CHUNK` entries (see the bound in `number`).
+/// No branch depends on the data: the link of the next free chunk is written
+/// every time, and holds the right value at the moment that chunk is opened.
+#[inline(always)]
+fn append<T: Link>(arena: &mut [T], top: &mut u32, cur: &mut u32, val: T) {
+    let c = *cur;
+    let full = c & FULL == FULL;
+    // SAFETY: top + CHUNK <= arena.len() by the caller's bound.
+    unsafe { *arena.get_unchecked_mut(*top as usize + CHUNK - 1) = T::mark((c - FULL) as usize) };
+    let at = if full { *top } else { c };
+    *top += if full { CHUNK as u32 } else { 0 };
+    // SAFETY: at < top <= arena.len() - CHUNK.
+    unsafe { *arena.get_unchecked_mut(at as usize) = val };
+    *cur = at + 1;
+}
+
+#[derive(Clone, Copy)]
 struct Slot { key: u64, ev: u32, cl: u32 }
+
+const EMPTY: Slot = Slot { key: 0, ev: FULL, cl: FULL };
 
 /// Buffers reused across a worker's bins.
 #[derive(Default)]
 pub(super) struct Scratch {
     slots: Vec<Slot>,
-    ids: Vec<u32>,
+    // Occupied slots in order of first appearance.
+    persons: Vec<u32>,
     ev: Vec<u64>,
     cl: Vec<Hit>,
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
-// Within a person shard the table and cursors fit in private caches: number
-// every row by its person's slot, count, then scatter each person's events
-// and clicks together. Neither events nor clicks get sorted (see `aggregate`).
+// Within a person shard the table and the chunk arenas fit in private
+// caches: one pass chains every row onto its person's slot, then each person
+// is summarized from its chain. Neither events nor clicks get sorted (see
+// `aggregate`).
 pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], slow: &SlowIntern, first_day: i32) {
     #[cfg(test)]
     bench::capture(&parts);
@@ -57,92 +162,46 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     let t0 = Instant::now();
     let mut bits = (ne / 8).max(64).next_power_of_two().trailing_zeros();
     let mut sc = std::mem::take(&mut acc.scratch);
-    // Person numbers go to a reused array rather than into the parts, which
-    // stay clean and are only read twice. A table that fills up is doubled
-    // and the pass redone; the numbers so far are simply overwritten.
-    let ids = &mut sc.ids;
-    if ids.len() < ne + nc { ids.resize(ne + nc, 0); }
-    let mut slots = std::mem::take(&mut sc.slots);
-    while !number(&parts, &mut slots, &mut ids[..ne + nc], bits) {
-        slots.fill(Slot::default());
+    // A table that fills up is doubled and the pass redone from the start.
+    while !number(&parts, &mut sc, ne, nc, bits) {
+        sc.slots.fill(EMPTY);
+        sc.persons.clear();
         bits += 1;
     }
     let t1 = Instant::now();
-    let (mut es, mut cs) = (0u32, 0u32);
-    for p in &mut slots {
-        let (e, c) = (p.ev, p.cl);
-        p.ev = es; p.cl = cs;
-        es += e; cs += c;
-    }
-    // Every cell below es and cs is written by the scatter; stale contents
-    // from earlier bins need no clearing.
-    let (ev, cl) = (&mut sc.ev, &mut sc.cl);
-    if ev.len() < es as usize { ev.resize(es as usize, 0); }
-    if cl.len() < cs as usize { cl.resize(cs as usize, Hit { ts: 0, id: 0, camp: 0 }); }
-    debug_assert!(cs as usize <= nc);
-    // `number` gave every event a slot below slots.len() and counted it in
-    // that slot, so each cursor stays below the next slot's start <= es (cs).
-    let (ev_ids, cl_ids) = ids[..ne + nc].split_at(ne);
-    // Counted loops here; the numbering keeps its iterator form, which
-    // measured faster on x86 although it is longer.
-    let mut n = 0;
-    for p in &parts {
-        for r in &p.ev {
-            // SAFETY: n counts the events, which have one number each.
-            let id = unsafe { *ev_ids.get_unchecked(n) } as usize;
-            n += 1;
-            // SAFETY: see above.
-            let cursor = unsafe { &mut slots.get_unchecked_mut(id).ev };
-            unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
-            *cursor += 1;
-        }
-    }
-    let mut n = 0;
-    for p in &parts {
-        for r in &p.cl {
-            // SAFETY: n counts the clicks, which have one number each.
-            let id = unsafe { *cl_ids.get_unchecked(n) } as usize;
-            n += 1;
-            if id != u32::MAX as usize {
-                // SAFETY: see above.
-                let cursor = unsafe { &mut slots.get_unchecked_mut(id).cl };
-                unsafe { *cl.get_unchecked_mut(*cursor as usize) = r.hit };
-                *cursor += 1;
-            }
-        }
-    }
-    let t2 = Instant::now();
-    let (mut e0, mut c0) = (0, 0);
-    for p in &mut slots {
-        let (e1, c1) = (p.ev as usize, p.cl as usize);
-        if e1 > e0 {
-            acc.person(p.key, &mut ev[e0..e1], &mut cl[c0..c1], cats, slow, first_day);
-        }
-        e0 = e1; c0 = c1;
+    for &id in &sc.persons {
+        let id = id as usize;
+        let s = sc.slots[id];
+        acc.person(s.key, Chain { arena: &sc.ev, cur: s.ev }, Chain { arena: &sc.cl, cur: s.cl }, cats, slow, first_day);
         // Leave the table empty for the next bin.
-        *p = Slot::default();
+        sc.slots[id] = EMPTY;
     }
-    sc.slots = slots;
+    sc.persons.clear();
     acc.scratch = sc;
-    let t3 = Instant::now();
+    let t2 = Instant::now();
     #[cfg(test)]
-    bench::phase([t0, t1, t2, t3]);
-    for (p, (a, b)) in acc.phases.0.iter_mut().zip([(t0, t1), (t1, t2), (t2, t3)]) {
+    bench::phase([t0, t1, t2]);
+    for (p, (a, b)) in acc.phases.0.iter_mut().zip([(t0, t1), (t1, t2)]) {
         *p += (b - a).as_nanos() as u64;
     }
 }
 
-// Open addressing with linear probing; a slot number is a person's number.
-// One spare slot after the last lets the two-slot check skip the wraparound;
-// it stays empty. Returns false, with `slots` dirty, once three quarters of
-// the slots are taken. `slots` comes in empty.
-fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32) -> bool {
+// Open addressing with linear probing. One spare slot after the last lets
+// the two-slot check skip the wraparound; it stays empty. Returns false, with
+// the scratch dirty, once three quarters of the slots are taken. `sc` comes
+// in with every slot EMPTY and no persons.
+fn number(parts: &[Histories], sc: &mut Scratch, ne: usize, nc: usize, bits: u32) -> bool {
     let mask = (1usize << bits) - 1;
-    slots.resize(mask + 2, Slot::default());
-    let slots = &mut slots[..];
-    let shift = 64 - bits;
+    sc.slots.resize(mask + 2, EMPTY);
     let mut room = mask / 4 * 3;
-    let mut out = ids.iter_mut();
+    // Every person opens one chunk and then one more per seven records, so
+    // the arenas never run out at these sizes (chunk 0 is the end mark).
+    let bound = |n: usize| CHUNK * (2 + room.min(n) + n / (CHUNK - 1));
+    if sc.ev.len() < bound(ne) { sc.ev.resize(bound(ne), 0); }
+    if sc.cl.len() < bound(nc) { sc.cl.resize(bound(nc), Hit { id: 0, ts: 0, camp: 0 }); }
+    let slots = &mut sc.slots[..];
+    let shift = 64 - bits;
+    let mut top = CHUNK as u32;
     for e in parts.iter().flat_map(|p| &p.ev) {
         let key = e.key;
         let s = (key.wrapping_mul(MUL) >> shift) as usize;
@@ -157,32 +216,28 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
                 if room == 0 { return false; }
                 room -= 1;
                 slots[id].key = key;
+                sc.persons.push(id as u32);
             }
         }
         // SAFETY: id <= mask + 1 < slots.len().
-        unsafe { slots.get_unchecked_mut(id) }.ev += 1;
-        if let Some(o) = out.next() { *o = id as u32; }
+        let slot = unsafe { slots.get_unchecked_mut(id) };
+        append(&mut sc.ev, &mut top, &mut slot.ev, e.val);
     }
-    let mut n = parts.iter().map(|p| p.ev.len()).sum::<usize>();
-    for p in parts {
-        for c in &p.cl {
-            let key = c.key;
-            let s = (key.wrapping_mul(MUL) >> shift) as usize;
-            // SAFETY: as for events.
-            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-            if unsafe { slots.get_unchecked(id) }.key != key {
-                id = probe(slots, key, s, mask);
-            }
-            // A person without events has no sessions to credit.
-            let found = slots[id].key == key;
-            if found { slots[id].cl += 1; }
-            // SAFETY: the caller sizes `ids` to the events plus the clicks,
-            // and n counts them in that order, so n < ids.len().
-            unsafe { *ids.get_unchecked_mut(n) = if found { id as u32 } else { u32::MAX } };
-            n += 1;
+    let mut top = CHUNK as u32;
+    for c in parts.iter().flat_map(|p| &p.cl) {
+        let key = c.key;
+        let s = (key.wrapping_mul(MUL) >> shift) as usize;
+        // SAFETY: as for events.
+        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+        if unsafe { slots.get_unchecked(id) }.key != key {
+            id = probe(slots, key, s, mask);
+        }
+        // A person without events has no sessions to credit.
+        let slot = &mut slots[id];
+        if slot.key == key {
+            append(&mut sc.cl, &mut top, &mut slot.cl, c.hit);
         }
     }
-    debug_assert_eq!(n, ids.len());
     true
 }
 
@@ -237,6 +292,45 @@ mod tests {
         assert!(acc.rows.iter().all(|r| (r.day, r.sessions, r.events, r.revenue, r.top) == (0, 1, 1, 0, u16::MAX)));
         assert_eq!(acc.stats, [[1, 0, 0, 1], [1, 0, 0, 1], [i64::from(n) - 2, 0, 0, 0]]);
     }
+
+    // Chains hand back every value exactly once, newest chunk first, and
+    // the arena bound of `number` holds for persons of every size.
+    #[test]
+    fn chains_keep_every_record() {
+        for n in 0..40usize {
+            let vals: Vec<u64> = (1..=n as u64).collect();
+            let mut arena = Vec::new();
+            let chain = Chain::build(&vals, &mut arena);
+            assert_eq!(chain.is_empty(), n == 0);
+            if n == 0 { continue; }
+            let mut got = Vec::new();
+            let mut chunks = 0;
+            chain.for_each_chunk(|c| { chunks += 1; got.extend_from_slice(c); });
+            assert_eq!(chunks, n.div_ceil(CHUNK - 1));
+            got.sort_unstable();
+            assert_eq!(got, vals);
+        }
+        // Many persons with few events each, split over parts, through
+        // `histories` itself: every event is summarized exactly once.
+        let cats = vec![b"c".to_vec()];
+        let slow = SlowIntern::new();
+        let week = WEEK_MS as u32;
+        for per in [1usize, 6, 7, 8, 13, 14, 15, 29] {
+            let persons = 500;
+            let mut parts: Vec<Histories> = (0..4).map(|_| Histories::default()).collect();
+            for p in 0..persons as u32 {
+                for e in 0..per as u32 {
+                    // A person's events are more than a gap apart: one session each.
+                    let ts = week + e * (GAP_MS as u32 + 1) + p * 1000;
+                    parts[(p + e) as usize % 4].ev.push(Event { key: u64::from(p) + 1, val: u64::from(ts) << 32 });
+                }
+            }
+            let mut acc = Acc::new(1, 40, cats.len());
+            histories(parts, &mut acc, &cats, &slow, 0);
+            let (sessions, events): (i64, i64) = acc.rows.iter().fold((0, 0), |a, r| (a.0 + r.sessions, a.1 + r.events));
+            assert_eq!((sessions, events), ((persons * per) as i64, (persons * per) as i64), "per={per}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -245,11 +339,11 @@ mod bench {
     use std::sync::Mutex;
 
     static CAPTURE: Mutex<Option<Vec<Vec<Histories>>>> = Mutex::new(None);
-    static PHASE: Mutex<[f64; 3]> = Mutex::new([0.0; 3]);
+    static PHASE: Mutex<[f64; 2]> = Mutex::new([0.0; 2]);
 
-    pub(super) fn phase(t: [Instant; 4]) {
+    pub(super) fn phase(t: [Instant; 3]) {
         let mut p = PHASE.lock().unwrap();
-        for i in 0..3 { p[i] += (t[i + 1] - t[i]).as_secs_f64(); }
+        for i in 0..2 { p[i] += (t[i + 1] - t[i]).as_secs_f64(); }
     }
 
     pub(super) fn capture(parts: &[Histories]) {
@@ -279,11 +373,11 @@ mod bench {
         let nc: usize = bins.iter().flatten().map(|p| p.cl.len()).sum();
         eprintln!("bins={} events={ne} clicks={nc} rows={}", bins.len(), want.len());
         let mut best = f64::MAX;
-        let mut best_p = [f64::MAX; 3];
+        let mut best_p = [f64::MAX; 2];
         let rounds = std::env::var("BENCH_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(5);
         for round in 0..rounds {
             let copies = copy(&bins);
-            *PHASE.lock().unwrap() = [0.0; 3];
+            *PHASE.lock().unwrap() = [0.0; 2];
             let mut acc = Acc::new(t.camps.len(), days, t.cat_names.len());
             let start = Instant::now();
             for b in copies {
@@ -292,7 +386,7 @@ mod bench {
             let el = start.elapsed().as_secs_f64();
             best = best.min(el);
             let p = *PHASE.lock().unwrap();
-            for i in 0..3 { best_p[i] = best_p[i].min(p[i]); }
+            for i in 0..2 { best_p[i] = best_p[i].min(p[i]); }
             if round == 0 && std::env::var_os("BENCH_NOCHECK").is_none() {
                 let mut got: Vec<_> = acc.rows.iter().map(|r| (r.key, r.day, r.sessions, r.events, r.revenue, r.top)).collect();
                 got.sort_unstable();
@@ -307,15 +401,15 @@ mod bench {
                 assert!(camps == want_c, "campaign rows differ");
             }
         }
-        eprintln!("histories: {:.1} ms ({:.2} ns/record) intern={:.1} scatter={:.1} person={:.1}", best * 1e3, best * 1e9 / (ne + nc) as f64,
-            best_p[0] * 1e3, best_p[1] * 1e3, best_p[2] * 1e3);
+        eprintln!("histories: {:.1} ms ({:.2} ns/record) chain={:.1} person={:.1}", best * 1e3, best * 1e9 / (ne + nc) as f64,
+            best_p[0] * 1e3, best_p[1] * 1e3);
         if std::env::var_os("BENCH_STATS").is_some() {
             stats(&bins);
         }
     }
 
     fn stats(bins: &[Vec<Histories>]) {
-                let mut hist_p = [0usize; 24];
+        let mut hist_p = [0usize; 24];
         let mut hist_e = [0usize; 24];
         let mut hist_cp = [0usize; 24];
         let mut hist_cc = [0usize; 24];
