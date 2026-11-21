@@ -66,6 +66,7 @@ struct Scan {
     cand: Vec<Vec<Cand>>, // by event ID
     wide: Vec<Vec<Wide>>, // by event ID; allocated on first use
     links: Vec<(u64, u64)>,
+    sink: u64, // diagnostic: absorbs rows when pushes are skipped
 }
 
 impl Scan {
@@ -175,13 +176,15 @@ struct Decoder<'a, 'c> {
     click_start: i64,
     click_span: u64,
     b: Bits,
+    nopush: bool, // diagnostic: decode fully but write nothing
 }
 
 impl Decoder<'_, '_> {
     fn new<'a, 'c>(cx: &'a Ctx<'c>, clock: &'a Clock, s: &'a Shared, origin: i64, b: Bits) -> Decoder<'a, 'c> {
         let w = cx.window;
         Decoder { cx, clock, s, origin, start: w.start, span: (w.end - w.start) as u64,
-                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
+                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b,
+                  nopush: std::env::var_os("SS_NOPUSH").is_some() }
     }
 
     #[inline(never)]
@@ -200,10 +203,12 @@ impl Decoder<'_, '_> {
             // Mixed until renaming.
             let key = hash(user_key(self.s, f[1]));
             let bin = (key >> (64 - self.b.user)) as usize;
+            if self.nopush { out.sink ^= key ^ val ^ hash(id) ^ sec as u64; return; }
             let v = &mut out.ev[bin];
             at_row = Some((bin, v.len()));
             v.push(Event { key, val });
         }
+        if self.nopush { out.sink ^= hash(id) ^ sec as u64; return; }
         out.candidate(id, sec, at_row, self.b);
     }
 
@@ -247,6 +252,7 @@ impl Decoder<'_, '_> {
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
         let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
+        if self.nopush { out.sink ^= key ^ hit.id ^ u64::from(hit.ts); return; }
         out.cl[(key >> (64 - self.b.user)) as usize].push(Click { key, hit });
     }
 
@@ -563,17 +569,24 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let next=AtomicUsize::new(0);
     let shared=Shared{slow:Mutex::new(SlowIntern::new())};
     let dec=Decoder::new(&cx,&clock,&shared,origin,b);
+    let nodecode=std::env::var_os("SS_NODECODE").is_some();
     let prep=total.elapsed();
     // Workers take chunks dynamically; leave headroom over an even share.
     let share=|bytes:usize,row:usize,n:usize|bytes/row/threads*5/4/n+64;
     let scans=thread::scope(|scope|{
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
-                cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
+                cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new(),sink:0};
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
+                if nodecode && c.kind<2 {
+                    // Diagnostic: scan only, touching each record's fields.
+                    if c.kind==0 { wire::rows::<7>(buf,|f| out.sink^=(f[0].len()+f[6].len()) as u64); }
+                    else { wire::rows::<4>(buf,|f| out.sink^=(f[0].len()+f[3].len()) as u64); }
+                    continue;
+                }
                 match c.kind {
                     0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
@@ -589,6 +602,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     let parsed=total.elapsed();
+    std::hint::black_box(scans.iter().fold(0u64,|a,s|a^s.0.sink));
     // Idle tail of the parse: the first worker to run out of chunks waits this long.
     let tail=parsed-scans.iter().map(|s|s.1).min().unwrap_or(parsed);
     let scans=scans.into_iter().map(|s|s.0);
@@ -830,7 +844,7 @@ mod bench {
         });
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
-                                 cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
+                                 cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new(), sink: 0 };
             batched::<7>(body, |rows| dec.events(rows, &mut out));
             std::hint::black_box(&out.ev);
         });
