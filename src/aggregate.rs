@@ -3,8 +3,8 @@
 //!
 //! Events are never sorted: half-hour buckets keep only their earliest and
 //! latest times, and neighbouring occupied buckets decide the session breaks.
-//! Clicks are never sorted either: a binary search over the session starts
-//! places each click on the run of sessions whose window contains it.
+//! Clicks are never sorted either: counting the session starts below a click's
+//! time places it on the run of sessions whose window contains it.
 
 use super::{cmp_keys, SlowIntern, UserRow};
 use crate::time::{DAY_MS, GAP_MS, WEEK_MS};
@@ -34,10 +34,16 @@ pub(super) struct Acc {
     pub(super) scratch: crate::group::Scratch,
     ndays: usize,
     organic: usize,
-    // Half-hour buckets: [min ts, max ts, events, session]. Two events in one
-    // bucket are less than a gap apart, so a bucket always lies inside one
-    // session; only neighbouring occupied buckets need a test.
-    buckets: Box<[[u32; 4]; NB]>,
+    n_cats: usize,
+    // Half-hour buckets: earliest and latest time, events, then the session
+    // number. Two events in one bucket are less than a gap apart, so a bucket
+    // always lies inside one session; only neighbouring occupied buckets need
+    // a test. One array per field keeps the read-modify-write chains of a
+    // repeated bucket independent of each other.
+    bmin: Box<[u32; NB]>,
+    bmax: Box<[u32; NB]>,
+    bcnt: Box<[u32; NB]>,
+    bsess: Box<[u32; NB]>,
     occupied: Box<[u64; NB.div_ceil(64)]>,
     // Occupied buckets in time order, with room for four positions past the end.
     order: Box<[u16; NB + 4]>,
@@ -47,14 +53,13 @@ pub(super) struct Acc {
     // have room for padding to a power of two for the searches.
     starts: Vec<u32>,
     lowers: Vec<u32>,
-    counts: Vec<u32>,
+    // ends[i + 1] is the number of events in sessions 0..=i; ends[0] = 0.
+    ends: Vec<u32>,
     cents: Vec<i64>,
     // Day of each session and the end of its run of same-day sessions.
     day_of: Vec<u8>,
-    day_lt: Vec<u64>,
-    day_le: Vec<u64>,
     run_end: Vec<u32>,
-    // Clicks listed by the first session whose window holds them.
+    // Long path: clicks listed by the first session whose window holds them.
     first: Vec<u32>,
     next: Vec<u32>,
     leave: Vec<u32>,
@@ -66,19 +71,15 @@ pub(super) struct Acc {
     top: Vec<(u32, u64, u16)>,
     local: Vec<u16>,
     runs: Vec<u64>,
-    dmask: Vec<u64>,
-    // Short path: sessions of each day, and the days with sessions.
+    // Short path: sessions of each day; cleared again with the rows.
     on_day: Vec<u64>,
-    day_mask: u64,
     epoch: u64,
     days: Vec<Day>,
     // Purchase cents per (day, category), with the touched cells.
     spend: Vec<i64>,
     touched: Vec<u32>,
-    n_cats: usize,
 }
 
-const EMPTY: [u32; 4] = [u32::MAX, 0, 0, 0];
 // LOW[i] has the i lowest bits set.
 const LOW: [u64; 65] = {
     let mut t = [u64::MAX; 65];
@@ -89,8 +90,10 @@ const LOW: [u64; 65] = {
     }
     t
 };
+const GAP: u32 = GAP_MS as u32;
+const WEEK: u32 = WEEK_MS as u32;
 // Half-hour buckets of every 32-bit offset.
-const NB: usize = (u32::MAX / GAP_MS as u32) as usize + 1;
+const NB: usize = (u32::MAX / GAP) as usize + 1;
 const NONE: u32 = u32::MAX;
 
 impl Acc {
@@ -108,17 +111,19 @@ impl Acc {
             scratch: Default::default(),
             ndays,
             organic,
-            buckets: Box::new([EMPTY; NB]),
+            n_cats,
+            bmin: Box::new([u32::MAX; NB]),
+            bmax: Box::new([0; NB]),
+            bcnt: Box::new([0; NB]),
+            bsess: Box::new([0; NB]),
             occupied: Box::new([0; NB.div_ceil(64)]),
             order: Box::new([0; NB + 4]),
             purchases: Vec::new(),
             starts: vec![0; room],
             lowers: vec![0; room],
-            counts: vec![0; nb],
+            ends: vec![0; nb + 1],
             cents: vec![0; nb],
             day_of: vec![0; nb],
-            day_lt: vec![0; nb],
-            day_le: vec![0; nb],
             run_end: vec![0; nb],
             first: vec![NONE; nb + 1],
             next: Vec::new(),
@@ -127,14 +132,11 @@ impl Acc {
             top: vec![(0, 0, 0); 65],
             local: vec![0; organic],
             runs: vec![0; organic],
-            dmask: vec![0; organic],
             on_day: vec![0; ndays],
-            day_mask: 0,
             epoch: 0,
             days: vec![NO_DAY; ndays],
             spend: vec![0; ndays * n_cats],
             touched: Vec::new(),
-            n_cats,
         }
     }
 
@@ -148,109 +150,100 @@ impl Acc {
         s[2] += cents;
         let day = &mut self.days[d];
         day.sessions += 1;
-        day.events += u64::from(self.counts[i]);
+        day.events += u64::from(self.ends[i + 1] - self.ends[i]);
         day.revenue += cents;
-    }
-
-    /// Session windows, days and same-day runs, plus padding for `rank`.
-    fn prepare(&mut self, ns: usize) -> usize {
-        let p = (ns + 1).next_power_of_two().max(8);
-        for i in 0..ns {
-            self.lowers[i] = self.starts[i] - WEEK_MS as u32;
-            let d = day_index(self.starts[i]);
-            self.day_of[i] = d as u8;
-            // Days before session i's day, and up to it.
-            self.day_lt[i] = (1u64 << d) - 1;
-            self.day_le[i] = (2u64 << d).wrapping_sub(1);
-        }
-        self.starts[ns..p].fill(u32::MAX);
-        self.lowers[ns..p].fill(u32::MAX);
-        let mut end = ns as u32;
-        let mut days = 0u64;
-        for i in (0..ns).rev() {
-            self.run_end[i] = end;
-            if i == 0 || self.day_of[i - 1] != self.day_of[i] {
-                let d = usize::from(self.day_of[i]);
-                // Session masks only exist for the short path.
-                self.on_day[d] = ((1u128 << end.min(64)) - (1u128 << i.min(64))) as u64;
-                days |= 1 << d;
-                end = i as u32;
-            }
-        }
-        self.day_mask = days;
-        p
     }
 
     /// Up to 64 sessions, without branches on the data. The best click of
     /// each entry session is kept by selects, then carried forward; each
     /// campaign's assisted sessions are a bit mask. Returns the day mask.
     fn attribute_short(&mut self, ns: usize, clicks: &[Hit], slow: &SlowIntern) -> u64 {
-        let p = self.prepare(ns);
+        // Pad the starts to whole groups of eight for the counting.
+        let p = (ns + 7) & !7;
+        self.starts[ns..p].fill(u32::MAX);
+        let mut mask = 0u64;
+        for i in 0..ns {
+            let d = day_index(self.starts[i]);
+            self.day_of[i] = d as u8;
+            self.on_day[d] |= 1 << i;
+            mask |= 1 << d;
+        }
         // Per entry session: one plus the best time, its ID and campaign.
         self.top[..=ns].fill((0, 0, 0));
         self.epoch += 1;
-        let epoch = self.epoch << 32;
+        let epoch = self.epoch;
         let mut nl = 0usize;
-        let short = p <= 8;
-        let (s8, l8): ([u32; 8], [u32; 8]) = if short {
-            (self.starts[..8].try_into().unwrap(), self.lowers[..8].try_into().unwrap())
-        } else {
-            ([0; 8], [0; 8])
-        };
+        let starts = &self.starts[..p];
         for h in clicks {
-            let (a, b) = if short {
-                let (mut a, mut b) = (0, 0);
-                for i in 0..8 {
-                    a += usize::from(s8[i] < h.ts);
-                    b += usize::from(l8[i] <= h.ts);
-                }
-                (a, b)
-            } else {
-                (rank(&self.starts[..p], h.ts), rank(&self.lowers[..p], h.ts + 1))
-            };
+            // Session i holds the click when start - WEEK <= ts <= start:
+            // a = #(start < ts) sessions come before, b = #(start <= ts + WEEK).
+            let (a, b) = below(starts, h.ts, h.ts.saturating_add(WEEK + 1));
             // a <= b <= ns <= 64.
-            let top = &mut self.top[a];
+            // SAFETY: `top` has 65 entries.
+            let top = unsafe { self.top.get_unchecked_mut(a) };
             let (t, id, camp) = *top;
             // Computed before the time test, which keeps this free of branches.
             let smaller = id_lt(h.id, id, slow);
-            let better = h.ts + 1 > t || (h.ts + 1 == t && smaller);
-            *top = (if better { h.ts + 1 } else { t }, if better { h.id } else { id }, if better { h.camp } else { camp });
+            let t2 = h.ts + 1;
+            let better = t2 > t || (t2 == t && smaller);
+            *top = (if better { t2 } else { t }, if better { h.id } else { id }, if better { h.camp } else { camp });
             let k = usize::from(h.camp);
             let c = self.covered[k];
-            let new = c & !0xffff_ffff != epoch;
+            let new = c >> 32 != epoch;
             let x = if new { nl } else { c as u32 as usize };
             nl += usize::from(new);
-            self.covered[k] = epoch | x as u64;
-            // A new local number starts from empty masks.
+            self.covered[k] = epoch << 32 | x as u64;
+            // A new local number starts from an empty mask.
             let keep = u64::from(new).wrapping_sub(1);
             self.local[x] = h.camp;
             self.runs[x] = (LOW[b] & !LOW[a]) | (self.runs[x] & keep);
-            // Sessions [a, b) cover exactly the session days from day(a) to day(b - 1).
-            let dm = self.day_le[b.max(1) - 1] & !self.day_lt[a] & self.day_mask;
-            self.dmask[x] = (if a < b { dm } else { 0 }) | (self.dmask[x] & keep);
         }
-        let mut mask = 0u64;
-        let (mut t, mut id, mut camp) = (0u32, 0u64, 0u16);
+        // Later entry sessions hold strictly later clicks, so a filled entry
+        // always replaces the carried one.
+        let (mut t, mut camp) = (0u32, 0u16);
         for i in 0..ns {
-            let (t2, id2, camp2) = self.top[i];
-            let smaller = id_lt(id2, id, slow);
-            let better = t2 > t || (t2 == t && t2 != 0 && smaller);
-            (t, id, camp) = (if better { t2 } else { t }, if better { id2 } else { id }, if better { camp2 } else { camp });
+            let (t2, _, camp2) = self.top[i];
+            let take = t2 != 0;
+            (t, camp) = (if take { t2 } else { t }, if take { camp2 } else { camp });
             let d = usize::from(self.day_of[i]);
-            let c = if t > self.lowers[i] { usize::from(camp) } else { self.organic };
+            let c = if t > self.starts[i] - WEEK { usize::from(camp) } else { self.organic };
             self.credit(i, c, d);
-            mask |= 1 << d;
         }
         for x in 0..nl {
-            let (k, runs) = (usize::from(self.local[x]), self.runs[x]);
-            let mut m = self.dmask[x];
-            while m != 0 {
-                let d = m.trailing_zeros() as usize;
-                m &= m - 1;
-                self.stats[k * self.ndays + d][3] += i64::from((runs & self.on_day[d]).count_ones());
+            let (k, r) = (usize::from(self.local[x]), self.runs[x]);
+            if r == 0 {
+                continue;
+            }
+            // The run's days, from its first session's to its last one's.
+            let lo = usize::from(self.day_of[r.trailing_zeros() as usize]);
+            let hi = usize::from(self.day_of[63 - r.leading_zeros() as usize]);
+            for d in lo..=hi {
+                let c = (r & self.on_day[d]).count_ones();
+                if c != 0 {
+                    self.stats[k * self.ndays + d][3] += i64::from(c);
+                }
             }
         }
         mask
+    }
+
+    /// Session windows, days and same-day runs, plus padding for `rank`.
+    fn prepare(&mut self, ns: usize) -> usize {
+        let p = (ns + 1).next_power_of_two().max(8);
+        for i in 0..ns {
+            self.lowers[i] = self.starts[i] - WEEK;
+            self.day_of[i] = day_index(self.starts[i]) as u8;
+        }
+        self.starts[ns..p].fill(u32::MAX);
+        self.lowers[ns..p].fill(u32::MAX);
+        let mut end = ns as u32;
+        for i in (0..ns).rev() {
+            self.run_end[i] = end;
+            if i == 0 || self.day_of[i - 1] != self.day_of[i] {
+                end = i as u32;
+            }
+        }
+        p
     }
 
     /// Credit every session from its latest click within a week and count
@@ -325,15 +318,14 @@ impl Acc {
         let purchases = &mut self.purchases;
         purchases.clear();
         {
-            let buckets = &mut *self.buckets;
+            let (bmin, bmax, bcnt) = (&mut *self.bmin, &mut *self.bmax, &mut *self.bcnt);
             let occupied = &mut *self.occupied;
             for &e in events.iter() {
                 let ts = timestamp(e);
-                let b = (ts / GAP_MS as u32) as usize;
-                let k = &mut buckets[b];
-                k[0] = k[0].min(ts);
-                k[1] = k[1].max(ts);
-                k[2] += 1;
+                let b = (ts / GAP) as usize;
+                bmin[b] = bmin[b].min(ts);
+                bmax[b] = bmax[b].max(ts);
+                bcnt[b] += 1;
                 occupied[b / 64] |= 1 << (b % 64);
                 lo = lo.min(b);
                 hi = hi.max(b);
@@ -368,27 +360,33 @@ impl Acc {
             nb += n;
         }
         // Event offsets are at least a week, so the first bucket always
-        // opens a session.
+        // opens a session. Every bucket writes the start of a would-be next
+        // session, which the real next start overwrites.
         let mut ns = 0;
         let mut prev = 0u32;
+        let mut cum = 0u32;
         {
-            let buckets = &mut *self.buckets;
-            let (starts, counts) = (&mut self.starts[..], &mut self.counts[..]);
+            let (bmin, bmax, bcnt, bsess) = (&mut *self.bmin, &mut *self.bmax, &mut *self.bcnt, &mut *self.bsess);
+            let (starts, ends) = (&mut self.starts[..], &mut self.ends[..]);
+            ends[0] = 0;
             for &b in &order[..nb] {
-                let k = &mut buckets[usize::from(b)];
-                let [min, max, n, _] = *k;
-                let new = min - prev > GAP_MS as u32;
+                let b = usize::from(b);
+                let (min, max, n) = (bmin[b], bmax[b], bcnt[b]);
+                let new = min - prev > GAP;
+                starts[ns] = min;
                 ns += usize::from(new);
-                let i = ns - 1;
-                *k = [u32::MAX, 0, 0, i as u32];
-                starts[i] = if new { min } else { starts[i] };
-                counts[i] = if new { n } else { counts[i] + n };
+                cum += n;
+                ends[ns] = cum;
+                bsess[b] = (ns - 1) as u32;
+                bmin[b] = u32::MAX;
+                bmax[b] = 0;
+                bcnt[b] = 0;
                 prev = max;
             }
         }
         self.cents[..ns].fill(0);
         for &(b, pay) in &self.purchases {
-            let i = self.buckets[b as usize][3] as usize;
+            let i = self.bsess[b as usize] as usize;
             let price = i64::from(pay & 0x00ff_ffff);
             self.cents[i] += price;
             let cell = day_index(self.starts[i]) * self.n_cats + (pay >> 24) as usize;
@@ -416,7 +414,7 @@ impl Acc {
                 let day = &mut self.days[d];
                 day.sessions += 1;
                 day.purchasing += u32::from(cents != 0);
-                day.events += u64::from(self.counts[i]);
+                day.events += u64::from(self.ends[i + 1] - self.ends[i]);
                 day.revenue += cents;
                 mask |= 1 << d;
             }
@@ -438,6 +436,7 @@ impl Acc {
         while mask != 0 {
             let d = mask.trailing_zeros() as usize;
             mask &= mask - 1;
+            self.on_day[d] = 0;
             let day = std::mem::replace(&mut self.days[d], NO_DAY);
             self.rows.push(UserRow {
                 key,
@@ -464,6 +463,62 @@ fn slow_lt(a: u64, b: u64, slow: &SlowIntern) -> bool {
     a != 0 && b != 0 && cmp_keys(a, b, slow).is_lt()
 }
 
+/// How many entries of a sorted slice, whose length is a multiple of eight,
+/// are below x and below y: eight lanes at a time, no data-dependent steps.
+/// The three versions compute the same counts.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn below(a: &[u32], x: u32, y: u32) -> (usize, usize) {
+    use std::arch::x86_64::*;
+    // SAFETY: AVX2 is a compile-time target feature here; every chunk holds
+    // eight u32 values, and unaligned loads need no alignment.
+    unsafe {
+        // Unsigned order is signed order with the top bit flipped.
+        let flip = _mm256_set1_epi32(i32::MIN);
+        let vx = _mm256_xor_si256(_mm256_set1_epi32(x as i32), flip);
+        let vy = _mm256_xor_si256(_mm256_set1_epi32(y as i32), flip);
+        let (mut cx, mut cy) = (0u32, 0u32);
+        for c in a.chunks_exact(8) {
+            let v = _mm256_xor_si256(_mm256_loadu_si256(c.as_ptr().cast()), flip);
+            cx += (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vx, v))) as u32).count_ones();
+            cy += (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vy, v))) as u32).count_ones();
+        }
+        (cx as usize, cy as usize)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn below(a: &[u32], x: u32, y: u32) -> (usize, usize) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is always present on aarch64; every chunk holds eight u32
+    // values, loaded from in-bounds pointers.
+    unsafe {
+        let vx = vdupq_n_u32(x);
+        let vy = vdupq_n_u32(y);
+        let (mut cx, mut cy) = (vdupq_n_u32(0), vdupq_n_u32(0));
+        for c in a.chunks_exact(8) {
+            let lo = vld1q_u32(c.as_ptr());
+            let hi = vld1q_u32(c.as_ptr().add(4));
+            // A true lane is all ones, so subtracting it counts one.
+            cx = vsubq_u32(vsubq_u32(cx, vcgtq_u32(vx, lo)), vcgtq_u32(vx, hi));
+            cy = vsubq_u32(vsubq_u32(cy, vcgtq_u32(vy, lo)), vcgtq_u32(vy, hi));
+        }
+        (vaddvq_u32(cx) as usize, vaddvq_u32(cy) as usize)
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+#[inline(always)]
+fn below(a: &[u32], x: u32, y: u32) -> (usize, usize) {
+    let (mut cx, mut cy) = (0usize, 0usize);
+    for &s in a {
+        cx += usize::from(s < x);
+        cy += usize::from(s < y);
+    }
+    (cx, cy)
+}
+
 /// Number of entries below x in a sorted slice whose length is a power of
 /// two and whose last entry is u32::MAX. The steps are fixed by the length.
 #[inline(always)]
@@ -484,16 +539,14 @@ fn timestamp(event: u64) -> u32 {
 
 #[inline]
 fn day_index(start: u32) -> usize {
-    ((start - WEEK_MS as u32) / DAY_MS as u32) as usize
+    ((start - WEEK) / DAY_MS as u32) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const WEEK: u32 = WEEK_MS as u32;
     const DAY: u32 = DAY_MS as u32;
-    const GAP: u32 = GAP_MS as u32;
 
     fn ev(ts: u32, cat: u8, cents: u32) -> u64 {
         (u64::from(ts) << 32) | (u64::from(cat) << 24) | u64::from(cents)
@@ -598,5 +651,56 @@ mod tests {
         assert_eq!(row(&acc.rows[1]), (2, 7, 1, 1, 2, 0));
         assert_eq!(row(&acc.rows[2]), (3, 7, 1, 1, 0, u16::MAX));
         assert_eq!(acc.stats, [[1, 1, 2, 2], [3, 3, 40, 3], [1, 0, 0, 0]]);
+    }
+
+    // Many sessions on many days with clicks in every relation to the
+    // windows: the short and long paths must agree with each other.
+    #[test]
+    fn short_and_long_paths_agree() {
+        let slow = SlowIntern::new();
+        let cats = vec![b"a".to_vec(), b"b".to_vec()];
+        let mut seed = 0x9e37_79b9u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let span = 14 * DAY;
+        let limit = WEEK + span - 2 * GAP;
+        for round in 0..60 {
+            let ns = 1 + rnd(if round % 2 == 0 { 64 } else { 200 }) as usize;
+            let mut events = Vec::new();
+            let mut t = WEEK + rnd(u64::from(DAY)) as u32;
+            'outer: for _ in 0..ns {
+                for _ in 0..1 + rnd(4) {
+                    if t >= limit {
+                        break 'outer;
+                    }
+                    events.push(ev(t, rnd(2) as u8, if rnd(5) == 0 { 10 + rnd(100) as u32 } else { 0 }));
+                    t += rnd(u64::from(GAP)) as u32;
+                }
+                t += GAP + 1 + rnd(u64::from(span) / (ns as u64 * 2)) as u32;
+            }
+            let mut clicks: Vec<Hit> = (0..rnd(300))
+                .map(|j| Hit { ts: rnd(u64::from(WEEK + span)) as u32, id: 1 + j, camp: rnd(9) as u16 })
+                .collect();
+            let mut acc_a = Acc::new(10, 18, cats.len());
+            acc_a.person(1, &mut events.clone(), &mut clicks.clone(), &cats, &slow, 0);
+            // The same history under the long path: 65 isolated sessions are
+            // added after the 14 days, which only touch later cells.
+            let mut acc_b = Acc::new(10, 18, cats.len());
+            for i in 0..65u32 {
+                events.push(ev(WEEK + span + i * (GAP + 1) * 2, 0, 0));
+            }
+            acc_b.person(1, &mut events, &mut clicks, &cats, &slow, 0);
+            let strip = |acc: &Acc| -> Vec<[i64; 4]> {
+                acc.stats.chunks(18).flat_map(|c| c[..14].iter().copied()).collect()
+            };
+            assert_eq!(strip(&acc_a), strip(&acc_b), "round {round}: ns={ns} clicks={}", clicks.len());
+            let ra: Vec<_> = acc_a.rows.iter().map(row).collect();
+            let rb: Vec<_> = acc_b.rows.iter().map(row).filter(|r| r.1 < 14).collect();
+            assert_eq!(ra, rb);
+        }
     }
 }
