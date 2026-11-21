@@ -5,8 +5,38 @@
 use super::*;
 use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
-use crate::clock::Clock;
+use crate::clock::{self, ld8, Clock};
 use crate::links::Aliases;
+
+/// `n` bytes at `p + at`.
+///
+/// # Safety
+/// The bytes must be readable, and live as long as the result is used.
+#[inline(always)]
+unsafe fn slice<'b>(p: *const u8, at: u32, n: u32) -> &'b [u8] {
+    // SAFETY: forwarded.
+    unsafe { std::slice::from_raw_parts(p.add(at as usize), n as usize) }
+}
+
+/// The event-row sink: fixed-sequence decode, exact decode for the rest.
+struct Events<'a, 'c, 'o> {
+    dec: &'a Decoder<'a, 'c>,
+    out: &'o mut Scan,
+}
+
+impl<'b> wire::Sink<'b, 7> for Events<'_, '_, '_> {
+    #[inline(always)]
+    fn record(&mut self, f: wire::Fields<'b, 7>) {
+        if !self.dec.fast(&f, self.out) {
+            self.dec.event_exact(&f.all(), self.out);
+        }
+    }
+
+    #[inline(always)]
+    fn fields(&mut self, f: [&'b [u8]; 7]) {
+        self.dec.event_exact(&f, self.out);
+    }
+}
 
 /// The splitmix64 finalizer. Every step is invertible, so `hash` is a
 /// bijection: a mixed key identifies its key exactly, and rows carry mixed
@@ -184,11 +214,98 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
-    #[inline(never)]
-    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
-        for f in rows {
-            self.event(f, out);
+    /// The fixed-sequence decode of a clean event row whose shape the table
+    /// of forms covers: ids of eight or nine bytes, an F1 ingest with a
+    /// cached date, a ts of the three forms' usual lengths. Quotes are
+    /// stripped by arithmetic, every form of the ts is computed and the
+    /// row's selected by mask, and validity is a conjunction of flags: no
+    /// branch depends on a field's content except the predictable purchase
+    /// one. Returns false for any other row, which then takes the exact
+    /// path; both compute the same result.
+    #[inline(always)]
+    fn fast(&self, f: &wire::Fields<'_, 7>, out: &mut Scan) -> bool {
+        let p = f.first();
+        let o = f.ends();
+        // SAFETY: `Fields` guarantees p[0..=o[6]] readable. A quote flag reads
+        // a field's first byte, at most the LF. Every other load happens after
+        // the shape check and is bounded by a later field: see each.
+        unsafe {
+            // In a clean row a field starts with a quote exactly when it also
+            // ends with one; the content lies between.
+            let q = |at: u32| u32::from(*p.add(at as usize) == b'"');
+            let (q0, q1, q2, q3) = (q(0), q(o[0] + 1), q(o[1] + 1), q(o[2] + 1));
+            let (q4, q5, q6) = (q(o[3] + 1), q(o[4] + 1), q(o[5] + 1));
+            let (c0, d0) = (q0, o[0] - q0);
+            let (c1, d1) = (o[0] + 1 + q1, o[1] - q1);
+            let (c2, d2) = (o[1] + 1 + q2, o[2] - q2);
+            let (c3, d3) = (o[2] + 1 + q3, o[3] - q3);
+            let (c4, d4) = (o[3] + 1 + q4, o[4] - q4);
+            let (c5, d5) = (o[4] + 1 + q5, o[5] - q5);
+            let (c6, d6) = (o[5] + 1 + q6, o[6] - q6);
+            let (l0, l1, l2, l3) = (d0 - c0, d1 - c1, d2 - c2, d3 - c3);
+            let (l4, l5, l6) = (d4 - c4, d5 - c5, d6 - c6);
+            let (f1, f2, f3) = (l2 == 20, l2 == 25, l2.wrapping_sub(9) <= 7);
+            if !((l0.wrapping_sub(8) <= 1) & (l1.wrapping_sub(8) <= 1) & (l3 == 20) & (f1 | f2 | f3)) {
+                return false;
+            }
+            // Event id as in `event_key`: the last eight bytes, the prefix
+            // shifted out of an eight-byte id. In bounds: l0 >= 8.
+            let tail = ld8(p.add((d0 - 8) as usize));
+            let w = tail >> (8 * (9 - l0));
+            let pad = u64::from(l0 == 8) << 56;
+            let e_ok = (*p.add(c0 as usize) == b'e') & (((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0);
+            // Ingest: 20 bytes at c3.
+            let (sec, in_ok) = self.clock.iso_raw(p.add(c3 as usize));
+            let in_ok = in_ok & (*p.add((c3 + 19) as usize) == b'Z');
+            // User id: l1 bytes at c1.
+            let (ukey, u_ok) = atom::pack_raw(p.add(c1 as usize), l1);
+            if !(e_ok & in_ok & u_ok) {
+                return false;
+            }
+            // Every form of the ts at once. Its loads reach at most 25 bytes
+            // past c2, inside the 20-byte ingest that follows.
+            let t = p.add(c2 as usize);
+            let (iso, iso_ok) = self.clock.iso_raw(t);
+            let (off, off_ok) = clock::offset_raw(t);
+            let (f3v, f3_ok) = clock::epoch_raw(t, l2);
+            let iso_ok = iso_ok & ((f1 & (*t.add(19) == b'Z')) | (f2 & off_ok));
+            let iso_s = iso + (off & -i64::from(f2));
+            let mi = -i64::from(f1 | f2);
+            let ts = (iso_s.wrapping_mul(1000) & mi) | (f3v & !mi);
+            let ts_ok = ((f1 | f2) & iso_ok) | (f3 & f3_ok);
+            // Type: the eight bytes ending at d4 hold a 4- or 8-byte word; d4
+            // follows the 20-byte ingest, so d4 - 8 lies inside the row.
+            let tw = ld8(p.add((d4 - 8) as usize)).wrapping_shr(8u32.wrapping_sub(l4).wrapping_mul(8));
+            let purchase = (l4 == 8) & (tw == PURCHASE);
+            let type_ok = purchase | ((l4 == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
+            let at = sec * 1000;
+            let mut valid = ts_ok & type_ok & (l5 != 0)
+                & ((ts.wrapping_sub(self.start) as u64) < self.span) & (at.wrapping_sub(ts) <= DAY_MS);
+            let mut pay = 0u32;
+            if purchase & valid {
+                let (prod, price) = (slice(p, c5, l5), slice(p, c6, l6));
+                match parse_price(price) {
+                    Some(c) => pay = c | u32::from(product_cat(self.cx, prod)) << 24,
+                    None => valid = false,
+                }
+            }
+            let key = hash(ukey);
+            let bin = (key >> (64 - self.b.user)) as usize;
+            let val = (ts.wrapping_sub(self.origin) as u64) << 32 | u64::from(pay);
+            let mut at_row = None;
+            if valid {
+                let v = &mut out.ev[bin];
+                at_row = Some((bin, v.len()));
+                v.push(Event { key, val });
+            }
+            out.candidate(w | 1 << 63, sec, at_row, self.b);
         }
+        true
+    }
+
+    #[inline(never)]
+    fn event_exact(&self, f: &[&[u8]; 7], out: &mut Scan) {
+        self.event(f, out);
     }
 
     #[inline(always)]
@@ -575,7 +692,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
+                    0=>wire::records::<7>(buf,Events{dec:&dec,out:&mut out}),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -831,7 +948,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(rows, &mut out));
+            wire::records::<7>(body, Events { dec: &dec, out: &mut out });
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());

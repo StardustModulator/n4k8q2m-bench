@@ -81,6 +81,27 @@ impl Clock {
         self.iso(b)
     }
 
+    /// The branch-free form of `iso` for the fixed-sequence row decoder:
+    /// "YYYY-MM-DDTHH:MM:SS" at `p` in seconds, and whether the date is
+    /// cached and the time of day valid. The terminator byte is the
+    /// caller's. A false flag never means "invalid": the exact path decides.
+    ///
+    /// # Safety
+    /// `p` must point at 19 readable bytes.
+    #[inline(always)]
+    pub(super) unsafe fn iso_raw(&self, p: *const u8) -> (i64, bool) {
+        // SAFETY: 19 readable bytes cover every load.
+        let (lo, hi) = unsafe { (ld8(p), ld4(p.add(8)) & 0xff_ffff) };
+        // `slot` from the loaded words: b[6] is byte 6 of `lo`, b[8..10] the
+        // low half of `hi`. Any bytes give an in-range index.
+        let dd = (hi as u16).wrapping_mul(2561) >> 8;
+        let day = &self.days[(((lo >> 48) as usize & 1) << 5) | usize::from(dd & 31)];
+        let tag_ok = ((day.lo ^ lo) | u64::from(day.hi ^ hi)) == 0;
+        // SAFETY: as above.
+        let (hms, hms_ok) = hms_raw(unsafe { ld8(p.add(11)) });
+        (day.midnight + hms, tag_ok & hms_ok)
+    }
+
     /// Seconds since the epoch.
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
@@ -126,6 +147,13 @@ const HMS_BIAS: u64 = LOW7 - u64::from_le_bytes(*b"29:59:59");
 
 #[inline(always)]
 fn hms_s(raw: u64) -> Option<i64> {
+    let (s, ok) = hms_raw(raw);
+    ok.then_some(s)
+}
+
+/// "HH:MM:SS" as seconds, and whether every byte was in range.
+#[inline(always)]
+fn hms_raw(raw: u64) -> (i64, bool) {
     // In each lane require MIN <= byte <= MAX (the two colons have min=max).
     // Valid lanes cannot carry/borrow into a neighbor, so the *first* invalid
     // lane necessarily contributes a high bit to one of these two words.
@@ -134,12 +162,59 @@ fn hms_s(raw: u64) -> Option<i64> {
     // 2561 = 10*256+1: each ones byte receives ten times its tens byte.
     let pairs = digits.wrapping_mul(2561) >> 8;
     let h = i64::from(pairs as u8);
-    if bad != 0 || h > 23 {
-        return None;
-    }
     let m = i64::from((pairs >> 24) as u8);
     let s = i64::from((pairs >> 48) as u8);
-    Some((h * 60 + m) * 60 + s)
+    ((h * 60 + m) * 60 + s, (bad == 0) & (h <= 23))
+}
+
+#[inline(always)]
+pub(super) unsafe fn ld8(p: *const u8) -> u64 {
+    // SAFETY: the caller passes 8 readable bytes; the load is unaligned.
+    unsafe { p.cast::<u64>().read_unaligned() }
+}
+
+#[inline(always)]
+pub(super) unsafe fn ld4(p: *const u8) -> u32 {
+    // SAFETY: the caller passes 4 readable bytes; the load is unaligned.
+    unsafe { p.cast::<u32>().read_unaligned() }
+}
+
+/// The F2 zone of a 25-byte form at `p`, as the signed seconds to ADD to the
+/// local time, and whether sign, digits and colon are all valid.
+///
+/// # Safety
+/// `p` must point at 25 readable bytes.
+#[inline(always)]
+pub(super) unsafe fn offset_raw(p: *const u8) -> (i64, bool) {
+    // SAFETY: bytes 17..25 and 19 lie within the 25.
+    let (hm, sign) = unsafe { (ld8(p.add(17)) >> 24, *p.add(19)) };
+    // "HH:MM" plus ":00" seconds for the same checked decoder (see `iso`).
+    let (off, ok) = hms_raw(hm | (HMS_MIN & (u64::MAX << 40)));
+    let plus = sign == b'+';
+    // East of UTC the local time is ahead: subtract. Negate without a branch.
+    let neg = -i64::from(plus);
+    ((off ^ neg) - neg, ok & (plus | (sign == b'-')))
+}
+
+/// `n` bytes at `p` as F3 epoch milliseconds, for 9 <= n <= 16, and whether
+/// all are digits. Any `n` up to 25 is safe to pass (the flag may lie, the
+/// caller selects by form); the value is then meaningless.
+///
+/// # Safety
+/// `p` must point at `max(n, 8)` readable bytes.
+#[inline(always)]
+pub(super) unsafe fn epoch_raw(p: *const u8, n: u32) -> (i64, bool) {
+    const ZERO: u64 = u64::from_le_bytes(*b"00000000");
+    const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
+    // SAFETY: both loads end at or before p + max(n, 8).
+    let (a, z) = unsafe { (ld8(p), ld8(p.add(n.saturating_sub(8) as usize))) };
+    let hi = a.wrapping_sub(ZERO);
+    let lo = z.wrapping_sub(ZERO);
+    let ok = (hi | lo | a.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
+    // Left-pad the first n - 8 digits to eight lanes (a wrapping amount for
+    // forms this does not serve).
+    let prefix = hi.wrapping_shl(16u32.wrapping_sub(n).wrapping_mul(8));
+    ((decimal8(prefix).wrapping_mul(100_000_000).wrapping_add(decimal8(lo))) as i64, ok)
 }
 
 #[inline(always)]
