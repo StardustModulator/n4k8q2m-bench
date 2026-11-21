@@ -297,31 +297,34 @@ impl Decoder<'_, '_> {
             let n1 = e(1).wrapping_sub(s1).wrapping_sub(2 * q1);
             let tail = ld8(p1.add(n1.wrapping_sub(8).min(1))).swap_bytes();
             let (user_ok, ukey) = atom::pack_tail(*p1, tail, n1);
-            // Timestamp: F1, F2 and 9 to 16 digits all decoded, the width selects.
+            // Timestamp and ingest. Their clocks decode side by side; F1 and
+            // the digit form are both computed and the width selects, since a
+            // dispatch on the form mix mispredicts almost every other row and
+            // discards the rows in flight behind it. F2 stays a branch: one
+            // row in ten.
             let s2 = e(1) + 1;
             let q2 = q(s2);
             let p2 = row.add(s2 + q2);
             let n2 = e(2).wrapping_sub(s2).wrapping_sub(2 * q2);
-            let (hit2, mid2) = self.clock.probe(p2);
-            let (hms_ok2, sec2) = clock::hms(ld8(p2.add(11)));
-            let (off_ok, off) = clock::offset(ld8(p2.add(17)));
-            let zone = *p2.add(19);
-            let local = mid2 + sec2;
-            let f1 = (n2 == 20) & (zone == b'Z') & hit2 & hms_ok2;
-            let f2 = (n2 == 25) & ((zone == b'+') | (zone == b'-')) & hit2 & hms_ok2 & off_ok;
-            let shifted = if zone == b'+' { local - off } else { local + off };
-            let iso = (if n2 == 25 { shifted } else { local }) * 1000;
-            let (dig_ok, f3v) = clock::epoch16(ld8(p2), ld8(p2.add(n2.wrapping_sub(8).min(8))), n2);
-            let f3 = (n2.wrapping_sub(9) <= 7) & dig_ok;
-            let ts_ok = f1 | f2 | f3;
-            let ts = if f3 { f3v } else { iso };
-            // Ingest: F1 only, as ingest_s.
             let s3 = e(2) + 1;
             let q3 = q(s3);
             let p3 = row.add(s3 + q3);
             let n3 = e(3).wrapping_sub(s3).wrapping_sub(2 * q3);
+            let (hit2, mid2) = self.clock.probe(p2);
             let (hit3, mid3) = self.clock.probe(p3);
-            let (hms_ok3, sec3) = clock::hms(ld8(p3.add(11)));
+            let (hms_ok2, hms_ok3, sec2, sec3) = clock::hms2(ld8(p2.add(11)), ld8(p3.add(11)));
+            let zone = *p2.add(19);
+            let local = mid2 + sec2;
+            let (dig_ok, f3v) = clock::epoch16(ld8(p2), ld8(p2.add(n2.wrapping_sub(8).min(8))), n2);
+            let f3 = (n2.wrapping_sub(9) <= 7) & dig_ok;
+            let mut ts_ok = f3 | ((n2 == 20) & (zone == b'Z') & hit2 & hms_ok2);
+            let mut ts = if f3 { f3v } else { local * 1000 };
+            if n2 == 25 {
+                let (off_ok, off) = clock::offset(ld8(p2.add(17)));
+                ts_ok = hit2 & hms_ok2 & off_ok & ((zone == b'+') | (zone == b'-'));
+                ts = (if zone == b'+' { local - off } else { local + off }) * 1000;
+            }
+            // Ingest: F1 only, as ingest_s.
             let ingest_ok = (n3 == 20) & (*p3.add(19) == b'Z') & hit3 & hms_ok3;
             let sec = mid3 + sec3;
             // Type: whole-word compares.
