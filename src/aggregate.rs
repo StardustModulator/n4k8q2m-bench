@@ -67,9 +67,9 @@ pub(super) struct Acc {
     // Per campaign: epoch << 32 | sessions already counted as assisted (long
     // path) or its local number (short path).
     covered: Vec<u64>,
-    // Short path: per entry session (1 + time, ID, campaign) of the best
-    // click; per local campaign its number and assisted sessions.
-    top: Vec<(u32, u64, u16)>,
+    // Short path: per entry session the best click, tagged with the epoch;
+    // per local campaign its number and assisted sessions.
+    top: Vec<(u64, u64, u16)>,
     local: Vec<u16>,
     runs: Vec<u64>,
     // Short path: sessions of each day; cleared again with the rows.
@@ -163,15 +163,6 @@ impl Acc {
         // Pad the starts to whole groups of eight for the counting.
         let p = (ns + 7) & !7;
         self.starts[ns..p].fill(u32::MAX);
-        let mut mask = 0u64;
-        for i in 0..ns {
-            let d = day_index(self.starts[i]);
-            self.day_of[i] = d as u8;
-            self.on_day[d] |= 1 << i;
-            mask |= 1 << d;
-        }
-        // Per entry session: one plus the best time, its ID and campaign.
-        self.top[..=ns].fill((0, 0, 0));
         self.epoch += 1;
         let epoch = self.epoch;
         let mut nl = 0usize;
@@ -180,13 +171,15 @@ impl Acc {
             // Session i holds the click when start - WEEK <= ts <= start:
             // a = #(start < ts) sessions come before, b = #(start <= ts + WEEK).
             let (a, b) = below(starts, h.ts, h.ts.saturating_add(WEEK + 1));
-            // a <= b <= ns <= 64.
+            // Per entry session the best click: epoch << 32 | 1 + time, its ID
+            // and campaign. An entry left by an earlier person loses to any
+            // click of this one, so nothing needs clearing. a <= b <= ns <= 64.
             // SAFETY: `top` has 65 entries.
             let top = unsafe { self.top.get_unchecked_mut(a) };
             let (t, id, camp) = *top;
+            let t2 = epoch << 32 | u64::from(h.ts) + 1;
             // Computed before the time test, which keeps this free of branches.
             let smaller = id_lt(h.id, id, slow);
-            let t2 = h.ts + 1;
             let better = t2 > t || (t2 == t && smaller);
             *top = (if better { t2 } else { t }, if better { h.id } else { id }, if better { h.camp } else { camp });
             let k = usize::from(h.camp);
@@ -201,13 +194,18 @@ impl Acc {
             self.runs[x] = (LOW[b] & !LOW[a]) | (self.runs[x] & keep);
         }
         // Later entry sessions hold strictly later clicks, so a filled entry
-        // always replaces the carried one.
+        // always replaces the carried one. The same pass records each
+        // session's day and each day's sessions for the assists below.
         let (mut t, mut camp) = (0u32, 0u16);
+        let mut mask = 0u64;
         for i in 0..ns {
             let (t2, _, camp2) = self.top[i];
-            let take = t2 != 0;
-            (t, camp) = (if take { t2 } else { t }, if take { camp2 } else { camp });
-            let d = usize::from(self.day_of[i]);
+            let take = t2 >> 32 == epoch;
+            (t, camp) = (if take { t2 as u32 } else { t }, if take { camp2 } else { camp });
+            let d = day_index(self.starts[i]);
+            self.day_of[i] = d as u8;
+            self.on_day[d] |= 1 << i;
+            mask |= 1 << d;
             let c = if t > self.starts[i] - WEEK { usize::from(camp) } else { self.organic };
             self.credit(i, c, d);
         }
