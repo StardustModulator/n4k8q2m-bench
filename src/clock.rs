@@ -179,44 +179,6 @@ pub(super) unsafe fn ld4(p: *const u8) -> u32 {
     unsafe { p.cast::<u32>().read_unaligned() }
 }
 
-/// The F2 zone of a 25-byte form at `p`, as the signed seconds to ADD to the
-/// local time, and whether sign, digits and colon are all valid.
-///
-/// # Safety
-/// `p` must point at 25 readable bytes.
-#[inline(always)]
-pub(super) unsafe fn offset_raw(p: *const u8) -> (i64, bool) {
-    // SAFETY: bytes 17..25 and 19 lie within the 25.
-    let (hm, sign) = unsafe { (ld8(p.add(17)) >> 24, *p.add(19)) };
-    // "HH:MM" plus ":00" seconds for the same checked decoder (see `iso`).
-    let (off, ok) = hms_raw(hm | (HMS_MIN & (u64::MAX << 40)));
-    let plus = sign == b'+';
-    // East of UTC the local time is ahead: subtract. Negate without a branch.
-    let neg = -i64::from(plus);
-    ((off ^ neg) - neg, ok & (plus | (sign == b'-')))
-}
-
-/// `n` bytes at `p` as F3 epoch milliseconds, for 9 <= n <= 16, and whether
-/// all are digits. Any `n` up to 25 is safe to pass (the flag may lie, the
-/// caller selects by form); the value is then meaningless.
-///
-/// # Safety
-/// `p` must point at `max(n, 8)` readable bytes.
-#[inline(always)]
-pub(super) unsafe fn epoch_raw(p: *const u8, n: u32) -> (i64, bool) {
-    const ZERO: u64 = u64::from_le_bytes(*b"00000000");
-    const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
-    // SAFETY: both loads end at or before p + max(n, 8).
-    let (a, z) = unsafe { (ld8(p), ld8(p.add(n.saturating_sub(8) as usize))) };
-    let hi = a.wrapping_sub(ZERO);
-    let lo = z.wrapping_sub(ZERO);
-    let ok = (hi | lo | a.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
-    // Left-pad the first n - 8 digits to eight lanes (a wrapping amount for
-    // forms this does not serve).
-    let prefix = hi.wrapping_shl(16u32.wrapping_sub(n).wrapping_mul(8));
-    ((decimal8(prefix).wrapping_mul(100_000_000).wrapping_add(decimal8(lo))) as i64, ok)
-}
-
 #[inline(always)]
 fn epoch_ms(b: &[u8]) -> Option<i64> {
     let n = b.len();

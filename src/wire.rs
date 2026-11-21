@@ -79,19 +79,6 @@ impl<'b, const N: usize> Fields<'b, N> {
         unsafe { *self.ends.add(i) - self.first.offset_from(self.base) as u32 }
     }
 
-    /// All N of `end`.
-    #[inline(always)]
-    pub(super) fn ends(&self) -> [u32; N] {
-        // SAFETY: the N slots at `ends` belong to this record (see `get`).
-        let row = unsafe { self.first.offset_from(self.base) } as u32;
-        let mut out = [0u32; N];
-        for (i, o) in out.iter_mut().enumerate() {
-            // SAFETY: as above.
-            *o = unsafe { *self.ends.add(i) } - row;
-        }
-        out
-    }
-
     /// Field `i` without its syntactic quotes.
     #[inline(always)]
     fn get(&self, i: usize) -> &'b [u8] {

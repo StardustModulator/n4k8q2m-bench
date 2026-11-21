@@ -5,7 +5,7 @@
 use super::*;
 use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
-use crate::clock::{self, ld8, Clock};
+use crate::clock::{ld8, Clock};
 use crate::links::Aliases;
 
 /// `n` bytes at `p + at`.
@@ -231,12 +231,11 @@ impl Decoder<'_, '_> {
     }
 
     /// The decode of a clean event row of the usual shapes: ids of eight or
-    /// nine bytes, an F1 ingest with a cached date, a ts of the three forms'
-    /// usual lengths. Fields are sliced by arithmetic from the separator
-    /// offsets, one at a time so that few values stay live, and F1 and F3
-    /// (the unpredictable pair) are both computed and the row's selected by
-    /// mask. Returns false for any other row, which then takes the exact
-    /// path; both compute the same result.
+    /// nine bytes and an F1 ingest with a cached date. Fields are sliced by
+    /// arithmetic from the separator offsets, one at a time so that few
+    /// values stay live (seven eager ranges spilled on x86). Returns false
+    /// for any other row, which then takes the exact path; both compute the
+    /// same result.
     #[inline(always)]
     fn fast(&self, f: &wire::Fields<'_, 7>, out: &mut Scan) -> bool {
         let p = f.first();
@@ -289,10 +288,8 @@ impl Decoder<'_, '_> {
             if !(in_ok & (*g.add(19) == b'Z')) {
                 return false;
             }
-            // The ts: F2 is rare enough for a branch; F1 and F3 are computed
-            // both and selected. Their loads reach at most 25 bytes past the
-            // content start, inside the ingest.
-            let t = p.add((r2 + q2) as usize);
+            // The ts keeps the clock's dispatch by form: computing F1 and F3
+            // both and selecting by mask cost more than the branch.
             let (ts, ts_ok) = match self.clock.parse(slice(p, r2 + q2, l2)) { Some(v) => (v, true), None => (0, false) };
             // Type: the eight bytes ending at the field's end hold a 4- or
             // 8-byte word; they start inside the row, after the ingest.
@@ -981,9 +978,10 @@ mod bench {
             impl<'b> wire::Sink<'b, 7> for S {
                 #[inline(always)]
                 fn record(&mut self, f: wire::Fields<'b, 7>) {
-                    let (p, o) = (f.first(), f.ends());
+                    let p = f.first();
                     for i in 0..7 {
-                        self.0 += o[i] + unsafe { u32::from(*p.add(if i == 0 { 0 } else { o[i - 1] as usize + 1 }) == b'"') };
+                        let r = if i == 0 { 0 } else { f.end(i - 1) + 1 };
+                        self.0 += f.end(i) + unsafe { u32::from(*p.add(r as usize) == b'"') };
                     }
                 }
                 fn fields(&mut self, f: [&'b [u8]; 7]) { self.0 += f[6].len() as u32; }
