@@ -584,11 +584,14 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                     }),
                 }
             }
-            out
+            (out,total.elapsed())
         })).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     let parsed=total.elapsed();
+    // Idle tail of the parse: the first worker to run out of chunks waits this long.
+    let tail=parsed.saturating_sub(scans.iter().map(|s|s.1).min().unwrap_or(parsed));
+    let scans=scans.into_iter().map(|s|s.0);
     let slow=shared.slow.into_inner().unwrap();
     let mut evs=Vec::with_capacity(threads);
     let mut cls=Vec::with_capacity(threads);
@@ -601,10 +604,14 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         for ((c,wd),(cv,wv)) in cands.iter_mut().zip(s.cand.into_iter().zip(s.wide)) {c.push(cv);wd.push(wv);}
         lks.push(s.links);
     }
-    let aliases=links::build(lks,&slow,threads,pb);
-    let indexed=total.elapsed();
+    // Linking and dedup are independent. Side by side, dedup jobs fill the
+    // cores that the link build's serial steps leave idle.
     let rows=Rows::new(&mut evs,b.user);
-    consume(cands,threads,||(),|_,(c,wd)|dedup(c,wd,&rows,b.id));
+    let (aliases,indexed)=thread::scope(|scope|{
+        let linker=scope.spawn(||{let a=links::build(lks,&slow,threads,pb);(a,total.elapsed())});
+        consume(cands,threads,||(),|_,(c,wd)|dedup(c,wd,&rows,b.id));
+        linker.join().unwrap()
+    });
     drop(rows);
     let reduced=total.elapsed();
     let shift=64-b.user;
@@ -640,14 +647,25 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         }
     }
     if std::env::var_os("STAGES").is_some() {
-        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={}",
+        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={} parse_tail={}{}",
             prep.as_millis(),(parsed-prep).as_millis(),(indexed-parsed).as_millis(),(reduced-indexed).as_millis(),
-            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis());
+            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis(),
+            tail.as_millis(),cpu_stats());
     }
     // The process exits right after writing; unmapping is wasted time.
     std::mem::forget(maps);
     std::mem::forget(aliases);
     Ok(Tables{users,camps_out,camps,cat_names,slow,organic})
+}
+
+/// CPU seconds and minor faults of this process so far (Linux), for STAGES.
+fn cpu_stats()->String {
+    let Ok(stat)=fs::read_to_string("/proc/self/stat") else {return String::new()};
+    let Some((_,rest))=stat.rsplit_once(')') else {return String::new()};
+    let f:Vec<&str>=rest.split_whitespace().collect();
+    let num=|i:usize|f.get(i).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0);
+    // Fields after the command: state is index 0, so minflt=7, utime=11, stime=12 (ticks of 10 ms).
+    format!(" cpu_user_ms={} cpu_sys_ms={} minflt={}",num(11)*10,num(12)*10,num(7))
 }
 
 #[cfg(test)]
