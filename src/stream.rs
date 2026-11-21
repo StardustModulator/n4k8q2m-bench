@@ -3,7 +3,7 @@
 //! are sufficient; neither an all-user interner nor a global sort is needed.
 use super::*;
 use crate::aggregate::{Acc, Hit};
-use crate::group::{histories, Click, Event, Histories};
+use crate::group::{Click, Event, Histories};
 use crate::clock::Clock;
 use crate::links::Aliases;
 
@@ -290,16 +290,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     for r in routed {
         for (dst,src) in by_user.iter_mut().zip(r) {dst.push(src);}
     }
-    let named=consume(by_user.into_iter().enumerate().collect(),threads,||(hist(),Vec::new()),
-        |(out,kept),(b,job)|kept.push((b,rename(job,&aliases,out,shift,b))));
-    let mut by_name:Vec<Vec<Histories>>=bins(pb);
-    for (r,kept) in named {
-        for (dst,src) in by_name.iter_mut().zip(r) {dst.push(src);}
-        for (b,mut parts) in kept {by_name[b].append(&mut parts);}
-    }
-    by_name.sort_unstable_by_key(|s|std::cmp::Reverse(s.iter().map(|p|p.ev.len()+p.cl.len()).sum::<usize>()));
-    let partials=consume(by_name,threads,||Acc::new(camps.len(),days,cat_names.len()),
-                         |acc,job|histories(job,acc,&cat_names,&slow,w.start_day));
+    let partials=crate::persons::run(by_user,&aliases,threads,shift,||Acc::new(camps.len(),days,cat_names.len()),
+                                     &cat_names,&slow,w.start_day);
     let grouped=total.elapsed();
     let mut users=Vec::with_capacity(partials.iter().map(|p|p.rows.len()).sum());
     let mut stats=vec![[0i64;4];camps.len()*days];
