@@ -306,18 +306,46 @@ impl Acc {
         mask
     }
 
-    pub(super) fn person(
-        &mut self,
-        key: u64,
-        events: &mut [u64],
-        clicks: &mut [Hit],
-        cats: &[Vec<u8>],
-        slow: &SlowIntern,
-        first_day: i32,
-    ) {
-        if events.is_empty() {
-            return;
+    /// Sessions of a few events: a fixed comparator network sorts them, and
+    /// one sweep finds the breaks. Leaves starts, ends and purchases
+    /// (session, pay); returns the session count.
+    #[inline]
+    fn sessions_sorted(&mut self, events: &[u64]) -> usize {
+        let n = events.len();
+        let mut v = [u64::MAX; 16];
+        v[..n].copy_from_slice(events);
+        if n <= 8 {
+            sort8(&mut v);
+        } else {
+            sort16(&mut v);
         }
+        let (starts, ends) = (&mut self.starts[..], &mut self.ends[..]);
+        let purchases = &mut self.purchases;
+        purchases.clear();
+        ends[0] = 0;
+        // The first offset is at least a week, so it opens a session. Every
+        // event writes the start of a would-be next session, which the real
+        // next start overwrites.
+        let mut ns = 0;
+        let mut prev = 0u32;
+        for (i, &e) in v[..n].iter().enumerate() {
+            let ts = timestamp(e);
+            let new = ts - prev > GAP;
+            starts[ns] = ts;
+            ns += usize::from(new);
+            ends[ns] = i as u32 + 1;
+            prev = ts;
+            let pay = e as u32;
+            if pay != 0 {
+                purchases.push((ns as u32 - 1, pay));
+            }
+        }
+        ns
+    }
+
+    /// Sessions of many events through the bucket summaries. Leaves starts,
+    /// ends and purchases (session, pay); returns the session count.
+    fn sessions_bucketed(&mut self, events: &[u64]) -> usize {
         // Bucket the events instead of sorting them. Locals keep the slices
         // in registers; a 32-bit time divided by the gap indexes the fixed
         // tables without bounds checks.
@@ -394,9 +422,28 @@ impl Acc {
                 prev = max;
             }
         }
+        for p in self.purchases.iter_mut() {
+            p.0 = self.bsess[p.0 as usize];
+        }
+        ns
+    }
+
+    pub(super) fn person(
+        &mut self,
+        key: u64,
+        events: &mut [u64],
+        clicks: &mut [Hit],
+        cats: &[Vec<u8>],
+        slow: &SlowIntern,
+        first_day: i32,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        let ns = if events.len() <= 16 { self.sessions_sorted(events) } else { self.sessions_bucketed(events) };
         self.cents[..ns].fill(0);
-        for &(b, pay) in &self.purchases {
-            let i = self.bsess[b as usize] as usize;
+        for &(i, pay) in &self.purchases {
+            let i = i as usize;
             let price = i64::from(pay & 0x00ff_ffff);
             self.cents[i] += price;
             let cell = day_index(self.starts[i]) * self.n_cats + (pay >> 24) as usize;
@@ -555,6 +602,43 @@ fn below2(a: &[u32], summary: &[u32], x: u32, y: u32) -> (usize, usize) {
     (8 * cx + ax, 8 * cy + by)
 }
 
+/// Compare-exchange the listed pairs in turn, each a min and a max.
+macro_rules! network {
+    ($v:ident; $(($i:literal, $j:literal)),* $(,)?) => {
+        $( { let (a, b) = ($v[$i], $v[$j]); $v[$i] = a.min(b); $v[$j] = a.max(b); } )*
+    };
+}
+
+/// Sort the first eight entries: 19 comparators in 6 layers.
+#[inline(always)]
+fn sort8(v: &mut [u64; 16]) {
+    network!(v;
+        (0, 1), (2, 3), (4, 5), (6, 7),
+        (0, 2), (1, 3), (4, 6), (5, 7),
+        (1, 2), (5, 6),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+        (2, 4), (3, 5),
+        (1, 2), (3, 4), (5, 6),
+    );
+}
+
+/// Sort all sixteen entries: 60 comparators in 10 layers.
+#[inline(always)]
+fn sort16(v: &mut [u64; 16]) {
+    network!(v;
+        (0, 13), (1, 12), (2, 15), (3, 14), (4, 8), (5, 6), (7, 11), (9, 10),
+        (0, 5), (1, 7), (2, 9), (3, 4), (6, 13), (8, 14), (10, 15), (11, 12),
+        (0, 1), (2, 3), (4, 5), (6, 8), (7, 9), (10, 11), (12, 13), (14, 15),
+        (0, 2), (1, 3), (4, 10), (5, 11), (6, 7), (8, 9), (12, 14), (13, 15),
+        (1, 2), (3, 12), (4, 6), (5, 7), (8, 10), (9, 11), (13, 14),
+        (1, 4), (2, 6), (5, 8), (7, 10), (9, 13), (11, 14),
+        (2, 4), (3, 6), (9, 12), (11, 13),
+        (3, 5), (6, 8), (7, 9), (10, 12),
+        (3, 4), (5, 6), (7, 8), (9, 10), (11, 12),
+        (6, 7), (8, 9),
+    );
+}
+
 #[inline]
 fn timestamp(event: u64) -> u32 {
     (event >> 32) as u32
@@ -674,6 +758,25 @@ mod tests {
         assert_eq!(row(&acc.rows[1]), (2, 7, 1, 1, 2, 0));
         assert_eq!(row(&acc.rows[2]), (3, 7, 1, 1, 0, u16::MAX));
         assert_eq!(acc.stats, [[1, 1, 2, 2], [3, 3, 40, 3], [1, 0, 0, 0]]);
+    }
+
+    // By the 0-1 principle a network that sorts every 0/1 input sorts all.
+    #[test]
+    fn comparator_networks_sort() {
+        for x in 0..1u32 << 16 {
+            let mut v = [0u64; 16];
+            for i in 0..16 {
+                v[i] = u64::from(x >> i & 1);
+            }
+            let mut w = v;
+            sort16(&mut w);
+            assert!(w.windows(2).all(|p| p[0] <= p[1]), "{x:016b}");
+            if x < 1 << 8 {
+                v[8..].fill(u64::MAX);
+                sort8(&mut v);
+                assert!(v.windows(2).all(|p| p[0] <= p[1]), "{x:08b}");
+            }
+        }
     }
 
     // Many sessions on many days with clicks in every relation to the
