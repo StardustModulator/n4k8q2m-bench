@@ -60,6 +60,22 @@ fn sized<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
+/// Push to one of thousands of bins, fetching the line after the tail early.
+/// A bin takes a row only every few thousand rows, so its tail's next line
+/// is one no hardware prefetcher predicted: a store to it waits in the store
+/// buffer for a cold read-for-ownership, and that wait is the scatter's
+/// stall. Fetched a line ahead, the line is in cache by the next crossing.
+#[inline(always)]
+fn push_far<T>(v: &mut Vec<T>, x: T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, whatever the address.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(v.as_ptr().add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T0);
+    }
+    v.push(x);
+}
+
 struct Scan {
     ev: Vec<Vec<Event>>,  // by raw user
     cl: Vec<Vec<Click>>,  // by raw user
@@ -78,7 +94,7 @@ impl Scan {
             Some((bin, row)) => (row as u64) << b.user | bin as u64,
         };
         if (loc < DEAD as u64 || at_row.is_none()) && (0..=u32::MAX as i64).contains(&sec) {
-            self.cand[part].push(Cand { h, sec: sec as u32, loc: loc as u32 });
+            push_far(&mut self.cand[part], Cand { h, sec: sec as u32, loc: loc as u32 });
         } else {
             self.push_wide(part, Wide { h, at: sec * 1000, at_row });
         }
@@ -202,7 +218,7 @@ impl Decoder<'_, '_> {
             let bin = (key >> (64 - self.b.user)) as usize;
             let v = &mut out.ev[bin];
             at_row = Some((bin, v.len()));
-            v.push(Event { key, val });
+            push_far(v, Event { key, val });
         }
         out.candidate(id, sec, at_row, self.b);
     }
