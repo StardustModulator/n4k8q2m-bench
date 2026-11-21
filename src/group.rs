@@ -41,6 +41,26 @@ pub(super) struct Scratch {
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Records whose table slot is fetched ahead of their turn.
+const AHEAD: usize = 12;
+
+/// Pull the line holding `p` towards the core; a hint, never a fault.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch hint has no effect beyond the caches.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast())
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch hint has no effect beyond the caches.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
 // Within a person shard the table and cursors fit in private caches: number
 // every row by its person's slot, count, then scatter each person's events
 // and clicks together. Neither events nor clicks get sorted (see `aggregate`).
@@ -82,8 +102,11 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     // `number` gave every event a slot below slots.len() and counted it in
     // that slot, so each cursor stays below the next slot's start <= es (cs).
     let (ev_ids, cl_ids) = ids[..ne + nc].split_at(ne);
-    for (r, &id) in parts.iter().flat_map(|p| &p.ev).zip(ev_ids) {
-        // SAFETY: see above.
+    for (i, (r, &id)) in parts.iter().flat_map(|p| &p.ev).zip(ev_ids).enumerate() {
+        // SAFETY: a slot number is below slots.len(); the lookahead index is
+        // clamped to the numbered events.
+        let next = unsafe { *ev_ids.get_unchecked((i + AHEAD).min(ne - 1)) };
+        prefetch(unsafe { slots.get_unchecked(next as usize) });
         let cursor = unsafe { &mut slots.get_unchecked_mut(id as usize).ev };
         unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
         *cursor += 1;
@@ -135,7 +158,10 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
     let home = |key: u64| (key.wrapping_mul(MUL) >> shift) as usize;
     for p in parts {
         let ev = &p.ev[..];
-        for e in ev.iter() {
+        for (i, e) in ev.iter().enumerate() {
+            // The slot of a later record is fetched while this one waits.
+            // SAFETY: the index is clamped to the part; home() <= mask.
+            prefetch(unsafe { slots.get_unchecked(home(ev.get_unchecked((i + AHEAD).min(ev.len() - 1)).key)) });
             let key = e.key;
             let s = home(key);
             // A key sits in its home slot or the next one unless its run is
