@@ -364,39 +364,17 @@ impl Decoder<'_, '_> {
         }
     }
 
-    /// The exact path for the record `buf[o..lf]`: split on commas, check
-    /// every field's quotes, decode as the scalar decoder does. Returns the
-    /// number of separators the record holds: its commas and its LF or EOF.
+    /// The exact path for the record `buf[o..lf]`: the general scanner on
+    /// that one record, then the scalar decoder. Returns the number of
+    /// separators the record holds: its commas and its LF or EOF.
     #[cold]
     #[inline(never)]
     fn slow_event(&self, buf: &[u8], o: usize, lf: usize, out: &mut Scan) -> usize {
         #[cfg(test)]
         SLOW_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
         let row = &buf[o..lf];
-        let mut f: [&[u8]; 7] = [&row[..0]; 7];
-        let (mut k, mut s, mut ok) = (0usize, 0usize, true);
-        for (i, &b) in row.iter().enumerate().chain(std::iter::once((row.len(), &b','))) {
-            if b != b',' {
-                continue;
-            }
-            let raw = &row[s..i];
-            if k < 7 {
-                f[k] = match raw.iter().filter(|&&b| b == b'"').count() {
-                    0 => raw,
-                    2 if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' => &raw[1..raw.len() - 1],
-                    _ => {
-                        ok = false;
-                        raw
-                    }
-                };
-            }
-            k += 1;
-            s = i + 1;
-        }
-        if k == 7 && ok {
-            self.event(&f, out);
-        }
-        k
+        wire::rows::<7>(row, |f| self.event(&f, out));
+        memchr::memchr_iter(b',', row).count() + 1
     }
 
     #[inline(always)]
