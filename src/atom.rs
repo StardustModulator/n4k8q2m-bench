@@ -75,6 +75,21 @@ pub(super) fn try_pack(s: &[u8]) -> Option<u64> {
     Some((u64::from(rank) << 60) | (gather_ascii(word) << 4) | n as u64)
 }
 
+/// `try_pack` of the `n` bytes at `p` for n = 8 or 9, with its outcome as a
+/// flag, for the fixed-sequence row decoder.
+///
+/// # Safety
+/// `p` must point at `n` readable bytes, and `n` must be 8 or 9.
+#[inline(always)]
+pub(super) unsafe fn pack_raw(p: *const u8, n: u32) -> (u64, bool) {
+    debug_assert!(n == 8 || n == 9);
+    // SAFETY: the last eight of the n bytes.
+    let (rank, tail) = unsafe { (RANK[*p as usize], p.add(n as usize - 8).cast::<[u8; 8]>().read_unaligned()) };
+    // n = 8: the word holds the prefix too; shift it out (see `try_pack`).
+    let word = u64::from_be_bytes(tail) << (8 * (9 - n));
+    ((u64::from(rank) << 60) | (gather_ascii(word) << 4) | u64::from(n), (rank != 0) & (word & !ASCII == 0))
+}
+
 /// Write the original bytes of a fast key to `buf[..returned_length]`.
 #[inline]
 pub(super) fn write_id(key: u64, buf: &mut [u8; 24]) -> usize {

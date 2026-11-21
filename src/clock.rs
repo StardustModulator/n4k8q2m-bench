@@ -81,6 +81,27 @@ impl Clock {
         self.iso(b)
     }
 
+    /// The branch-free form of `iso` for the fixed-sequence row decoder:
+    /// "YYYY-MM-DDTHH:MM:SS" at `p` in seconds, and whether the date is
+    /// cached and the time of day valid. The terminator byte is the
+    /// caller's. A false flag never means "invalid": the exact path decides.
+    ///
+    /// # Safety
+    /// `p` must point at 19 readable bytes.
+    #[inline(always)]
+    pub(super) unsafe fn iso_raw(&self, p: *const u8) -> (i64, bool) {
+        // SAFETY: 19 readable bytes cover every load.
+        let (lo, hi) = unsafe { (ld8(p), ld4(p.add(8)) & 0xff_ffff) };
+        // `slot` from the loaded words: b[6] is byte 6 of `lo`, b[8..10] the
+        // low half of `hi`. Any bytes give an in-range index.
+        let dd = (hi as u16).wrapping_mul(2561) >> 8;
+        let day = &self.days[(((lo >> 48) as usize & 1) << 5) | usize::from(dd & 31)];
+        let tag_ok = ((day.lo ^ lo) | u64::from(day.hi ^ hi)) == 0;
+        // SAFETY: as above.
+        let (hms, hms_ok) = hms_raw(unsafe { ld8(p.add(11)) });
+        (day.midnight + hms, tag_ok & hms_ok)
+    }
+
     /// Seconds since the epoch.
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
@@ -126,6 +147,13 @@ const HMS_BIAS: u64 = LOW7 - u64::from_le_bytes(*b"29:59:59");
 
 #[inline(always)]
 fn hms_s(raw: u64) -> Option<i64> {
+    let (s, ok) = hms_raw(raw);
+    ok.then_some(s)
+}
+
+/// "HH:MM:SS" as seconds, and whether every byte was in range.
+#[inline(always)]
+fn hms_raw(raw: u64) -> (i64, bool) {
     // In each lane require MIN <= byte <= MAX (the two colons have min=max).
     // Valid lanes cannot carry/borrow into a neighbor, so the *first* invalid
     // lane necessarily contributes a high bit to one of these two words.
@@ -134,12 +162,21 @@ fn hms_s(raw: u64) -> Option<i64> {
     // 2561 = 10*256+1: each ones byte receives ten times its tens byte.
     let pairs = digits.wrapping_mul(2561) >> 8;
     let h = i64::from(pairs as u8);
-    if bad != 0 || h > 23 {
-        return None;
-    }
     let m = i64::from((pairs >> 24) as u8);
     let s = i64::from((pairs >> 48) as u8);
-    Some((h * 60 + m) * 60 + s)
+    ((h * 60 + m) * 60 + s, (bad == 0) & (h <= 23))
+}
+
+#[inline(always)]
+pub(super) unsafe fn ld8(p: *const u8) -> u64 {
+    // SAFETY: the caller passes 8 readable bytes; the load is unaligned.
+    unsafe { p.cast::<u64>().read_unaligned() }
+}
+
+#[inline(always)]
+pub(super) unsafe fn ld4(p: *const u8) -> u32 {
+    // SAFETY: the caller passes 4 readable bytes; the load is unaligned.
+    unsafe { p.cast::<u32>().read_unaligned() }
 }
 
 #[inline(always)]

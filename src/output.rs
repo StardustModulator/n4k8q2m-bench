@@ -1,20 +1,36 @@
-//! Bounded-memory Parquet output. Each worker owns a file; each column page is
-//! gathered directly into reusable scratch and written with its header via writev.
+//! Bounded-memory Parquet output. Each worker owns a part file and writes one
+//! row group per GROUP rows with a single writev from reusable scratch.
+//!
+//! Columns are dictionary encoded without hashing or sorting. Strings get one
+//! dictionary entry per run of equal values (a person's rows are adjacent) and
+//! RLE runs of 16-bit indices. Integers get the dense range [origin, origin+K)
+//! followed by the out-of-range values in row order, and bit-packed indices of
+//! minimal width. Integer width then only sizes the dictionary page, so no
+//! pre-pass over the table picks it: sessions and events are INT64, revenue is
+//! INT32 when the campaign table bounds it, and the user table is read once.
 
-use super::{with_key_bytes, CampRow, Tables, UserRow};
+use super::{SlowIntern, Tables, UserRow};
+use crate::atom::{is_slow, slow_index, write_id};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 
-const GROUP: usize = 16_384; // also bounds dictionary indices to two bytes
+const GROUP: usize = 16_384; // keeps a row group's rows cache resident
 const MIN_PART: usize = 32_768;
 const CREATOR: &[u8] = b"shopping-sessions-solve version 2";
 const MAGIC: &[u8] = b"PAR1";
 const PLAIN: i32 = 0;
 const RLE: i32 = 3;
 const DICT: i32 = 8; // RLE_DICTIONARY
+// Dense dictionary ranges (origin, K): a typical row group then needs 4-bit
+// session, 7-bit event and 12-bit revenue indices.
+const SESSIONS: (i64, usize) = (1, 14);
+const EVENTS: (i64, usize) = (1, 64);
+const REVENUE: (i64, usize) = (0, 1);
+const _: () = assert!(GROUP + 256 <= 1 << 16); // indices fit u16 and 16-bit runs
 
 fn invalid(s: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, s)
@@ -29,6 +45,10 @@ fn var(mut x: u64, b: &mut [u8]) -> usize {
     }
     b[n] = x as u8;
     n + 1
+}
+
+fn bitlen(x: usize) -> u32 {
+    usize::BITS - x.leading_zeros()
 }
 
 #[derive(Default)]
@@ -113,7 +133,6 @@ impl Col {
 fn page_header(t: &mut Thrift, dict: bool, encoding: i32, n: usize, bytes: usize) -> io::Result<()> {
     let bytes = i32::try_from(bytes).map_err(|_| invalid("Parquet page exceeds INT32 size"))?;
     let n = i32::try_from(n).map_err(|_| invalid("Parquet page exceeds INT32 value count"))?;
-    t.0.clear();
     t.i32(1, if dict { 2 } else { 0 });
     t.i32(1, bytes);
     t.i32(1, bytes); // UNCOMPRESSED
@@ -129,9 +148,7 @@ fn page_header(t: &mut Thrift, dict: bool, encoding: i32, n: usize, bytes: usize
     Ok(())
 }
 
-fn writev<const N: usize>(file: &mut File, bufs: [&[u8]; N]) -> io::Result<()> {
-    let mut vecs = bufs.map(IoSlice::new);
-    let mut pending = &mut vecs[..];
+fn writev(file: &mut File, mut pending: &mut [IoSlice<'_>]) -> io::Result<()> {
     loop {
         while pending.first().is_some_and(|b| b.is_empty()) {
             pending = &mut pending[1..];
@@ -146,7 +163,21 @@ fn writev<const N: usize>(file: &mut File, bufs: [&[u8]; N]) -> io::Result<()> {
     }
 }
 
-struct Chunk { start: i64, data: i64, size: i64 }
+/// One column chunk: an optional dictionary page (entry count and PLAIN body)
+/// and one data page. A data body is levels, then values; unused parts are empty.
+struct Chunk<'a> {
+    dict: Option<(usize, [&'a [u8]; 2])>,
+    enc: i32,
+    body: [&'a [u8]; 4],
+}
+
+impl<'a> Chunk<'a> {
+    fn plain(values: &'a [u8]) -> Self {
+        Self { dict: None, enc: PLAIN, body: [values, &[], &[], &[]] }
+    }
+}
+
+const MAX_COLS: usize = 7;
 
 struct Writer<'a> {
     f: File,
@@ -155,44 +186,61 @@ struct Writer<'a> {
     groups: usize,
     rows: i64,
     meta: Thrift,
-    dh: Thrift,
-    ph: Thrift,
+    hdr: Thrift,
 }
 
 impl<'a> Writer<'a> {
-    fn new(mut f: File, cols: &'a [Col]) -> io::Result<Self> {
-        f.write_all(MAGIC)?;
-        Ok(Self { f, cols, pos: 4, groups: 0, rows: 0, meta: Thrift::default(),
-            dh: Thrift::default(), ph: Thrift::default() })
+    fn new(f: File, cols: &'a [Col]) -> Self {
+        debug_assert!(cols.len() <= MAX_COLS);
+        Self { f, cols, pos: 0, groups: 0, rows: 0, meta: Thrift::default(), hdr: Thrift::default() }
     }
 
-    // body = definition-level prefix, bitmap, value prefix, values. Required
-    // columns simply supply empty slices for the level sections.
-    fn page(&mut self, n: usize, dict: Option<(usize, &[u8])>, body: [&[u8]; 4]) -> io::Result<Chunk> {
-        self.dh.0.clear();
-        let dict_body = if let Some((entries, bytes)) = dict {
-            page_header(&mut self.dh, true, PLAIN, entries, bytes.len())?;
-            bytes
-        } else { &[] };
-        let size: usize = body.iter().map(|p| p.len()).sum();
-        page_header(&mut self.ph, false, if dict.is_some() { DICT } else { PLAIN }, n, size)?;
-        let start = self.pos;
-        let data = start + (self.dh.0.len() + dict_body.len()) as i64;
-        writev(&mut self.f, [&self.dh.0, dict_body, &self.ph.0, body[0], body[1], body[2], body[3]])?;
-        self.pos = data + (self.ph.0.len() + size) as i64;
-        Ok(Chunk { start, data, size: self.pos - start })
-    }
-
-    fn group(&mut self, n: usize, chunks: &[Chunk]) {
+    fn group(&mut self, n: usize, chunks: &[Chunk<'_>]) -> io::Result<()> {
         debug_assert_eq!(self.cols.len(), chunks.len());
+        let mut h = std::mem::take(&mut self.hdr);
+        h.0.clear();
+        let mut ends = [(0, 0); MAX_COLS];
+        for (c, e) in chunks.iter().zip(&mut ends) {
+            if let Some((entries, d)) = c.dict {
+                page_header(&mut h, true, PLAIN, entries, d[0].len() + d[1].len())?;
+            }
+            e.0 = h.0.len();
+            page_header(&mut h, false, c.enc, n, c.body.iter().map(|b| b.len()).sum())?;
+            e.1 = h.0.len();
+        }
+        let mut iov = [IoSlice::new(&[]); 1 + MAX_COLS * 8];
+        let mut k = 0;
+        if self.pos == 0 {
+            iov[0] = IoSlice::new(MAGIC);
+            k = 1;
+            self.pos = MAGIC.len() as i64;
+        }
         let t = &mut self.meta;
         t.list(1, chunks.len(), 12);
-        let mut total = 0;
-        for (&col, c) in self.cols.iter().zip(chunks) {
+        let (mut at, mut total) = (0, 0);
+        for ((c, &(d, p)), &col) in chunks.iter().zip(&ends).zip(self.cols) {
+            let start = self.pos;
+            let mut parts = [&[][..]; 8];
+            let mut m = 0;
+            if let Some((_, dict)) = c.dict {
+                parts[..3].copy_from_slice(&[&h.0[at..d], dict[0], dict[1]]);
+                m = 3;
+            }
+            parts[m] = &h.0[d..p];
+            parts[m + 1..m + 5].copy_from_slice(&c.body);
+            let mut data = start;
+            for (i, b) in parts[..m + 5].iter().enumerate() {
+                if i == m { data = self.pos; }
+                iov[k] = IoSlice::new(b);
+                k += 1;
+                self.pos += b.len() as i64;
+            }
+            at = p;
+            let size = self.pos - start;
             t.i64(2, 0); // no duplicated ColumnMetaData outside the footer
             t.tag(1, 12);
             t.i32(1, col.physical());
-            let enc: &[i32] = if c.data != c.start { &[PLAIN, RLE, DICT] }
+            let enc: &[i32] = if c.dict.is_some() { &[PLAIN, RLE, DICT] }
                 else if col.2 { &[PLAIN, RLE] } else { &[PLAIN] };
             t.list(1, enc.len(), 5);
             for &e in enc { t.zz(i64::from(e)); }
@@ -200,13 +248,13 @@ impl<'a> Writer<'a> {
             t.bytes(col.0.as_bytes()); // exactly the leaf name from the schema
             t.i32(1, 0);
             t.i64(1, n as i64);
-            t.i64(1, c.size);
-            t.i64(1, c.size);
-            t.i64(2, c.data); // ColumnMetaData.data_page_offset = 9
-            if c.data != c.start { t.i64(2, c.start); } // dictionary_page_offset = 11
+            t.i64(1, size);
+            t.i64(1, size);
+            t.i64(2, data); // ColumnMetaData.data_page_offset = 9
+            if c.dict.is_some() { t.i64(2, start); } // dictionary_page_offset = 11
             t.stop();
             t.stop();
-            total += c.size;
+            total += size;
         }
         t.i64(1, total);
         t.i64(1, n as i64);
@@ -214,6 +262,9 @@ impl<'a> Writer<'a> {
         t.stop();
         self.rows += n as i64;
         self.groups += 1;
+        writev(&mut self.f, &mut iov[..k])?;
+        self.hdr = h;
+        Ok(())
     }
 
     fn finish(mut self) -> io::Result<()> {
@@ -231,256 +282,487 @@ impl<'a> Writer<'a> {
         tail.stop();
         let len = u32::try_from(head.0.len() + self.meta.0.len() + tail.0.len())
             .map_err(|_| invalid("Parquet footer too large"))?.to_le_bytes();
-        writev(&mut self.f, [&head.0, &self.meta.0, &tail.0, &len, MAGIC])
+        let magic = if self.pos == 0 { MAGIC } else { &[] };
+        writev(&mut self.f, &mut [magic, &head.0, &self.meta.0, &tail.0, &len, MAGIC].map(IoSlice::new))
     }
 }
 
+/// Bytes in a buffer whose length is its high-water mark, so values can be
+/// formatted in place without zeroing it for each row group.
 #[derive(Default)]
-struct Scratch {
-    values: Vec<u8>,
-    dict: Vec<u8>,
-    bitmap: Vec<u8>,
-    num: Vec<u8>,
-    // Small, reused exact interner; also handles disjoint runs of the same ID.
-    slots: Vec<u16>,
-    keys: Vec<u64>,
-}
+struct Buf { buf: Vec<u8>, len: usize }
 
-fn plain_string(dst: &mut Vec<u8>, s: &[u8]) {
-    // If a string doesn't fit a signed i32, its containing page cannot fit
-    // either. page_header checks that limit before issuing any write.
-    dst.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    dst.extend_from_slice(s);
-}
-
-fn prefix_for_literals(width: u8, count: usize, buf: &mut [u8; 12]) -> usize {
-    buf[0] = width;
-    1 + var((count.div_ceil(8) as u64) * 2 + 1, &mut buf[1..])
-}
-
-fn user_ids(w: &mut Writer<'_>, s: &mut Scratch, t: &Tables, rows: &[UserRow]) -> io::Result<Chunk> {
-    let n = rows.len();
-    let runs = 1 + rows.windows(2).filter(|p| p[0].key != p[1].key).count();
-    // Per-run dictionary ordinals need 2–3 bytes per person, not per day.
-    // Near-unique and small groups are cheaper to write PLAIN instead.
-    let dictionary = n >= 32 && runs * 4 <= n * 3;
-    let bits = (usize::BITS - (runs - 1).leading_zeros()).max(1) as u8;
-    let cap = (runs * 2).next_power_of_two();
-    if dictionary {
-        s.slots.resize(cap, 0);
-        s.slots.fill(0);
-        s.keys.clear();
-        s.dict.clear();
-        s.dict.reserve(runs * 13);
+impl Buf {
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
-    s.values.clear();
-    s.values.reserve(if dictionary { runs * 3 } else { n * 13 });
-    let mut i = 0;
-    while i < n {
-        let key = rows[i].key;
-        let mut j = i + 1;
-        while j < n && rows[j].key == key { j += 1; }
-        if dictionary {
-            let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let mut slot = ((h ^ (h >> 32)) as usize) & (cap - 1);
-            let id = loop {
-                let entry = s.slots[slot];
-                if entry == 0 {
-                    let id = s.keys.len() as u16;
-                    s.keys.push(key);
-                    s.slots[slot] = id + 1;
-                    with_key_bytes(key, &t.slow, |bytes| plain_string(&mut s.dict, bytes));
-                    break id;
-                }
-                if s.keys[(entry - 1) as usize] == key { break entry - 1; }
-                slot = (slot + 1) & (cap - 1);
-            };
-            let length = (j - i) << 1;
-            if length < 128 { s.values.push(length as u8); }
-            else {
-                let mut b = [0; 10];
-                let len = var(length as u64, &mut b);
-                s.values.extend_from_slice(&b[..len]);
-            }
-            s.values.push(id as u8);
-            if bits > 8 { s.values.push((id >> 8) as u8); }
-        } else {
-            with_key_bytes(key, &t.slow, |bytes| {
-                for _ in i..j { plain_string(&mut s.values, bytes); }
-            });
+    fn room(&mut self, n: usize) -> &mut [u8] {
+        if self.buf.len() < self.len + n {
+            self.buf.resize((self.len + n).max(2 * self.buf.len()), 0);
         }
-        i = j;
+        &mut self.buf[self.len..]
     }
-    if dictionary {
-        w.page(n, Some((s.keys.len(), &s.dict)), [&[], &[], &[bits], &s.values])
-    } else {
-        w.page(n, None, [&[], &[], &[], &s.values])
+    fn push(&mut self, s: &[u8]) {
+        // A string too long for i32 makes its page too long; page_header rejects it.
+        let room = self.room(4 + s.len());
+        room[..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+        room[4..4 + s.len()].copy_from_slice(s);
+        self.len += 4 + s.len();
     }
 }
 
-// A small dense integer range can be written as raw bytes/nibbles into a
-// literal dictionary-index run; no general bit-packer, compressor or hashing.
-fn integers<R>(w: &mut Writer<'_>, s: &mut Scratch, col: Col, rows: &[R],
-    dense: bool, get: impl Fn(&R) -> i64) -> io::Result<Chunk> {
-    let n = rows.len();
-    let wide = matches!(col.1, Kind::I64);
-    if dense && n >= 512 {
-        let mut lo = i64::MAX;
-        let mut hi = i64::MIN;
-        for r in rows {
-            let v = get(r);
-            lo = lo.min(v);
-            hi = hi.max(v);
+/// Bit i of `out[i / 64]` marks a row that starts a run: row 0 and every row
+/// that `same` deems different from the row before. Bit n marks the end.
+fn run_starts<R>(rows: &[R], same: impl Fn(&R, &R) -> bool, out: &mut Vec<u64>) {
+    out.clear();
+    out.resize(rows.len() / 64 + 1, 0);
+    let mut prev = None;
+    for (block, m) in rows.chunks(64).zip(out.iter_mut()) {
+        for (j, r) in block.iter().enumerate() {
+            *m |= u64::from(prev.is_none_or(|p| !same(p, r))) << j;
+            prev = Some(r);
         }
-        let span = hi.abs_diff(lo);
-        if span <= 255 && (span + 1) * (if wide { 8 } else { 4 }) <= (n * 2) as u64 {
-            let count = span as usize + 1;
-            s.dict.clear();
-            for i in 0..count {
-                let v = lo + i as i64;
-                if wide { s.dict.extend_from_slice(&v.to_le_bytes()); }
-                else { s.dict.extend_from_slice(&(v as i32).to_le_bytes()); }
-            }
-            let mut pre = [0; 12];
-            if span == 0 {
-                pre[0] = 1; // one-bit indices; one RLE run of zero
-                let end = 1 + var((n as u64) << 1, &mut pre[1..]);
-                return w.page(n, Some((count, &s.dict)), [&[], &[], &pre[..end + 1], &[]]);
-            }
-            let width = if span < 16 { 4 } else { 8 };
-            let len = n.div_ceil(8) * width as usize;
-            if s.num.len() < len { s.num.resize(len, 0); }
-            if width == 8 {
-                for (dst, r) in s.num[..n].iter_mut().zip(rows) { *dst = (get(r) - lo) as u8; }
-                s.num[n..len].fill(0);
+    }
+    out[rows.len() / 64] |= 1 << (rows.len() % 64);
+}
+
+/// Append the RLE run of `len` copies of the 16-bit index `count` at `at`, a
+/// varint of at most three bytes as runs are at most GROUP long. Returns the
+/// new end. Needs 8 bytes of room at `at`.
+#[inline(always)]
+fn put_run(out: &mut [u8], at: usize, len: usize, count: usize) -> usize {
+    let x = (len as u64) << 1;
+    let (v, k) = if x < 1 << 7 { (x, 1) } else if x < 1 << 14 { (x & 127 | 128 | (x >> 7) << 8, 2) }
+        else { (x & 127 | 128 | ((x >> 7) & 127 | 128) << 8 | (x >> 14) << 16, 3) };
+    out[at..at + 8].copy_from_slice(&(v | (count as u64) << (8 * k)).to_le_bytes());
+    at + k + 2
+}
+
+/// RLE runs of 16-bit dictionary indices, one per run marked in `starts`;
+/// `entry` receives each run's first row to append its dictionary value.
+/// Visiting only the marked starts avoids a per-run mispredicted loop exit:
+/// runs average a few rows.
+fn index_runs<R>(rows: &[R], starts: &[u64], out: &mut Vec<u8>, mut entry: impl FnMut(&R)) -> usize {
+    out.clear();
+    out.resize(1 + 5 * rows.len() + 8, 0);
+    out[0] = 16; // bit width
+    let (mut count, mut start, mut at) = (0, 0, 1);
+    for (b, &m) in starts.iter().enumerate() {
+        let mut m = if b == 0 { m & !1 } else { m };
+        while m != 0 {
+            let end = b * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            entry(&rows[start]);
+            at = put_run(out, at, end - start, count);
+            count += 1;
+            start = end;
+        }
+    }
+    out.truncate(at);
+    count
+}
+
+/// index_runs for user ids, with every position in a local: through the
+/// closure the compiler would reload and store them for each run.
+fn user_ids(rows: &[UserRow], starts: &[u64], slow: &SlowIntern, dict: &mut Buf, runs: &mut Buf) -> usize {
+    let n = rows.len();
+    runs.len = 0;
+    let out = runs.room(1 + 5 * n + 8);
+    out[0] = 16; // bit width
+    // A packed id takes at most 13 bytes, and write_id wants 24 writable.
+    dict.len = 0;
+    dict.room(13 * n + 28);
+    let (mut count, mut start, mut at, mut dp) = (0, 0, 1, 0);
+    for (b, &m) in starts.iter().enumerate() {
+        let mut m = if b == 0 { m & !1 } else { m };
+        while m != 0 {
+            let end = b * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            let key = rows[start].key;
+            if is_slow(key) {
+                dict.len = dp;
+                dict.push(&slow.strings[slow_index(key)]);
+                dict.room(13 * n + 28);
+                dp = dict.len;
             } else {
-                let mut pairs = rows.chunks_exact(2);
-                for (dst, pair) in s.num.iter_mut().zip(&mut pairs) {
-                    *dst = (get(&pair[0]) - lo) as u8 | (((get(&pair[1]) - lo) as u8) << 4);
-                }
-                let at = n / 2;
-                s.num[at..len].fill(0);
-                if let [r] = pairs.remainder() { s.num[at] = (get(r) - lo) as u8; }
+                let buf = &mut dict.buf[dp..dp + 28];
+                let len = write_id(key, (&mut buf[4..]).try_into().unwrap());
+                buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
+                dp += 4 + len;
             }
-            let p = prefix_for_literals(width, n, &mut pre);
-            return w.page(n, Some((count, &s.dict)), [&[], &[], &pre[..p], &s.num[..len]]);
+            at = put_run(out, at, end - start, count);
+            count += 1;
+            start = end;
         }
     }
-    let len = n * if wide { 8 } else { 4 };
-    if s.num.len() < len { s.num.resize(len, 0); }
-    if wide {
-        for (b, r) in s.num[..len].chunks_exact_mut(8).zip(rows) { b.copy_from_slice(&get(r).to_le_bytes()); }
-    } else {
-        for (b, r) in s.num[..len].chunks_exact_mut(4).zip(rows) { b.copy_from_slice(&(get(r) as i32).to_le_bytes()); }
-    }
-    w.page(n, None, [&[], &[], &[], &s.num[..len]])
+    dict.len = dp;
+    runs.len = at;
+    count
 }
 
-fn top_category(w: &mut Writer<'_>, s: &mut Scratch, t: &Tables, cats: Option<&[u8]>,
-    rows: &[UserRow]) -> io::Result<Chunk> {
-    s.bitmap.clear();
-    s.values.clear();
-    let mut defined = 0;
-    for group in rows.chunks(8) {
-        let mut mask = 0;
-        for (b, r) in group.iter().enumerate() {
-            if r.top == u16::MAX { continue; }
-            let name = t.cat_names.get(r.top as usize).ok_or_else(|| invalid("invalid top_category index"))?;
-            mask |= 1 << b;
-            defined += 1;
-            if cats.is_some() { s.values.push(r.top as u8); }
-            else { plain_string(&mut s.values, name); }
-        }
-        s.bitmap.push(mask);
-    }
-    let n = rows.len();
-    let mut levels = [0; 16];
-    let (end, bitmap): (usize, &[u8]) = if defined == 0 || defined == n {
-        let end = 4 + var((n as u64) << 1, &mut levels[4..]);
-        levels[end] = u8::from(defined != 0);
-        (end + 1, &[])
-    } else {
-        let end = 4 + var(s.bitmap.len() as u64 * 2 + 1, &mut levels[4..]);
-        (end, &s.bitmap)
+/// Bit-pack 16-bit indices, 8 values into W bytes, LSB first.
+fn pack_w<const W: usize>(idx: &[u16], out: &mut Vec<u8>) {
+    debug_assert!(idx.len() % 8 == 0 && idx.iter().all(|&x| usize::from(x) >> W == 0));
+    // Squeeze four 16-bit lanes of a word into 4W low bits in two steps.
+    const L: u64 = 0x0000_ffff_0000_ffff;
+    let squeeze = |x: u64| {
+        let x = (x & L) | ((x >> 16) & L) << W;
+        (x & 0xffff_ffff) | (x >> 32) << (2 * W)
     };
-    levels[..4].copy_from_slice(&((end - 4 + bitmap.len()) as u32).to_le_bytes());
-    if let Some(dict) = cats.filter(|_| defined != 0) {
-        let mut pre = [0; 12];
-        let p = prefix_for_literals(8, defined, &mut pre);
-        s.values.resize(defined.div_ceil(8) * 8, 0);
-        w.page(n, Some((t.cat_names.len(), dict)), [&levels[..end], bitmap, &pre[..p], &s.values])
-    } else {
-        w.page(n, None, [&levels[..end], bitmap, &[], &s.values])
+    let len = idx.len() / 8 * W;
+    out.clear();
+    out.reserve(len + 16);
+    let dst = out.as_mut_ptr();
+    for (g, v) in idx.chunks_exact(8).enumerate() {
+        let lo = squeeze(u64::from(v[0]) | u64::from(v[1]) << 16 | u64::from(v[2]) << 32 | u64::from(v[3]) << 48);
+        let hi = squeeze(u64::from(v[4]) | u64::from(v[5]) << 16 | u64::from(v[6]) << 32 | u64::from(v[7]) << 48);
+        let acc = u128::from(lo) | u128::from(hi) << (4 * W);
+        // SAFETY: g * W + 16 <= len - W + 16 <= capacity; later groups
+        // overwrite the zero tail of this store.
+        unsafe { dst.add(g * W).cast::<u128>().write_unaligned(acc.to_le()) };
+    }
+    // SAFETY: the loop initialized out[..len].
+    unsafe { out.set_len(len) };
+}
+
+fn pack(idx: &[u16], w: u32, out: &mut Vec<u8>) {
+    macro_rules! by_width {
+        ($($w:literal)*) => { match w { $($w => pack_w::<$w>(idx, out),)* _ => unreachable!() } };
+    }
+    by_width!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+}
+
+/// A bit-packed run of dictionary indices, preceded by its bit width.
+#[derive(Default)]
+struct Packed { bits: Vec<u8>, head: [u8; 12], hlen: usize }
+
+impl Packed {
+    /// `idx` holds a multiple of 8 indices, none above `max`.
+    fn finish(&mut self, idx: &[u16], max: usize) {
+        let w = bitlen(max).max(1);
+        pack(idx, w, &mut self.bits);
+        self.head[0] = w as u8;
+        self.hlen = 1 + var(((idx.len() / 8) as u64) << 1 | 1, &mut self.head[1..]);
+    }
+    fn head(&self) -> &[u8] {
+        &self.head[..self.hlen]
     }
 }
 
-fn user_file(path: &Path, cols: &[Col; 6], t: &Tables, cats: Option<&[u8]>, rows: &[UserRow]) -> io::Result<()> {
-    staged(path, |file| {
-        let mut w = Writer::new(file, cols)?;
-        let mut s = Scratch::default();
-        for r in rows.chunks(GROUP) {
-            let chunks = [
-                user_ids(&mut w, &mut s, t, r)?,
-                integers(&mut w, &mut s, cols[1], r, true, |r| i64::from(r.day))?,
-                integers(&mut w, &mut s, cols[2], r, true, |r| r.sessions)?,
-                integers(&mut w, &mut s, cols[3], r, true, |r| r.events)?,
-                integers(&mut w, &mut s, cols[4], r, false, |r| r.revenue)?,
-                top_category(&mut w, &mut s, t, cats, r)?,
-            ];
-            w.group(r.len(), &chunks);
+/// Dictionary: `dense` (K values from origin), then the other values in row order.
+#[derive(Default)]
+struct Ints { p: Packed, exc: Vec<i64>, narrow: Vec<u8>, entries: usize }
+
+impl Ints {
+    fn encode<R>(&mut self, idx: &mut Vec<u16>, rows: &[R], (origin, k): (i64, usize), wide: bool,
+        get: impl Fn(&R) -> i64) -> io::Result<()> {
+        self.exc.clear();
+        idx.clear();
+        idx.extend(rows.iter().map(|r| {
+            let v = get(r);
+            let d = v.wrapping_sub(origin) as u64;
+            if d < k as u64 { d as u16 } else { spill(&mut self.exc, k, d, v) }
+        }));
+        idx.resize(rows.len().next_multiple_of(8), 0);
+        self.seal(idx, k, wide)
+    }
+    fn seal(&mut self, idx: &[u16], k: usize, wide: bool) -> io::Result<()> {
+        self.entries = k + self.exc.len();
+        self.p.finish(idx, self.entries - 1);
+        self.narrow.clear();
+        if !wide {
+            self.narrow.resize(4 * self.exc.len(), 0);
+            let mut fits = true;
+            for (b, &v) in self.narrow.chunks_exact_mut(4).zip(&self.exc) {
+                fits &= v as i32 as i64 == v;
+                b.copy_from_slice(&(v as i32).to_le_bytes());
+            }
+            if !fits { return Err(invalid("value outside its INT32 bound")); }
+        } else if cfg!(target_endian = "big") {
+            for &v in &self.exc { self.narrow.extend_from_slice(&v.to_le_bytes()); }
         }
-        w.finish()
-    })
+        Ok(())
+    }
+    fn chunk<'a>(&'a self, dense: &'a [u8], wide: bool) -> Chunk<'a> {
+        let exc = if wide && cfg!(target_endian = "little") {
+            // SAFETY: i64 has no padding; on little-endian targets its bytes
+            // are exactly PLAIN INT64.
+            unsafe { std::slice::from_raw_parts(self.exc.as_ptr().cast::<u8>(), self.exc.len() * 8) }
+        } else { &self.narrow };
+        Chunk { dict: Some((self.entries, [dense, exc])), enc: DICT, body: [self.p.head(), &self.p.bits, &[], &[]] }
+    }
 }
 
-fn campaign_file(path: &Path, t: &Tables) -> io::Result<()> {
+fn dense(origin: i64, k: usize, wide: bool) -> Vec<u8> {
+    let mut d = Vec::new();
+    for v in (0..k as i64).map(|i| origin + i) {
+        if wide { d.extend_from_slice(&v.to_le_bytes()); } else { d.extend_from_slice(&(v as i32).to_le_bytes()); }
+    }
+    d
+}
+
+/// Optional top_category: bitmap definition levels plus dictionary indices.
+#[derive(Default)]
+struct Top { p: Packed, bitmap: Vec<u8>, levels: [u8; 16], llen: usize, defined: usize }
+
+impl Top {
+    /// `idx` holds the `e` defined values, padded to a multiple of 8.
+    fn seal(&mut self, idx: &[u16], e: usize, n: usize, cats: usize) -> io::Result<()> {
+        if idx[..e].iter().any(|&t| usize::from(t) >= cats) { return Err(invalid("invalid top_category index")); }
+        self.defined = e;
+        let end = if e == 0 || e == n {
+            let end = 4 + var((n as u64) << 1, &mut self.levels[4..]);
+            self.levels[end] = u8::from(e != 0);
+            self.bitmap.clear();
+            end + 1
+        } else {
+            4 + var(self.bitmap.len() as u64 * 2 + 1, &mut self.levels[4..])
+        };
+        self.levels[..4].copy_from_slice(&((end - 4 + self.bitmap.len()) as u32).to_le_bytes());
+        self.llen = end;
+        if e != 0 { self.p.finish(idx, cats - 1); }
+        Ok(())
+    }
+    fn chunk<'a>(&'a self, dict: &'a [u8], cats: usize) -> Chunk<'a> {
+        let levels = &self.levels[..self.llen];
+        if self.defined == 0 {
+            return Chunk { dict: None, enc: PLAIN, body: [levels, &[], &[], &[]] };
+        }
+        Chunk { dict: Some((cats, [dict, &[]])), enc: DICT, body: [levels, &self.bitmap, self.p.head(), &self.p.bits] }
+    }
+}
+
+fn spill(exc: &mut Vec<i64>, k: usize, d: u64, v: i64) -> u16 {
+    if d < k as u64 { return d as u16; }
+    exc.push(v);
+    (k + exc.len() - 1) as u16
+}
+
+/// Per-thread scratch of user row groups. The index columns of day,
+/// sessions, events, revenue and top_category sit GROUP apart in one buffer,
+/// so the fill loop reaches all from one register: x86 has too few for five
+/// pointers next to the loop state.
+struct Cols { idx: Vec<u16>, ints: [Ints; 4], top: Top, starts: Vec<u64>, odd: Vec<u64> }
+
+impl Default for Cols {
+    fn default() -> Self {
+        Self { idx: vec![0; 5 * GROUP], ints: Default::default(), top: Top::default(), starts: Vec::new(),
+            odd: Vec::new() }
+    }
+}
+
+/// Dictionary indices of all integer columns and top_category and the run
+/// starts of user ids, in one pass over the rows. Revenue and top_category are
+/// branch free; day, sessions and events are almost always in range, and rows
+/// where one is not are only marked, then fixed in order after the loop: a
+/// call inside it would cost registers, which x86 lacks here.
+fn fill(rows: &[UserRow], d: &UserDicts, s: &mut Cols) -> io::Result<()> {
+    let n = rows.len();
+    assert!(n <= GROUP); // also proves every index below in bounds
+    let idx = &mut s.idx[..5 * GROUP];
+    let [day, ses, evs, rev] = &mut s.ints;
+    for x in [&mut *day, &mut *ses, &mut *evs, &mut *rev] { x.exc.clear(); }
+    rev.exc.reserve(n);
+    let x3 = rev.exc.spare_capacity_mut();
+    let top = &mut s.top;
+    top.bitmap.clear();
+    top.bitmap.resize(n.div_ceil(64) * 8, 0);
+    s.starts.clear();
+    s.starts.resize(n / 64 + 1, 0);
+    s.odd.clear();
+    s.odd.resize(n.div_ceil(64), 0);
+    let ((o0, k0), (o1, k1), (o2, k2), (o3, k3)) = (d.day, SESSIONS, EVENTS, REVENUE);
+    let (mut er, mut et) = (0, 0);
+    let mut prev = rows.first().map_or(0, |r| !r.key);
+    let blocks = s.starts.iter_mut().zip(top.bitmap.chunks_exact_mut(8)).zip(s.odd.iter_mut());
+    for (b, ((m, defs), odd)) in blocks.enumerate() {
+        let (mut bits, mut def, mut out) = (0u64, 0u64, 0u64);
+        let end = (b * 64 + 64).min(n);
+        // Masks shift each row in at the bottom, one operation cheaper than
+        // placing it, and are reversed once per block.
+        for i in b * 64..end {
+            let r = &rows[i];
+            bits = bits << 1 | u64::from(r.key != prev);
+            prev = r.key;
+            let a = i64::from(r.day).wrapping_sub(o0) as u64;
+            let b = r.sessions.wrapping_sub(o1) as u64;
+            let c = r.events.wrapping_sub(o2) as u64;
+            idx[i] = a as u16;
+            idx[GROUP + i] = b as u16;
+            idx[2 * GROUP + i] = c as u16;
+            out = out << 1 | u64::from((a >= k0 as u64) | (b >= k1 as u64) | (c >= k2 as u64));
+            let v = r.revenue;
+            let x = v.wrapping_sub(o3) as u64;
+            let big = x >= k3 as u64;
+            // SAFETY: er and et count earlier rows only, so both are below
+            // n, which bounds the spare capacity and GROUP.
+            unsafe { x3.get_unchecked_mut(er) }.write(v);
+            idx[3 * GROUP + i] = if big { (k3 + er) as u16 } else { x as u16 };
+            er += usize::from(big);
+            let t = r.top;
+            let some = t != u16::MAX;
+            def = def << 1 | u64::from(some);
+            *unsafe { idx.get_unchecked_mut(4 * GROUP + et) } = t;
+            et += usize::from(some);
+        }
+        let shift = 64 - (end - b * 64) as u32;
+        *m = bits.reverse_bits() >> shift;
+        defs.copy_from_slice(&(def.reverse_bits() >> shift).to_le_bytes());
+        *odd = out.reverse_bits() >> shift;
+    }
+    // SAFETY: the loop above initialized er revenue exceptions.
+    unsafe { rev.exc.set_len(er) };
+    for (b, &m) in s.odd.iter().enumerate() {
+        let mut m = m;
+        while m != 0 {
+            let i = b * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            let r = &rows[i];
+            let (v0, v1, v2) = (i64::from(r.day), r.sessions, r.events);
+            idx[i] = spill(&mut day.exc, k0, v0.wrapping_sub(o0) as u64, v0);
+            idx[GROUP + i] = spill(&mut ses.exc, k1, v1.wrapping_sub(o1) as u64, v1);
+            idx[2 * GROUP + i] = spill(&mut evs.exc, k2, v2.wrapping_sub(o2) as u64, v2);
+        }
+    }
+    s.starts[n / 64] |= 1 << (n % 64);
+    top.bitmap.truncate(n.div_ceil(8));
+    let n8 = n.next_multiple_of(8);
+    for c in 0..4 { idx[c * GROUP + n..c * GROUP + n8].fill(0); }
+    idx[4 * GROUP + et..4 * GROUP + et.next_multiple_of(8)].fill(0);
+    let col = |c: usize, len: usize| c * GROUP..c * GROUP + len;
+    day.seal(&idx[col(0, n8)], k0, false)?;
+    ses.seal(&idx[col(1, n8)], k1, true)?;
+    evs.seal(&idx[col(2, n8)], k2, true)?;
+    rev.seal(&idx[col(3, n8)], k3, d.wide)?;
+    top.seal(&idx[col(4, et.next_multiple_of(8))], et, n, d.cats_n)
+}
+
+/// Per-table constants shared by all user part files.
+struct UserDicts { cols: [Col; 6], wide: bool, day: (i64, usize), dense: [Vec<u8>; 4], cats: Vec<u8>, cats_n: usize }
+
+impl UserDicts {
+    fn new(t: &Tables) -> Self {
+        // Every user day has a credited session, so campaign days bound user
+        // days. Anything outside still encodes, as a dictionary exception.
+        let (lo, hi) = t.camps_out.iter().fold((i32::MAX, i32::MIN), |(l, h), r| (l.min(r.day), h.max(r.day)));
+        let day = if lo > hi { (t.users.first().map_or(0, |r| i64::from(r.day)), 16) }
+            else { (i64::from(lo), (hi.abs_diff(lo) as usize + 1).min(256)) };
+        // Each session's revenue is credited to one campaign on its own day,
+        // so a day's campaign total bounds every user's revenue that day.
+        // Under INT32 the revenue dictionary takes half the bytes.
+        let span = if lo > hi { 0 } else { hi.abs_diff(lo) as usize + 1 };
+        let mut total = vec![0i64; if span > 1 << 16 { 0 } else { span }];
+        let mut wide = span > total.len();
+        for r in &t.camps_out {
+            if let Some(s) = total.get_mut(r.day.abs_diff(lo) as usize) { *s = s.saturating_add(r.revenue); }
+            wide |= r.revenue < 0;
+        }
+        wide |= total.iter().any(|&s| s > i64::from(i32::MAX));
+        let mut cats = Buf::default();
+        for c in &t.cat_names { cats.push(c); }
+        cats.buf.truncate(cats.len);
+        let cols = [Col("user_id", Kind::Str, false), Col("day", Kind::Date, false),
+            Col("sessions", Kind::I64, false), Col("events", Kind::I64, false),
+            Col("revenue_cents", if wide { Kind::I64 } else { Kind::I32 }, false), Col("top_category", Kind::Str, true)];
+        Self { cols, wide, day, cats: cats.buf, cats_n: t.cat_names.len(), dense: [dense(day.0, day.1, false),
+            dense(SESSIONS.0, SESSIONS.1, true), dense(EVENTS.0, EVENTS.1, true), dense(REVENUE.0, REVENUE.1, wide)] }
+    }
+}
+
+fn users(file: File, d: &UserDicts, t: &Tables, rows: &[UserRow]) -> io::Result<()> {
+    let mut w = Writer::new(file, &d.cols);
+    let (mut ids, mut runs, mut s) = (Buf::default(), Buf::default(), Cols::default());
+    let [dd, ds, de, dr] = &d.dense;
+    for r in rows.chunks(GROUP) {
+        fill(r, d, &mut s)?;
+        let entries = user_ids(r, &s.starts, &t.slow, &mut ids, &mut runs);
+        let [day, ses, evs, rev] = &s.ints;
+        w.group(r.len(), &[
+            Chunk { dict: Some((entries, [ids.bytes(), &[]])), enc: DICT, body: [runs.bytes(), &[], &[], &[]] },
+            day.chunk(dd, false), ses.chunk(ds, true), evs.chunk(de, true), rev.chunk(dr, d.wide),
+            s.top.chunk(&d.cats, d.cats_n),
+        ])?;
+    }
+    w.finish()
+}
+
+fn campaign(f: File, t: &Tables) -> io::Result<()> {
+    let rows = &t.camps_out;
     let mut b = [0u64; 4];
-    for r in &t.camps_out {
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for r in rows {
+        if usize::from(r.camp) >= t.camps.len() { return Err(invalid("invalid campaign index")); }
         b[0] |= r.sessions as u64; b[1] |= r.purchasing as u64;
         b[2] |= r.revenue as u64; b[3] |= r.assisted as u64;
+        lo = lo.min(r.day);
+        hi = hi.max(r.day);
     }
     let cols = [Col("campaign_id", Kind::Str, false), Col("channel", Kind::Str, false),
         Col("day", Kind::Date, false), Col::integer("sessions", b[0]),
         Col::integer("purchasing_sessions", b[1]), Col::integer("revenue_cents", b[2]),
         Col::integer("assisted_sessions", b[3])];
-    staged(path, |f| {
-        let mut w = Writer::new(f, &cols)?;
-        let mut s = Scratch::default();
-        for r in t.camps_out.chunks(GROUP) {
-            let mut text = |channel| -> io::Result<Chunk> {
-                s.values.clear();
-                for row in r {
-                    let camp = t.camps.get(row.camp as usize).ok_or_else(|| invalid("invalid campaign index"))?;
-                    plain_string(&mut s.values, if channel { &camp.channel } else { &camp.name });
-                }
-                w.page(r.len(), None, [&[], &[], &[], &s.values])
-            };
-            let chunks = [text(false)?, text(true)?,
-                integers(&mut w, &mut s, cols[2], r, false, |r: &CampRow| i64::from(r.day))?,
-                integers(&mut w, &mut s, cols[3], r, false, |r| r.sessions)?,
-                integers(&mut w, &mut s, cols[4], r, false, |r| r.purchasing)?,
-                integers(&mut w, &mut s, cols[5], r, false, |r| r.revenue)?,
-                integers(&mut w, &mut s, cols[6], r, false, |r| r.assisted)?];
-            w.group(r.len(), &chunks);
+    let range = (i64::from(lo), if lo > hi { 1 } else { (hi.abs_diff(lo) as usize + 1).min(256) });
+    let dense_day = dense(range.0, range.1, false);
+    let mut w = Writer::new(f, &cols);
+    let (mut names, mut chans, mut runs, mut starts) = (Buf::default(), Buf::default(), Vec::new(), Vec::new());
+    let (mut day, mut idx) = (Ints::default(), Vec::new());
+    let mut nums: [Vec<u8>; 4] = Default::default();
+    for r in rows.chunks(GROUP) {
+        names.len = 0;
+        chans.len = 0;
+        run_starts(r, |a, b| a.camp == b.camp, &mut starts);
+        let entries = index_runs(r, &starts, &mut runs, |row| {
+            let c = &t.camps[usize::from(row.camp)];
+            names.push(&c.name);
+            chans.push(&c.channel);
+        });
+        day.encode(&mut idx, r, range, false, |r| i64::from(r.day))?;
+        for (i, out) in nums.iter_mut().enumerate() {
+            out.clear();
+            let wide = matches!(cols[3 + i].1, Kind::I64);
+            for row in r {
+                let v = [row.sessions, row.purchasing, row.revenue, row.assisted][i];
+                if wide { out.extend_from_slice(&v.to_le_bytes()); }
+                else { out.extend_from_slice(&(v as i32).to_le_bytes()); }
+            }
         }
-        w.finish()
-    })
+        w.group(r.len(), &[
+            Chunk { dict: Some((entries, [names.bytes(), &[]])), enc: DICT, body: [&runs, &[], &[], &[]] },
+            Chunk { dict: Some((entries, [chans.bytes(), &[]])), enc: DICT, body: [&runs, &[], &[], &[]] },
+            day.chunk(&dense_day, false),
+            Chunk::plain(&nums[0]), Chunk::plain(&nums[1]), Chunk::plain(&nums[2]), Chunk::plain(&nums[3]),
+        ])?;
+    }
+    w.finish()
 }
 
-// Never publish an incomplete part. A killed writer can only leave a hidden
-// temp file, which the challenge ignores and a subsequent run won't overwrite.
-fn staged(path: &Path, encode: impl FnOnce(File) -> io::Result<()>) -> io::Result<()> {
-    let name = path.file_name().unwrap().to_string_lossy();
-    let mut generation = 0u64;
-    let (tmp, file) = loop {
-        let tmp = path.with_file_name(format!(".{name}.{}.{generation}.tmp", std::process::id()));
-        match File::create_new(&tmp) {
-            Ok(f) => break (tmp, f),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => generation += 1,
-            Err(e) => return Err(e),
+// Never publish an incomplete part. Encode into a hidden file directly under
+// the output root, which exists before the table directories do, then move it
+// to the name `path` yields. A killed writer can only leave a hidden temp
+// file, which the challenge ignores and a subsequent run won't overwrite.
+fn staged(root: &Path, tag: &str, path: impl FnOnce() -> io::Result<PathBuf>,
+    encode: impl FnOnce(File) -> io::Result<()>) -> io::Result<()> {
+    let hidden = |dir: &Path| {
+        let mut generation = 0u64;
+        loop {
+            let tmp = dir.join(format!(".{tag}.{}.{generation}.tmp", std::process::id()));
+            match File::create_new(&tmp) {
+                Ok(f) => return Ok((tmp, f)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => generation += 1,
+                Err(e) => return Err(e),
+            }
         }
     };
-    let result = encode(file).and_then(|_| fs::rename(&tmp, path));
+    let (tmp, file) = hidden(root)?;
+    let result = encode(file).and_then(|_| path()).and_then(|path| {
+        fs::rename(&tmp, &path).or_else(|_| {
+            // A table directory on another filesystem: copy beside it first.
+            let (near, _) = hidden(path.parent().unwrap())?;
+            let moved = fs::copy(&tmp, &near).and_then(|_| fs::rename(&near, &path));
+            if moved.is_err() { let _ = fs::remove_file(&near); }
+            moved.and_then(|_| fs::remove_file(&tmp))
+        })
+    });
     if result.is_err() { let _ = fs::remove_file(tmp); }
     result
 }
@@ -532,53 +814,165 @@ fn parts(dir: &Path, count: usize) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     Ok((paths, prior.into_iter().filter_map(|(i, p)| (i >= idx).then_some(p)).collect()))
 }
 
-fn widths(rows: &[UserRow]) -> [u64; 3] {
-    let mut b = [0; 3];
-    for r in rows {
-        b[0] |= r.sessions as u64;
-        b[1] |= r.events as u64;
-        b[2] |= r.revenue as u64;
-    }
-    b
-}
-
 pub(super) fn write(dir: &Path, t: &Tables, threads: usize) -> io::Result<()> {
     let n = t.users.len();
     let p = threads.max(1).min(n.div_ceil(MIN_PART).max(1));
-    let (paths, mut stale) = parts(&dir.join("user_daily"), p)?;
-    let (camp, stale_camp) = parts(&dir.join("campaign_daily"), 1)?;
-    stale.extend(stale_camp);
     let at = |i: usize| (n / p) * i + i.min(n % p);
-    let groups: Vec<_> = (0..p).map(|i| &t.users[at(i)..at(i+1)]).collect();
-    // One common physical schema, even if just one whale overflows INT32.
-    let b = thread::scope(|scope| {
-        let jobs: Vec<_> = groups[1..].iter().map(|&r| scope.spawn(move || widths(r))).collect();
-        let mut all = widths(groups[0]);
-        for job in jobs {
-            let b = job.join().unwrap();
-            for i in 0..3 { all[i] |= b[i]; }
+    let d = &UserDicts::new(t);
+    fs::create_dir_all(dir)?;
+    // Workers start encoding at once; making and scanning the table
+    // directories (a mkdir alone can take hundreds of µs) overlaps them, and
+    // each worker learns its part's name when it is done.
+    let stale = thread::scope(|scope| -> io::Result<Vec<PathBuf>> {
+        let (mut jobs, mut names) = (Vec::with_capacity(p), Vec::with_capacity(p));
+        for i in 0..p {
+            let (tx, rx) = mpsc::channel();
+            let rows = &t.users[at(i)..at(i + 1)];
+            let name = move || rx.recv().map_err(|_| io::Error::other("no name for a user_daily part"));
+            let tag = format!("user_daily-{i:05}");
+            jobs.push(scope.spawn(move || staged(dir, &tag, name, |f| users(f, d, t, rows))));
+            names.push(tx);
         }
-        all
-    });
-    let cols = [Col("user_id", Kind::Str, false), Col("day", Kind::Date, false),
-        Col::integer("sessions", b[0]), Col::integer("events", b[1]),
-        Col::integer("revenue_cents", b[2]), Col("top_category", Kind::Str, true)];
-    let cat_dict = if !t.cat_names.is_empty() && t.cat_names.len() <= 256
-        && t.cat_names.iter().map(|n| n.len() + 4).sum::<usize>() <= 64 * 1024 {
-        let mut d = Vec::new();
-        for n in &t.cat_names { plain_string(&mut d, n); }
-        Some(d)
-    } else { None };
-    let cats = cat_dict.as_deref();
-    let cols = &cols;
-    thread::scope(|scope| -> io::Result<()> {
-        let jobs: Vec<_> = paths[1..].iter().zip(&groups[1..])
-            .map(|(path, &r)| scope.spawn(move || user_file(path, cols, t, cats, r))).collect();
-        user_file(&paths[0], cols, t, cats, groups[0])?;
-        campaign_file(&camp[0], t)?;
-        for job in jobs { job.join().unwrap()?; }
-        Ok(())
+        let user = parts(&dir.join("user_daily"), p).map(|(paths, stale)| {
+            for (tx, path) in names.iter().zip(paths) { let _ = tx.send(path); }
+            stale
+        });
+        drop(names); // without names, workers discard their files
+        let camp = parts(&dir.join("campaign_daily"), 1)
+            .and_then(|(mut path, stale)| staged(dir, "campaign_daily", || Ok(path.remove(0)), |f| campaign(f, t))
+                .map(|_| stale));
+        let done = jobs.into_iter().try_fold((), |_, job| job.join().unwrap());
+        let mut stale = user?;
+        stale.extend(camp?);
+        done.map(|_| stale)
     })?;
     for file in stale { fs::remove_file(file)?; }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_matches_reference() {
+        let mut rand = 0x2545_f491_4f6c_dd1du64;
+        for w in 1..=16u32 {
+            for n in [8, 16, 64, 8200] {
+                let idx: Vec<u16> = (0..n).map(|_| {
+                    rand ^= rand << 13; rand ^= rand >> 7; rand ^= rand << 17;
+                    (rand >> 20) as u16 & ((1u32 << w) - 1) as u16
+                }).collect();
+                let mut want = vec![0u8; n * w as usize / 8];
+                for (i, &x) in idx.iter().enumerate() {
+                    for b in 0..w as usize {
+                        let bit = i * w as usize + b;
+                        want[bit / 8] |= (((x >> b) & 1) as u8) << (bit % 8);
+                    }
+                }
+                let mut got = Vec::new();
+                pack(&idx, w, &mut got);
+                assert_eq!(got, want, "w={w} n={n}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    // BENCH_DATA=/tmp/ss-20m BENCH_THREADS=8 cargo test --release --bin solve bench_write -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_write() {
+        let data = std::env::var("BENCH_DATA").unwrap_or_else(|_| "/tmp/ss-20m".into());
+        let threads: usize = std::env::var("BENCH_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let reps: usize = std::env::var("BENCH_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+        let t = crate::stream::compute(Path::new(&data), 8).unwrap();
+        let root = std::env::temp_dir().join(format!("bench_write.{}", std::process::id()));
+        let mut ms = Vec::new();
+        for i in 0..reps {
+            let dir = root.join(format!("{i}"));
+            let s = Instant::now();
+            write(&dir, &t, threads).unwrap();
+            ms.push(s.elapsed().as_secs_f64() * 1e3);
+        }
+        let _ = fs::remove_dir_all(&root);
+        let d = UserDicts::new(&t);
+        let mut enc = f64::MAX;
+        for _ in 0..reps {
+            let s = Instant::now();
+            users(File::create("/dev/null").unwrap(), &d, &t, &t.users).unwrap();
+            enc = enc.min(s.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("encode to /dev/null, 1 thread: {enc:.2} ms = {:.2} ns/row", enc * 1e6 / t.users.len() as f64);
+        let n = t.users.len();
+        let mut par = f64::MAX;
+        for _ in 0..reps {
+            let s = Instant::now();
+            thread::scope(|sc| {
+                let hs: Vec<_> = (0..threads).map(|i| { let (d, t) = (&d, &t); sc.spawn(move || {
+                    let r = &t.users[n * i / threads..n * (i + 1) / threads];
+                    users(File::create("/dev/null").unwrap(), d, t, r).unwrap(); }) }).collect();
+                for h in hs { h.join().unwrap(); }
+            });
+            par = par.min(s.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("encode to /dev/null, {threads} threads: {par:.2} ms");
+        let mut sorted = ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        eprintln!("rows={} threads={threads} min={:.2} med={:.2} all={:?}", t.users.len(), sorted[0],
+            sorted[sorted.len() / 2], ms.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
+        std::mem::forget(t);
+    }
+}
+
+#[cfg(test)]
+mod bench_cols {
+    use super::*;
+    use std::time::Instant;
+
+    // cargo test --release --bin solve bench_cols -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_cols() {
+        let t = crate::stream::compute(Path::new("/tmp/ss-20m"), 8).unwrap();
+        let d = UserDicts::new(&t);
+        let rows = &t.users[..];
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let mut best = f64::MAX;
+            for _ in 0..7 { let s = Instant::now(); f(); best = best.min(s.elapsed().as_secs_f64()); }
+            eprintln!("{name:>14}: {:6.3} ms {:5.2} ns/row", best * 1e3, best * 1e9 / rows.len() as f64);
+        };
+        let (mut ints, mut idx, mut out) = (Ints::default(), Vec::new(), Vec::new());
+        let mut w = 0;
+        time("pack revenue", &mut || for r in rows.chunks(GROUP) {
+            ints.encode(&mut idx, r, REVENUE, true, |r| r.revenue).unwrap();
+            w = ints.p.head[0];
+            pack(&idx, u32::from(w), &mut out);
+        });
+        let mut s = Cols::default();
+        time("fill", &mut || for r in rows.chunks(GROUP) { fill(r, &d, &mut s).unwrap(); std::hint::black_box(&s.top.p.bits); });
+        let (mut cold, mut warm) = (f64::MAX, f64::MAX);
+        for _ in 0..5 {
+            let (mut a, mut b) = (0.0, 0.0);
+            for r in rows.chunks(GROUP) {
+                let x = Instant::now(); fill(r, &d, &mut s).unwrap(); a += x.elapsed().as_secs_f64();
+                let x = Instant::now(); fill(r, &d, &mut s).unwrap(); b += x.elapsed().as_secs_f64();
+            }
+            cold = cold.min(a);
+            warm = warm.min(b);
+        }
+        eprintln!("fill cold {:.3} ms warm {:.3} ms", cold * 1e3, warm * 1e3);
+        time("campaign", &mut || campaign(File::create("/dev/null").unwrap(), &t).unwrap());
+        let (mut ids, mut runs, mut st) = (Buf::default(), Buf::default(), Vec::new());
+        time("ids", &mut || for r in rows.chunks(GROUP) {
+            run_starts(r, |a, b| a.key == b.key, &mut st);
+            user_ids(r, &st, &t.slow, &mut ids, &mut runs);
+            std::hint::black_box(&runs);
+        });
+        std::mem::forget(t);
+    }
 }
