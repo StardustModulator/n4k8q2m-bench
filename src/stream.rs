@@ -2,6 +2,11 @@
 //! sees only a 16-byte candidate per row, partitioned by event ID, and kills
 //! losing copies in place. Renaming then compacts each user bin and scatters
 //! only renamed rows; neither an all-user interner nor a global sort is needed.
+//!
+//! Keys stay raw: `Event.key`/`Click.key` leaving the parse is the packed or
+//! interned raw user key, and after `rename` the person's name key, exactly
+//! as `group` expects. Bins are picked by `bin_of`, one multiply; tables that
+//! need mixed bits mix on the spot.
 use super::*;
 use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
@@ -9,8 +14,8 @@ use crate::clock::Clock;
 use crate::links::Aliases;
 
 /// The splitmix64 finalizer. Every step is invertible, so `hash` is a
-/// bijection: a mixed key identifies its key exactly, and rows carry mixed
-/// keys so later stages index by their bits without hashing again.
+/// bijection: a mixed key identifies its key exactly. `group` and `links`
+/// index their tables by it.
 #[inline(always)]
 pub(super) fn hash(x: u64) -> u64 {
     let x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -18,13 +23,20 @@ pub(super) fn hash(x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// The inverse of `hash`.
-fn unhash(x: u64) -> u64 {
-    let x = x ^ (x >> 31) ^ (x >> 62);
-    let x = x.wrapping_mul(0x3196_42b2_d24d_8ec3);
-    let x = x ^ (x >> 27) ^ (x >> 54);
-    let x = x.wrapping_mul(0x96de_1b17_3f11_9089);
-    x ^ (x >> 30) ^ (x >> 60)
+/// An odd multiplier: `k * MIX` is a bijection whose top bits depend on every
+/// bit of `k`. Keys here have their entropy in the bytes of a random id, so
+/// the top bits of the product are well spread and the low bits are not.
+const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+#[inline(always)]
+fn mix(k: u64) -> u64 {
+    k.wrapping_mul(MIX)
+}
+
+/// The bin of a key among `1 << bits` (bits >= 1).
+#[inline(always)]
+fn bin_of(key: u64, bits: u32) -> usize {
+    (mix(key) >> (64 - bits)) as usize
 }
 
 /// One per event row with an ID and a parsable ingest, valid or not: dedup
@@ -32,7 +44,7 @@ fn unhash(x: u64) -> u64 {
 /// event in its worker's bins, or DEAD when the row failed validation.
 #[derive(Clone, Copy)]
 struct Cand {
-    h: u64,   // hash(event key): top bits pick the partition
+    h: u64,   // mix(event key): the top bits pick the partition, then the run
     sec: u32, // ingest seconds; F1 has no fraction
     loc: u32,
 }
@@ -71,7 +83,7 @@ struct Scan {
 impl Scan {
     #[inline(always)]
     fn candidate(&mut self, id: u64, sec: i64, at_row: Option<(usize, usize)>, b: Bits) {
-        let h = hash(id);
+        let h = mix(id);
         let part = (h >> (64 - b.id)) as usize;
         let loc = match at_row {
             None => DEAD as u64,
@@ -144,26 +156,6 @@ fn canonical8(w: u64, n: usize) -> Option<u32> {
     Some(crate::clock::decimal8(d) as u32)
 }
 
-/// Rows per decode batch. The scanner invokes its callback from several
-/// sites; a callback that only stores fields stays small enough to inline,
-/// and each decoder runs as one loop with its constants in registers.
-const BATCH: usize = 32;
-
-#[inline(always)]
-fn batched<'b, const N: usize>(buf: &'b [u8], mut decode: impl FnMut(&[[&'b [u8]; N]])) {
-    let mut batch = [[&buf[..0]; N]; BATCH];
-    let mut n = 0;
-    wire::rows::<N>(buf, |f| {
-        batch[n % BATCH] = f;
-        n += 1;
-        if n == BATCH {
-            decode(&batch);
-            n = 0;
-        }
-    });
-    decode(&batch[..n]);
-}
-
 /// Everything a row decoder reads, hoisted out of the shared context.
 struct Decoder<'a, 'c> {
     cx: &'a Ctx<'c>,
@@ -177,18 +169,51 @@ struct Decoder<'a, 'c> {
     b: Bits,
 }
 
+/// The event decoder as a scanner sink: the fast path decodes a record from
+/// its separator offsets inside the scanner's own loop, and the rare slow
+/// path takes slices through one out-of-line copy of the same decoder.
+struct Events<'a, 'c, 'd> {
+    dec: &'a Decoder<'c, 'd>,
+    out: &'a mut Scan,
+}
+
+impl<'b> wire::Sink<'b, 7> for Events<'_, '_, '_> {
+    #[inline(always)]
+    fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; 7]) {
+        // SAFETY: offsets handed over by the scanner (see `Sink::fast`).
+        let f: [&'b [u8]; 7] = unsafe { wire::unquoted(base, row, ends) };
+        self.dec.event(&f, self.out);
+    }
+    #[inline(never)]
+    fn slow(&mut self, f: [&'b [u8]; 7]) {
+        self.dec.event(&f, self.out);
+    }
+}
+
+struct Clicks<'a, 'b, 'c, 'd> {
+    dec: &'a Decoder<'c, 'd>,
+    out: &'a mut Scan,
+    buf: &'b [u8],
+}
+
+impl<'b> wire::Sink<'b, 4> for Clicks<'_, 'b, '_, '_> {
+    #[inline(always)]
+    fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; 4]) {
+        // SAFETY: offsets handed over by the scanner (see `Sink::fast`).
+        let f: [&'b [u8]; 4] = unsafe { wire::unquoted(base, row, ends) };
+        self.dec.click(self.buf, &f, self.out);
+    }
+    #[inline(never)]
+    fn slow(&mut self, f: [&'b [u8]; 4]) {
+        self.dec.click(self.buf, &f, self.out);
+    }
+}
+
 impl Decoder<'_, '_> {
     fn new<'a, 'c>(cx: &'a Ctx<'c>, clock: &'a Clock, s: &'a Shared, origin: i64, b: Bits) -> Decoder<'a, 'c> {
         let w = cx.window;
         Decoder { cx, clock, s, origin, start: w.start, span: (w.end - w.start) as u64,
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
-    }
-
-    #[inline(never)]
-    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
-        for f in rows {
-            self.event(f, out);
-        }
     }
 
     #[inline(always)]
@@ -197,9 +222,8 @@ impl Decoder<'_, '_> {
         let Some(sec) = self.clock.ingest_s(f[3]) else { return };
         let mut at_row = None;
         if let Some(val) = self.payload(f, sec * 1000) {
-            // Mixed until renaming.
-            let key = hash(user_key(self.s, f[1]));
-            let bin = (key >> (64 - self.b.user)) as usize;
+            let key = user_key(self.s, f[1]);
+            let bin = bin_of(key, self.b.user);
             let v = &mut out.ev[bin];
             at_row = Some((bin, v.len()));
             v.push(Event { key, val });
@@ -229,42 +253,6 @@ impl Decoder<'_, '_> {
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
-    #[inline(never)]
-    fn events_nostore(&self, rows: &[[&[u8]; 7]]) -> u64 {
-        let mut acc = 0u64;
-        for f in rows {
-            let Some(id) = event_key(self.s, f[0]) else { continue };
-            let Some(sec) = self.clock.ingest_s(f[3]) else { continue };
-            if let Some(val) = self.payload(f, sec * 1000) {
-                let key = hash(user_key(self.s, f[1]));
-                acc ^= key ^ val;
-            }
-            acc ^= hash(id) ^ sec as u64;
-        }
-        acc
-    }
-
-    #[inline(never)]
-    fn clicks_nostore(&self, buf: &[u8], rows: &[[&[u8]; 4]]) -> u64 {
-        let mut acc = 0u64;
-        for f in rows {
-            if f[0].is_empty() || f[1].is_empty() { continue; }
-            let Some(ts) = self.clock.parse(f[3]) else { continue };
-            if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { continue; }
-            let Some(camp) = self.campaign(buf, f[2]) else { continue };
-            let key = hash(user_key(self.s, f[1]));
-            acc ^= key ^ ts as u64 ^ u64::from(camp) ^ user_key(self.s, f[0]);
-        }
-        acc
-    }
-
-    #[inline(never)]
-    fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
-        for f in rows {
-            self.click(buf, f, out);
-        }
-    }
-
     // All copies of a click are identical. Window membership is existential
     // per campaign and credit is a min/max over keys. Both are idempotent:
     // duplicating an identical tuple cannot change either, so clicks skip dedup.
@@ -274,9 +262,9 @@ impl Decoder<'_, '_> {
         let Some(ts) = self.clock.parse(f[3]) else { return };
         if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { return; }
         let Some(camp) = self.campaign(buf, f[2]) else { return };
-        let key = hash(user_key(self.s, f[1]));
+        let key = user_key(self.s, f[1]);
         let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
-        out.cl[(key >> (64 - self.b.user)) as usize].push(Click { key, hit });
+        out.cl[bin_of(key, self.b.user)].push(Click { key, hit });
     }
 
     /// `campaign_of` with the number decoded in one word.
@@ -332,65 +320,76 @@ impl Rows {
     }
 }
 
+/// Per-worker dedup scratch, reused across partitions.
+#[derive(Default)]
+struct Dedup {
+    runs: Vec<Vec<Vec<Cand>>>, // [part][run]
+    table: Vec<u64>,           // (part + 1) << 32 | index into the part's run
+}
+
 // Copies of one id may sit in different workers' parts. Part p holds worker
 // p's candidates, so a loser's location is resolved against worker p's bins.
-fn dedup(parts: Vec<Vec<Cand>>, wide: Vec<Vec<Wide>>, rows: &Rows, id_bits: u32) {
+//
+// A partition is too big for a cache-sized table, so each part is first
+// scattered into runs by the next bits of `h` (one sequential pass over a
+// few dozen L1-resident streams), and each run is then settled in a table
+// that fits L1.
+fn dedup(parts: Vec<Vec<Cand>>, wide: Vec<Vec<Wide>>, rows: &Rows, id_bits: u32, d: &mut Dedup) {
     if wide.iter().any(|w| !w.is_empty()) {
         return dedup_exact(parts, wide, rows);
     }
     let n: usize = parts.iter().map(Vec::len).sum();
     if n == 0 { return; }
-    // Two bits per hash prefix. A prefix seen once cannot be a duplicate, so
-    // those rows skip the id table. A shared prefix is only a suspect: the
-    // exact table still compares full ids. The partition fixed the top bits;
-    // the bits below them pick the word and the bit.
-    let words = n.div_ceil(4).next_power_of_two();
-    let wbits = words.trailing_zeros();
-    let probe = |h: u64| {
-        let g = h << id_bits;
-        ((g >> (63 - wbits) >> 1) as usize, 1u64 << ((g >> (58 - wbits)) & 63))
-    };
-    let mut marks = vec![[0u64; 2]; words]; // present, repeated
-    for c in parts.iter().flatten() {
-        let (i, bit) = probe(c.h);
-        let m = &mut marks[i];
-        m[1] |= m[0] & bit;
-        m[0] |= bit;
+    let run_bits = (n / 1024).next_power_of_two().trailing_zeros().min(10);
+    let runs = 1usize << run_bits;
+    // Two shifts, so zero run bits select run 0 instead of shifting by 64.
+    let run_of = |h: u64| ((h << id_bits) >> (63 - run_bits) >> 1) as usize;
+    d.runs.resize_with(parts.len(), Vec::new);
+    for (part, out) in parts.iter().zip(&mut d.runs) {
+        out.resize_with(runs, Vec::new);
+        let hint = part.len() / runs * 5 / 4 + 16;
+        for v in out.iter_mut() {
+            v.clear();
+            v.reserve(hint);
+        }
+        for &c in part {
+            out[run_of(c.h)].push(c);
+        }
     }
-    let mut suspects = n;
-    for m in &marks {
-        suspects -= (m[0] ^ m[1]).count_ones() as usize;
-    }
-    if suspects == 0 { return; }
-    // Slot value: part index + 1 in the high half, row in the low half. The
-    // low hash bits are independent of the prefix bits used above.
-    let mask = (suspects * 2).next_power_of_two() - 1;
-    let mut table = vec![0u64; mask + 1];
-    for (p, part) in parts.iter().enumerate() {
-        for (i, c) in part.iter().enumerate() {
-            let (w, bit) = probe(c.h);
-            if marks[w][1] & bit == 0 { continue; }
-            let me = ((p as u64 + 1) << 32) | i as u64;
-            let mut s = c.h as usize & mask;
-            loop {
-                let ptr = table[s];
-                if ptr == 0 {
-                    table[s] = me;
-                    break;
-                }
-                let (q, j) = ((ptr >> 32) as usize - 1, ptr as u32 as usize);
-                let old = parts[q][j];
-                if old.h == c.h {
-                    // Copies with equal ingest are identical: keep either.
-                    if c.sec < old.sec {
-                        rows.kill(q, old.loc);
+    let largest = (0..runs).map(|r| d.runs.iter().map(|p| p[r].len()).sum::<usize>()).max().unwrap_or(0);
+    // Slot value: part index + 1 in the high half, index in the low half. The
+    // bits below the run bits index the table; one run never fills it.
+    let tbits = (largest * 2).max(16).next_power_of_two().trailing_zeros();
+    let mask = (1usize << tbits) - 1;
+    d.table.clear();
+    d.table.resize(mask + 1, 0);
+    let table = &mut d.table;
+    for r in 0..runs {
+        if r > 0 { table.fill(0); }
+        for p in 0..d.runs.len() {
+            for (j, &c) in d.runs[p][r].iter().enumerate() {
+                let me = ((p as u64 + 1) << 32) | j as u64;
+                let mut s = ((c.h << (id_bits + run_bits)) >> (64 - tbits)) as usize;
+                loop {
+                    let ptr = table[s];
+                    if ptr == 0 {
                         table[s] = me;
-                    } else {
-                        rows.kill(p, c.loc);
+                        break;
                     }
-                    break;
+                    let (q, k) = ((ptr >> 32) as usize - 1, ptr as u32 as usize);
+                    let old = d.runs[q][r][k];
+                    if old.h == c.h {
+                        // Copies with equal ingest are identical: keep either.
+                        if c.sec < old.sec {
+                            rows.kill(q, old.loc);
+                            table[s] = me;
+                        } else {
+                            rows.kill(p, c.loc);
+                        }
+                        break;
+                    }
+                    s = (s + 1) & mask;
                 }
-                s = (s + 1) & mask;
             }
         }
     }
@@ -425,31 +424,34 @@ fn dedup_exact(parts: Vec<Vec<Cand>>, wide: Vec<Vec<Wide>>, rows: &Rows) {
     }
 }
 
-/// Mixed raw user -> (person name, its bin) for one user bin. Each raw user
-/// recurs about a dozen times per bin, and a hit here is predictable where the
-/// alias probe's hit-or-miss outcome is not. Keys in one bin share their top
-/// bits, so the low bits index.
+/// Raw user -> (person name, its bin) for one user bin. Each raw user recurs
+/// about a dozen times per bin, and a hit here is predictable where the
+/// alias probe's hit-or-miss outcome is not. Keys in one bin share the top
+/// bits of their mix, so the bits below those index.
 #[derive(Default)]
 struct Names {
-    table: Vec<(u64, u64, usize)>,
+    table: Vec<[u64; 2]>, // raw key, name
     used: usize,
+    shift: u32,
 }
 
 impl Names {
-    fn reset(&mut self, rows: usize) {
+    fn reset(&mut self, rows: usize, bin_bits: u32) {
         self.table.clear();
-        // A raw user recurs about a dozen times per bin: start near 25% load.
-        self.table.resize((rows / 4).max(64).next_power_of_two(), (0, 0, 0));
+        // A raw user recurs a dozen or more times per bin: start under 50%
+        // load and grow if a bin proves unusually diverse.
+        self.table.resize((rows / 16).max(64).next_power_of_two(), [0; 2]);
+        self.shift = 64 - bin_bits - self.table.len().trailing_zeros();
         self.used = 0;
     }
 
     #[inline(always)]
     fn get(&mut self, key: u64, aliases: &Aliases, shift: u32) -> (u64, usize) {
         let mask = self.table.len() - 1;
-        let mut i = key as usize & mask;
+        let mut i = (mix(key) >> self.shift) as usize & mask;
         loop {
-            let (k, name, bin) = self.table[i];
-            if k == key { return (name, bin); }
+            let [k, name] = self.table[i];
+            if k == key { return (name, (mix(name) >> shift) as usize); }
             if k == 0 { return self.insert(i, key, aliases, shift); }
             i = (i + 1) & mask;
         }
@@ -458,21 +460,21 @@ impl Names {
     #[cold]
     #[inline(never)]
     fn insert(&mut self, i: usize, key: u64, aliases: &Aliases, shift: u32) -> (u64, usize) {
-        let name = aliases.resolve(unhash(key));
-        let bin = (hash(name) >> shift) as usize;
-        self.table[i] = (key, name, bin);
+        let name = aliases.resolve(key);
+        self.table[i] = [key, name];
         self.used += 1;
         if self.used * 2 > self.table.len() {
-            let grown = vec![(0, 0, 0); self.table.len() * 4];
+            let grown = vec![[0; 2]; self.table.len() * 4];
             let old = std::mem::replace(&mut self.table, grown);
+            self.shift -= 2;
             let mask = self.table.len() - 1;
-            for e in old.into_iter().filter(|e| e.0 != 0) {
-                let mut j = e.0 as usize & mask;
-                while self.table[j].0 != 0 { j = (j + 1) & mask; }
+            for e in old.into_iter().filter(|e| e[0] != 0) {
+                let mut j = (mix(e[0]) >> self.shift) as usize & mask;
+                while self.table[j][0] != 0 { j = (j + 1) & mask; }
                 self.table[j] = e;
             }
         }
-        (name, bin)
+        (name, (mix(name) >> shift) as usize)
     }
 }
 
@@ -511,14 +513,14 @@ fn split<T: Copy>(rows: &mut Vec<T>, stage: &mut Vec<(usize, T)>, bin: usize,
     unsafe { stage.set_len(moved) };
 }
 
-// Every raw user in this bin shares its top hash bits with exactly one alias
+// Every raw user in this bin shares its top mix bits with exactly one alias
 // shard, so a resolve stays in a cache-sized table; each happens once per raw
 // user. A user named by itself already lives in its person's bin: such rows
 // stay in place and only renamed rows are scattered. Dedup losers (key 0) drop.
 fn rename(mut parts: Vec<Histories>, aliases: &Aliases, dest: &mut [Histories], r: &mut Renamer, shift: u32, bin: usize) -> Vec<Histories> {
     let rows = parts.iter().map(|p| p.ev.len() + p.cl.len()).sum();
     let names = &mut r.names;
-    names.reset(rows);
+    names.reset(rows, 64 - shift);
     for p in &mut parts {
         split(&mut p.ev, &mut r.ev, bin, |e| {
             if e.key == 0 { return None; }
@@ -536,7 +538,7 @@ fn rename(mut parts: Vec<Histories>, aliases: &Aliases, dest: &mut [Histories], 
             dest[to].cl.push(c);
         }
     }
-    debug_assert!(parts.iter().all(|p| p.ev.iter().all(|e| (hash(e.key) >> shift) as usize == bin)));
+    debug_assert!(parts.iter().all(|p| p.ev.iter().all(|e| (mix(e.key) >> shift) as usize == bin)));
     parts
 }
 
@@ -546,14 +548,6 @@ fn rusage()->(u64,u64){
     let f:Vec<&str>=s.rsplit(')').next().unwrap_or("").split_whitespace().collect();
     let g=|i:usize|f.get(i).and_then(|x|x.parse::<u64>().ok()).unwrap_or(0);
     (g(7),g(11)+g(12))
-}
-
-/// Write one byte per page of a vector's capacity, so faults happen before timing.
-fn touch<T>(v:&mut Vec<T>){
-    let bytes=v.capacity()*std::mem::size_of::<T>();
-    let p=v.as_mut_ptr() as *mut u8;
-    let mut off=0;
-    while off<bytes { unsafe{p.add(off).write_volatile(0)}; off+=4096; }
 }
 
 // One owner for each job. The lock is acquired once per shard, never per row.
@@ -601,11 +595,12 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     }
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
+    // Few write streams: every bin's tail and header must stay in a small
+    // L1 while a row is decoded. Dedup re-splits its partitions locally.
     let env_pow2=|k:&str,d:usize|std::env::var(k).ok().and_then(|s|s.parse::<usize>().ok()).map_or(d,|v|v.next_power_of_two().clamp(2,1<<16));
-    let eb=env_pow2("SS_EB",(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048));
-    let pb=env_pow2("SS_PB",(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512));
+    let eb=env_pow2("SS_EB",(event_bytes / (77 * 131072)).next_power_of_two().clamp(8,128));
+    let pb=env_pow2("SS_PB",(event_bytes / (77 * 131072)).next_power_of_two().clamp(16,128));
     let abl=std::env::var("ABL").ok().and_then(|s|s.parse::<u8>().ok()).unwrap_or(0);
-    let prefault=std::env::var_os("PREFAULT").is_some();
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
     let next=AtomicUsize::new(0);
@@ -619,11 +614,6 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
                 cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
-            if prefault {
-                for v in &mut out.ev { touch(v); }
-                for v in &mut out.cl { touch(v); }
-                for v in &mut out.cand { touch(v); }
-            }
             let mut acc=0u64;
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
@@ -632,12 +622,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 match (c.kind,abl) {
                     (0,1)=>wire::rows::<7>(buf,|f|acc+=(f[0].len()+f[6].len()) as u64),
                     (1,1)=>wire::rows::<4>(buf,|f|acc+=(f[0].len()+f[3].len()) as u64),
-                    (0,2)=>batched::<7>(buf,|rows|acc+=rows.len() as u64),
-                    (1,2)=>batched::<4>(buf,|rows|acc+=rows.len() as u64),
-                    (0,3)=>batched::<7>(buf,|rows|acc^=dec.events_nostore(rows)),
-                    (1,3)=>batched::<4>(buf,|rows|acc^=dec.clicks_nostore(buf,rows)),
-                    (0,_)=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
-                    (1,_)=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
+                    (0,_)=>wire::records::<7>(buf,wire::WINDOW,Events{dec:&dec,out:&mut out}),
+                    (1,_)=>wire::records::<4>(buf,wire::WINDOW,Clicks{dec:&dec,out:&mut out,buf}),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));
@@ -671,7 +657,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let aliases=links::build(lks,&slow,threads,pb);
     let indexed=total.elapsed();
     let rows=Rows::new(&mut evs,b.user);
-    consume(cands,threads,||(),|_,(c,wd)|dedup(c,wd,&rows,b.id));
+    consume(cands,threads,Dedup::default,|d,(c,wd)|dedup(c,wd,&rows,b.id,d));
     drop(rows);
     let reduced=total.elapsed();
     let shift=64-b.user;
@@ -722,20 +708,6 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hash_is_a_bijection() {
-        let mut x = 0x0123_4567_89ab_cdefu64;
-        for i in 0..100_000u64 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            for k in [x, i, u64::MAX - i, 1 << (i % 64)] {
-                assert_eq!(unhash(hash(k)), k);
-            }
-        }
-        assert_eq!(hash(0), 0);
-    }
 
     #[test]
     fn event_keys_are_exact() {
@@ -802,7 +774,7 @@ mod bench {
         let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
         let rows_n = memchr::memchr_iter(b'\n', body).count();
         let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
-        let b = Bits { user: 9, id: 11 };
+        let b = Bits { user: 7, id: 7 };
         let dec = Decoder::new(&cx, &clock, &shared, origin, b);
         let only = std::env::var("BENCH_ONLY").ok();
         let report = |name: &str, f: &mut dyn FnMut()| {
@@ -825,23 +797,12 @@ mod bench {
             }
             std::hint::black_box(acc);
         });
+        report("stage1", &mut || {
+            std::hint::black_box(crate::wire::stage1_for_bench::<7>(body));
+        });
         report("rows<7>", &mut || {
             let mut acc = 0usize;
             wire::rows::<7>(body, |f| acc += f[0].len() + f[6].len());
-            std::hint::black_box(acc);
-        });
-        report("batch", &mut || {
-            let mut acc = 0usize;
-            let mut batch = [[&body[..0]; 7]; BATCH];
-            let mut n = 0;
-            #[inline(never)]
-            fn sink(rows: &[[&[u8]; 7]], acc: &mut usize) { for f in rows { *acc += f[0].len() + f[6].len(); } }
-            wire::rows::<7>(body, |f| {
-                batch[n % BATCH] = f;
-                n += 1;
-                if n == BATCH { sink(&batch, &mut acc); n = 0; }
-            });
-            sink(&batch[..n], &mut acc);
             std::hint::black_box(acc);
         });
         report("+id", &mut || {
@@ -882,7 +843,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(rows, &mut out));
+            wire::records::<7>(body, wire::WINDOW, Events { dec: &dec, out: &mut out });
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());

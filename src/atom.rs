@@ -48,31 +48,26 @@ pub(super) fn try_pack(s: &[u8]) -> Option<u64> {
     if rank == 0 {
         return None;
     }
-    let word = if let Some(tail) = s.last_chunk::<8>() {
-        // One in-bounds word load for both common sizes. For n=8, shift out
-        // the prefix; for n=9, the word already contains exactly the suffix.
-        let word = u64::from_be_bytes(*tail);
-        if n == 8 {
-            word << 8
-        } else {
-            word
-        }
+    let word = if n >= 8 {
+        // One in-bounds word load for both common sizes, shifted so the
+        // suffix starts at the top byte: for n = 8 it still holds the prefix.
+        // SAFETY: n - 8 + 8 <= n.
+        let w = unsafe { u64::from_be_bytes(s.as_ptr().add(n - 8).cast::<[u8; 8]>().read_unaligned()) };
+        w << (8 * (9 - n))
     } else {
-        // Fixed-size loads keep even the short case free of a memcpy call.
-        match s[1..] {
-            [a, b, c, d, e, f] => u64::from_be_bytes([a, b, c, d, e, f, 0, 0]),
-            [a, b, c, d, e] => u64::from_be_bytes([a, b, c, d, e, 0, 0, 0]),
-            [a, b, c, d] => u64::from_be_bytes([a, b, c, d, 0, 0, 0, 0]),
-            [a, b, c] => u64::from_be_bytes([a, b, c, 0, 0, 0, 0, 0]),
-            [a, b] => u64::from_be_bytes([a, b, 0, 0, 0, 0, 0, 0]),
-            [a] => u64::from(a) << 56,
-            _ => 0, // Empty suffix.
-        }
+        short_word(&s[1..])
     };
     if word & !ASCII != 0 {
         return None;
     }
     Some((u64::from(rank) << 60) | (gather_ascii(word) << 4) | n as u64)
+}
+
+/// Up to seven suffix bytes, left aligned.
+#[cold]
+#[inline(never)]
+fn short_word(suffix: &[u8]) -> u64 {
+    suffix.iter().fold(0u64, |w, &b| w << 8 | u64::from(b)) << (8 * (8 - suffix.len()))
 }
 
 /// Write the original bytes of a fast key to `buf[..returned_length]`.

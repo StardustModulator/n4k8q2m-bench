@@ -3,39 +3,41 @@
 
 use super::time::{civil_from_days, format_day, parse_ts, DAY_MS};
 
+/// One cached date: its "YYYY-MM-" word, then "DDT" in the low three bytes
+/// of `hd` and the day number (as an i32) above them. Sixteen bytes, so a
+/// hit costs one aligned load.
 #[derive(Clone, Copy)]
 struct Day {
-    lo: u64,       // "YYYY-MM-"
-    hi: u32,       // "DDT" in the low three bytes
-    midnight: i64, // seconds
+    lo: u64,
+    hd: u64,
 }
 
+#[repr(align(16))]
 pub(super) struct Clock {
     days: [Day; 64],
 }
 
+/// The cache slot of a date whose "YYYY-MM-" word is `lo` and whose
+/// "DDT?" bytes are `hi`.
 #[inline(always)]
-fn slot(b: &[u8]) -> usize {
+fn slot(lo: u64, hi: u32) -> usize {
     // The high byte of this product is (10 * b[8] + b[9]) mod 256.
     // Its low five bits distinguish all days of a month. Month parity keeps
     // adjacent months apart, including December and January. This is only an
     // index; neither a matching day number nor a hash hit establishes a date.
-    let dd = u16::from_le_bytes([b[8], b[9]]).wrapping_mul(2561) >> 8;
-    (usize::from(b[6] & 1) << 5) | usize::from(dd & 31)
-}
-
-/// The whole "YYYY-MM-DDT" prefix as two words; the hour digit is masked off.
-#[inline(always)]
-fn tag(b: &[u8]) -> (u64, u32) {
-    (word(&b[..8]), u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xff_ffff)
+    let dd = (hi as u16).wrapping_mul(2561) >> 8;
+    ((lo >> 48) as usize & 1) << 5 | usize::from(dd & 31)
 }
 
 impl Clock {
     pub(super) fn new(start: i64, end: i64) -> Self {
         // Even the default entry represents a real date: no arbitrary input
         // can match an uninitialized/all-zero tag and be mistaken for a hit.
-        let (lo, hi) = tag(b"1970-01-01T00");
-        let mut days = [Day { lo, hi, midnight: 0 }; 64];
+        let entry = |text: &[u8; 13], d: i32| Day {
+            lo: word(&text[..8]),
+            hd: u64::from(u32::from_le_bytes(text[8..12].try_into().unwrap()) & 0xff_ffff) | u64::from(d as u32) << 24,
+        };
+        let mut days = [entry(b"1970-01-01T00", 0); 64];
         // Include the click lookback and the preceding local day for F2.
         // Leave room after the window for offsets and late ingest dates too.
         // Bound the work even if passed the entire i64 range.
@@ -48,8 +50,8 @@ impl Clock {
             }
             let mut text = *b"1970-01-01T00";
             format_day(day, (&mut text[..10]).try_into().unwrap());
-            let (lo, hi) = tag(&text);
-            days[slot(&text)] = Day { lo, hi, midnight: d * (DAY_MS / 1000) };
+            let e = entry(&text, day);
+            days[slot(e.lo, e.hd as u32)] = e;
         }
         Self { days }
     }
@@ -57,10 +59,14 @@ impl Clock {
     /// F1, F2 or unsigned ASCII epoch milliseconds (F3).
     #[inline(always)]
     pub(super) fn parse(&self, b: &[u8]) -> Option<i64> {
-        match b.len() {
-            20 if b[19] == b'Z' => Some(self.iso::<20>(b.try_into().unwrap())? * 1000),
-            25 if matches!(b[19], b'+' | b'-') => Some(self.iso::<25>(b.try_into().unwrap())? * 1000),
-            _ => epoch_ms(b),
+        let p = b.as_ptr();
+        // SAFETY: each arm reads only within the checked length.
+        unsafe {
+            match b.len() {
+                20 if *p.add(19) == b'Z' => Some(self.iso::<20>(p)? * 1000),
+                25 if matches!(*p.add(19), b'+' | b'-') => Some(self.iso::<25>(p)? * 1000),
+                _ => epoch_ms(b),
+            }
         }
     }
 
@@ -74,36 +80,50 @@ impl Clock {
     /// `ingest` in whole seconds, which is exact: F1 has no fraction.
     #[inline(always)]
     pub(super) fn ingest_s(&self, b: &[u8]) -> Option<i64> {
-        let b: &[u8; 20] = b.try_into().ok()?;
-        if b[19] != b'Z' {
+        if b.len() != 20 || b[19] != b'Z' {
             return None;
         }
-        self.iso(b)
+        // SAFETY: 20 bytes.
+        unsafe { self.iso::<20>(b.as_ptr()) }
     }
 
-    /// Seconds since the epoch.
+    /// Seconds since the epoch of the `N`-byte ISO form at `p`.
+    ///
+    /// # Safety
+    /// `N` bytes must be readable at `p`.
     #[inline(always)]
-    fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
-        let day = &self.days[slot(b)];
-        if (day.lo, day.hi) != tag(b) {
-            return uncached_iso(b);
+    unsafe fn iso<const N: usize>(&self, p: *const u8) -> Option<i64> {
+        // SAFETY: all offsets lie below 20 <= N.
+        let (lo, hi, hms) = unsafe { (load(p), load::<u32>(p.add(8)), load::<u64>(p.add(11))) };
+        let day = self.days[slot(lo, hi)];
+        if day.lo != lo || day.hd as u32 & 0xff_ffff != hi & 0xff_ffff {
+            // SAFETY: forwarded.
+            return uncached_iso(unsafe { std::slice::from_raw_parts(p, N) });
         }
-        let local = day.midnight + hms_s(word(&b[11..19]))?;
+        let local = ((day.hd >> 24) as u32 as i32 as i64) * (DAY_MS / 1000) + hms_s(hms)?;
         if N == 25 {
             // Load exactly through the end of F2: "SS±HH:MM". Discard the
             // first three bytes and supply ":00" seconds for the same checked
             // HH:MM:SS decoder. Keep the offset in signed seconds.
-            let hm = word(&b[17..25]) >> 24;
+            // SAFETY: bytes 17..25 of 25.
+            let hm = unsafe { load::<u64>(p.add(17)) } >> 24;
             let offset = hms_s(hm | (HMS_MIN & (u64::MAX << 40)))?;
-            Some(if b[19] == b'+' {
-                local - offset
-            } else {
-                local + offset
-            })
+            // SAFETY: byte 19 of 25.
+            Some(if unsafe { *p.add(19) } == b'+' { local - offset } else { local + offset })
         } else {
             Some(local)
         }
     }
+}
+
+/// An unaligned little-endian load.
+///
+/// # Safety
+/// `size_of::<T>()` bytes must be readable at `p`.
+#[inline(always)]
+unsafe fn load<T: Copy>(p: *const u8) -> T {
+    // SAFETY: forwarded.
+    unsafe { p.cast::<T>().read_unaligned() }
 }
 
 // Keep the general calendar conversion off the row-parsing hot path. ISO

@@ -21,14 +21,76 @@
 /// slices, and syntactic quotes are removed from returned quoted fields.
 #[inline]
 pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], f: impl FnMut([&'b [u8]; N])) {
-    rows_window::<N>(buf, WINDOW, f);
+    records::<N>(buf, WINDOW, Slices(f));
+}
+
+/// A consumer of well-formed `N`-field records. The fast path hands over the
+/// record's separator offsets instead of field slices, so a decoder can read
+/// its fields straight from the window with no intermediate copies.
+pub(super) trait Sink<'b, const N: usize> {
+    /// A record whose quotes passed the block check. `base` is the window's
+    /// first byte, `row` the record's offset in the window and `ends[i]` the
+    /// offset of its i-th separator (the last one is its LF or EOF). Field i
+    /// runs from the previous separator (or `row`) to `ends[i]`, and is
+    /// wrapped in quotes exactly when the byte at `ends[i] - 1` is a quote;
+    /// `unquoted` applies that rule. Every offset lies in `buf`, and the byte
+    /// at `row - 1` is readable (it is an LF).
+    fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; N]);
+    /// Any other well-formed record, with syntactic quotes removed.
+    fn slow(&mut self, fields: [&'b [u8]; N]);
+}
+
+/// A sink that turns every record into field slices.
+struct Slices<F>(F);
+
+impl<'b, const N: usize, F: FnMut([&'b [u8]; N])> Sink<'b, N> for Slices<F> {
+    #[inline(always)]
+    fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; N]) {
+        // SAFETY: `records` only passes offsets inside the buffer it scans,
+        // which outlives this call.
+        (self.0)(unsafe { unquoted::<N>(base, row, ends) })
+    }
+    #[inline(always)]
+    fn slow(&mut self, fields: [&'b [u8]; N]) {
+        (self.0)(fields)
+    }
+}
+
+/// The field slices of a fast-path record (see `Sink::fast`).
+///
+/// # Safety
+/// `base`, `row` and `ends` must come from `Sink::fast` for a buffer that
+/// lives for `'b`.
+#[inline(always)]
+pub(super) unsafe fn unquoted<'b, const N: usize>(base: *const u8, row: usize, ends: &[u16; N]) -> [&'b [u8]; N] {
+    let mut fields = [&[][..]; N];
+    let mut s = row;
+    for (field, &e) in fields.iter_mut().zip(ends) {
+        let e = e as usize;
+        // SAFETY: the probe reads the byte before the separator: the field's
+        // last byte, or for an empty field the previous separator, at worst
+        // the LF before the record. A valid field ending in a quote is
+        // wrapped and has two or more bytes.
+        unsafe {
+            let w = (*base.add(e - 1) == b'"') as usize;
+            *field = std::slice::from_raw_parts(base.add(s + w), e - s - 2 * w);
+        }
+        s = e + 1;
+    }
+    fields
+}
+
+/// Feed every well-formed `N`-field record of `buf` to `sink` (see `rows`).
+#[inline]
+pub(super) fn records<'b, const N: usize>(buf: &'b [u8], window: usize, mut sink: impl Sink<'b, N>) {
+    rows_window::<N>(buf, window, &mut sink);
 }
 
 /// Bytes per two-stage window. A multiple of 64 so only the input's final
 /// block is ever partial, and small enough for u16 window offsets. Stage 2
 /// rereads the window, so it and its lists (about 10 KiB) should stay in L1
 /// next to the caller's own data; on M1 8 to 32 KiB measure the same.
-const WINDOW: usize = 1 << 13;
+pub(super) const WINDOW: usize = 1 << 13;
 /// Set on a line entry whose record must take the exact path.
 const POISON: u32 = 1 << 31;
 /// Written past the last separator: equals no window offset.
@@ -60,7 +122,7 @@ const NONE: u16 = u16::MAX;
 /// Every other record has valid quotes, so its field is quoted exactly when
 /// its last byte is a quote.
 #[inline]
-pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut f: impl FnMut([&'b [u8]; N])) {
+fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, sink: &mut impl Sink<'b, N>) {
     debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
     let len = buf.len();
     // Slack for the unconditional writes, the EOF entry and the sentinels.
@@ -69,17 +131,17 @@ pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut 
     // The first record goes to the simple scanner. Every window then starts
     // just after an LF, which the fast path's quote probe may read.
     let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
-    rows_simple::<N>(&buf[..start], &mut f);
+    rows_simple::<N>(&buf[..start], |f| sink.slow(f));
     while start < len {
         let end = (start + window).min(len);
-        let next = window_rows::<N>(buf, start, end, stops.as_mut_ptr(), lines.as_mut_ptr(), &mut f);
+        let next = window_rows::<N>(buf, start, end, stops.as_mut_ptr(), lines.as_mut_ptr(), sink);
         if next > start {
             start = next;
         } else {
             // A full window without LF: one long row. Hand it to the simple
             // scanner, which has no length limit.
             let stop = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i + 1);
-            rows_simple::<N>(&buf[start..stop], &mut f);
+            rows_simple::<N>(&buf[start..stop], |f| sink.slow(f));
             start = stop;
         }
     }
@@ -234,7 +296,7 @@ fn window_rows<'b, const N: usize>(
     end: usize,
     sp: *mut u16,
     lp: *mut u32,
-    f: &mut impl FnMut([&'b [u8]; N]),
+    sink: &mut impl Sink<'b, N>,
 ) -> usize {
     let len = buf.len();
     // A window starts at a record boundary.
@@ -299,21 +361,10 @@ fn window_rows<'b, const N: usize>(
         // is a separator), so k + N - 1 < nc + N is initialized.
         let fast = unsafe { *sp.add(k + N - 1) } as usize == lf && line & POISON == 0;
         if fast {
-            let mut fields = [&buf[..0]; N];
-            let mut s = row;
-            for (i, field) in fields.iter_mut().enumerate() {
-                // SAFETY: k + i < nc, and s <= e <= len - start. The probe
-                // reads the byte before the separator: the field's last byte,
-                // or for an empty field the previous separator, at worst the
-                // LF at start - 1 (start >= 1, see rows_window).
-                let e = unsafe { *sp.add(k + i) } as usize;
-                let w = (unsafe { *base.add(e).sub(1) } == b'"') as usize;
-                // SAFETY: a valid field ending in a quote is wrapped and has
-                // two or more bytes.
-                *field = unsafe { std::slice::from_raw_parts(base.add(s + w), e - s - 2 * w) };
-                s = e + 1;
-            }
-            f(fields);
+            // SAFETY: k + N <= nc, so the N entries are initialized; each is
+            // at most len - start (see the sentinels above). The byte before
+            // the record is the LF at start - 1 (start >= 1, see rows_window).
+            sink.fast(base, row, unsafe { &*sp.add(k).cast::<[u16; N]>() });
             k += N;
         } else {
             // SAFETY: every LF entry is also a separator entry at or after k.
@@ -324,7 +375,7 @@ fn window_rows<'b, const N: usize>(
             if j - k == N - 1 {
                 // SAFETY: entries k..=j were initialized in stage 1.
                 let ends = unsafe { std::slice::from_raw_parts(sp.add(k), N) };
-                exact::<N>(buf, start, start + row, ends, f);
+                exact::<N>(buf, start, start + row, ends, &mut |f| sink.slow(f));
             }
             k = j + 1;
         }
@@ -531,7 +582,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rows, rows_simple, rows_window};
+    use super::{records, rows, rows_simple, Slices};
 
     fn reference<'b, const N: usize>(buf: &'b [u8], mut emit: impl FnMut([&'b [u8]; N])) {
         fn line<'b, const N: usize>(line: &'b [u8]) -> Option<[&'b [u8]; N]> {
@@ -594,7 +645,7 @@ mod tests {
         assert_eq!(owned::<N>(buf, true), want, "input={buf:?}");
         assert_eq!(collect::<N>(buf, |b, f| rows_simple::<N>(b, f)), want, "simple input={buf:?}");
         for window in [64, 128, 192, 256] {
-            assert_eq!(collect::<N>(buf, |b, f| rows_window::<N>(b, window, f)), want, "window={window} input={buf:?}");
+            assert_eq!(collect::<N>(buf, |b, f| records::<N>(b, window, Slices(f))), want, "window={window} input={buf:?}");
         }
     }
 
@@ -849,4 +900,32 @@ mod tests {
 #[cfg(test)]
 pub(super) unsafe fn masks64_for_bench(p: *const u8) -> (u64, u64, u64) {
     unsafe { masks64(p) }
+}
+
+/// Stage 1 alone over whole windows: separator and LF lists plus the quote
+/// verdict, with no row walk. Returns the number of separators listed.
+#[cfg(test)]
+pub(super) fn stage1_for_bench<const N: usize>(buf: &[u8]) -> usize {
+    let len = buf.len();
+    let mut stops: Vec<u16> = Vec::with_capacity(WINDOW + 80);
+    let mut lines: Vec<u32> = Vec::with_capacity(WINDOW + 80);
+    let mut total = 0usize;
+    let mut start = 0usize;
+    while start + WINDOW + 64 < len {
+        let mut st = Scan { sp: stops.as_mut_ptr(), lp: lines.as_mut_ptr(), prev_s: 1, open: 0, pending: 0 };
+        let base = unsafe { buf.as_ptr().add(start) };
+        let mut rel = 0u32;
+        while rel < WINDOW as u32 {
+            unsafe {
+                let p = base.add(rel as usize);
+                let m = masks64(p);
+                let next_s = is_sep(*p.add(64));
+                st.block::<N>(rel, m, next_s, 0);
+            }
+            rel += 64;
+        }
+        total += unsafe { st.sp.offset_from(stops.as_ptr()) } as usize;
+        start += WINDOW;
+    }
+    total
 }
