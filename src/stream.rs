@@ -100,8 +100,8 @@ fn push_far<T>(v: &mut Vec<T>, x: T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: a prefetch never faults, whatever the address.
     unsafe {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        _mm_prefetch(v.as_ptr().add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T0);
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+        _mm_prefetch(v.as_ptr().add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T1);
     }
     v.push(x);
 }
