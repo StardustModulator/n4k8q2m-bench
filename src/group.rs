@@ -123,6 +123,7 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         // Leave the table empty for the next bin.
         *p = Slot::default();
     }
+    acc.flush();
     sc.slots = slots;
     acc.scratch = sc;
     let t3 = Instant::now();

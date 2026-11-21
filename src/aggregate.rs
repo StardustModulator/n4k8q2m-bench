@@ -75,6 +75,14 @@ pub(super) struct Acc {
     // Short path: sessions of each day; cleared again with the rows.
     on_day: Vec<u64>,
     epoch: u64,
+    // Per (campaign, day) cell, this bin's credited sessions | purchasing
+    // sessions << 32, their revenue and the assisted sessions, with a bitmap
+    // of the touched cells; `flush` adds them to `stats`. The small arrays
+    // stay in cache where the wide stats table does not.
+    cred: Vec<u64>,
+    rev: Vec<i64>,
+    asst: Vec<u32>,
+    hot: Vec<u64>,
     days: Vec<Day>,
     // Purchase cents per (day, category), with the touched cells.
     spend: Vec<i64>,
@@ -136,6 +144,10 @@ impl Acc {
             runs: vec![0; organic],
             on_day: vec![0; ndays],
             epoch: 0,
+            cred: vec![0; n_camps * ndays],
+            rev: vec![0; n_camps * ndays],
+            asst: vec![0; n_camps * ndays],
+            hot: vec![0; (n_camps * ndays).div_ceil(64)],
             days: vec![NO_DAY; ndays],
             spend: vec![0; ndays * n_cats],
             touched: Vec::new(),
@@ -146,14 +158,41 @@ impl Acc {
     #[inline]
     fn credit(&mut self, i: usize, camp: usize, d: usize) {
         let cents = self.cents[i];
-        let s = &mut self.stats[camp * self.ndays + d];
-        s[0] += 1;
-        s[1] += i64::from(cents != 0);
-        s[2] += cents;
+        let cell = camp * self.ndays + d;
+        self.cred[cell] += 1 | u64::from(cents != 0) << 32;
+        if cents != 0 {
+            self.rev[cell] += cents;
+        }
+        self.hot[cell / 64] |= 1 << (cell % 64);
         let day = &mut self.days[d];
         day.sessions += 1;
         day.events += u64::from(self.ends[i + 1] - self.ends[i]);
         day.revenue += cents;
+    }
+
+    /// Count `n` sessions of day `d` as assisted by campaign `k`.
+    #[inline]
+    fn assist(&mut self, k: usize, d: usize, n: u32) {
+        let cell = k * self.ndays + d;
+        self.asst[cell] += n;
+        self.hot[cell / 64] |= 1 << (cell % 64);
+    }
+
+    /// Add the bin's campaign cells to the stats and clear them.
+    pub(super) fn flush(&mut self) {
+        for w in 0..self.hot.len() {
+            let mut m = std::mem::take(&mut self.hot[w]);
+            while m != 0 {
+                let cell = w * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let c = std::mem::take(&mut self.cred[cell]);
+                let s = &mut self.stats[cell];
+                s[0] += i64::from(c as u32);
+                s[1] += (c >> 32) as i64;
+                s[2] += std::mem::take(&mut self.rev[cell]);
+                s[3] += i64::from(std::mem::take(&mut self.asst[cell]));
+            }
+        }
     }
 
     /// Up to 64 sessions, without branches on the data. The best click of
@@ -220,7 +259,7 @@ impl Acc {
             for d in lo..=hi {
                 let c = (r & self.on_day[d]).count_ones();
                 if c != 0 {
-                    self.stats[k * self.ndays + d][3] += i64::from(c);
+                    self.assist(k, d, c);
                 }
             }
         }
@@ -290,7 +329,7 @@ impl Acc {
                     let mut x = from as usize;
                     while x < to as usize {
                         let y = (self.run_end[x] as usize).min(to as usize);
-                        self.stats[k * self.ndays + usize::from(self.day_of[x])][3] += (y - x) as i64;
+                        self.assist(k, usize::from(self.day_of[x]), (y - x) as u32);
                         x = y;
                     }
                 }
@@ -679,6 +718,7 @@ mod tests {
             ev(after_midnight, 1, 40),
         ];
         acc.person(41, &mut events, &mut [], &cats, &slow, -2);
+        acc.flush();
         assert_eq!(
             acc.rows.iter().map(row).collect::<Vec<_>>(),
             [
@@ -721,6 +761,7 @@ mod tests {
         let cats = vec![b"book".to_vec()];
         let mut acc = Acc::new(6, 8, cats.len());
         acc.person(1, &mut events, &mut clicks, &cats, &slow, 0);
+        acc.flush();
 
         let mut expected = vec![[0; 4]; 6 * 8];
         expected[8] = [0, 0, 0, 1]; // Exactly seven days before A, too old for B.
@@ -752,6 +793,7 @@ mod tests {
         acc.person(2, &mut [ev(WEEK, 0, 2)], &mut [first], &cats, &slow, 7);
         acc.person(3, &mut [ev(WEEK, 0, 0)], &mut [], &cats, &slow, 7);
         acc.person(4, &mut [], &mut [later], &cats, &slow, 7);
+        acc.flush();
         assert_eq!(acc.rows.len(), 3);
         assert_eq!(row(&acc.rows[1]), (2, 7, 1, 1, 2, 0));
         assert_eq!(row(&acc.rows[2]), (3, 7, 1, 1, 0, u16::MAX));
@@ -818,6 +860,8 @@ mod tests {
                 events.push(ev(WEEK + span + i * (GAP + 1) * 2, 0, 0));
             }
             acc_b.person(1, &mut events, &mut clicks, &cats, &slow, 0);
+            acc_a.flush();
+            acc_b.flush();
             let strip = |acc: &Acc| -> Vec<[i64; 4]> {
                 acc.stats.chunks(18).flat_map(|c| c[..14].iter().copied()).collect()
             };
