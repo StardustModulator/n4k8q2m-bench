@@ -168,31 +168,28 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
     let slots = &mut slots[..];
     let shift = 64 - bits;
     let mut room = mask / 4 * 3;
-    let mut n = 0;
-    for p in parts {
-        for e in &p.ev {
-            let key = e.key;
-            let s = (key.wrapping_mul(MUL) >> shift) as usize;
-            // A key sits in its home slot or the next one unless its run is
-            // long; only those and new keys take the probing path.
-            // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
-            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-            // SAFETY: as above; probe returns a slot <= mask.
-            if unsafe { slots.get_unchecked(id) }.key != key {
-                id = probe(slots, key, s, mask);
-                if slots[id].key == 0 {
-                    if room == 0 { return false; }
-                    room -= 1;
-                    slots[id].key = key;
-                }
+    let mut out = ids.iter_mut();
+    for e in parts.iter().flat_map(|p| &p.ev) {
+        let key = e.key;
+        let s = (key.wrapping_mul(MUL) >> shift) as usize;
+        // A key sits in its home slot or the next one unless its run is
+        // long; only those and new keys take the probing path.
+        // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
+        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+        // SAFETY: as above; probe returns a slot <= mask.
+        if unsafe { slots.get_unchecked(id) }.key != key {
+            id = probe(slots, key, s, mask);
+            if slots[id].key == 0 {
+                if room == 0 { return false; }
+                room -= 1;
+                slots[id].key = key;
             }
-            // SAFETY: id <= mask + 1 < slots.len(); ids holds one entry per
-            // record and n counts them.
-            unsafe { slots.get_unchecked_mut(id) }.ev += 1;
-            unsafe { *ids.get_unchecked_mut(n) = id as u32 };
-            n += 1;
         }
+        // SAFETY: id <= mask + 1 < slots.len().
+        unsafe { slots.get_unchecked_mut(id) }.ev += 1;
+        if let Some(o) = out.next() { *o = id as u32; }
     }
+    let mut n = parts.iter().map(|p| p.ev.len()).sum::<usize>();
     for p in parts {
         for c in &p.cl {
             let key = c.key;
