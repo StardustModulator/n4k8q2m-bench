@@ -99,7 +99,9 @@ impl Clock {
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
         let day = &self.days[slot(b)];
-        if (day.lo, day.hi) != tag(b) {
+        let (lo, hi) = tag(b);
+        // One branch for both words: a miss is rare and goes the slow way.
+        if (day.lo ^ lo) | u64::from(day.hi ^ hi) != 0 {
             return uncached_iso(b);
         }
         let local = day.midnight + hms_s(word(&b[11..19]))?;

@@ -58,7 +58,7 @@ impl<'b, const N: usize> Cell<'b, N> {
         // a quote) when the field is empty. A field ending in a quote is
         // wrapped, so it has two or more bytes.
         unsafe {
-            let w = usize::from(*self.base.add(e).sub(1) == b'"');
+            let w = usize::from(*self.base.add(e - 1) == b'"');
             std::slice::from_raw_parts(self.base.add(s + w), e - s - 2 * w)
         }
     }

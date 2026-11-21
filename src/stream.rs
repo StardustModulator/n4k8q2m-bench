@@ -112,13 +112,13 @@ const ZEROS: u64 = 0x3030_3030_3030_3030;
 #[inline(always)]
 fn event_key(s: &Shared, b: &[u8]) -> Option<u64> {
     let n = b.len();
-    if let [b'e', .., _] = b {
-        if let Some(tail) = b.last_chunk::<8>().filter(|_| n == 8 || n == 9) {
-            let w = u64::from_le_bytes(*tail) >> (8 * (9 - n));
-            let pad = u64::from(n == 8) << 56;
-            if ((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0 {
-                return Some(w | 1 << 63);
-            }
+    if n | 1 == 9 && b[0] == b'e' {
+        // SAFETY: n is 8 or 9, so the last eight bytes start at n - 8 >= 0.
+        let tail = u64::from_le_bytes(unsafe { *b.as_ptr().add(n - 8).cast::<[u8; 8]>() });
+        let w = tail >> (8 * (9 - n));
+        let x = w | u64::from(n == 8) << 56;
+        if (x | x.wrapping_sub(ONES)) & HIGH == 0 {
+            return Some(w | 1 << 63);
         }
     }
     id_key(s, b)
@@ -193,17 +193,14 @@ impl Decoder<'_, '_> {
     /// shuffled input a per-row F1/F2/F3 branch mispredicts about every
     /// other row, while three loops over the lists never branch on form.
     #[inline(always)]
-    fn stamps<const N: usize>(&self, rows: &[Cell<'_, N>], col: usize) -> [i64; BATCH] {
+    fn stamps<const N: usize>(&self, rows: &[[&[u8]; N]], col: usize) -> [i64; BATCH] {
         debug_assert!(rows.len() <= BATCH);
         // Every slot read later is written below: each row joins one form.
         let mut ts = [0i64; BATCH];
-        let mut field = [&[][..]; BATCH];
         let mut form = [[0u8; BATCH]; 3];
         let (mut a, mut b, mut c) = (0, 0, 0);
-        for (i, r) in rows.iter().enumerate() {
-            let f = r.field(col);
-            field[i] = f;
-            let n = f.len();
+        for (i, f) in rows.iter().enumerate() {
+            let n = f[col].len();
             let (f1, f2) = (n == 20, n == 25);
             // SAFETY: each cursor counts earlier rows, so it is < i + 1 <= BATCH.
             unsafe {
@@ -217,7 +214,7 @@ impl Decoder<'_, '_> {
         }
         // SAFETY (all three loops): listed indexes are rows of this batch, and
         // a row is listed under F1 or F2 only when its field has that length.
-        let at = |i: u8| unsafe { *field.get_unchecked(usize::from(i)) };
+        let at = |i: u8| unsafe { *rows.get_unchecked(usize::from(i)).get_unchecked(col) };
         for &i in &form[0][..a] {
             let t = self.clock.parse20(unsafe { &*at(i).as_ptr().cast() });
             unsafe { *ts.get_unchecked_mut(usize::from(i)) = t.unwrap_or(i64::MIN) };
@@ -233,36 +230,54 @@ impl Decoder<'_, '_> {
         ts
     }
 
+    /// Decode a batch one column at a time. Rows are independent, so each
+    /// pass is a loop of short dependency chains the core overlaps freely;
+    /// decoding a row end to end is one long chain per row instead.
     #[inline(never)]
     fn events(&self, rows: &[Cell<'_, 7>], out: &mut Scan) {
-        assert!(out.ev.len() == 1 << self.b.user && out.cand.len() == 1 << self.b.id);
-        let ts = self.stamps(rows, 2);
-        for (c, &ts) in rows.iter().zip(&ts) {
-            self.event(c, ts, out);
+        assert!(out.ev.len() == 1 << self.b.user && out.cand.len() == 1 << self.b.id && rows.len() <= BATCH);
+        let n = rows.len();
+        let mut f = [[&[][..]; 7]; BATCH];
+        for (i, c) in rows.iter().enumerate() {
+            f[i] = c.fields();
+        }
+        let f = &f[..n];
+        let ts = self.stamps(f, 2);
+        // Ingest seconds, i64::MIN when invalid; event keys, 0 when empty
+        // (no key is 0: packed keys carry rank bits or bit 63, interned keys bit 63).
+        let (mut sec, mut id) = ([i64::MIN; BATCH], [0u64; BATCH]);
+        for (i, f) in f.iter().enumerate() {
+            sec[i] = self.clock.ingest_s(f[3]).unwrap_or(i64::MIN);
+        }
+        for (i, f) in f.iter().enumerate() {
+            id[i] = event_key(self.s, f[0]).unwrap_or(0);
+        }
+        // Payloads of rows passing validation; an invalid ingest fails the
+        // late check, since no instant is within a day of i64::MIN * 1000.
+        let mut val = [None; BATCH];
+        for (i, f) in f.iter().enumerate() {
+            val[i] = self.payload(f, ts[i], sec[i].wrapping_mul(1000));
+        }
+        for i in 0..n {
+            if id[i] == 0 || sec[i] == i64::MIN { continue; }
+            let mut at_row = None;
+            if let Some(val) = val[i] {
+                // Mixed until renaming.
+                let key = hash(user_key(self.s, f[i][1]));
+                let bin = (key >> (64 - self.b.user)) as usize;
+                // SAFETY: bin < 1 << user == ev.len(), asserted above.
+                let v = unsafe { out.ev.get_unchecked_mut(bin) };
+                at_row = Some((bin, v.len()));
+                v.push(Event { key, val });
+            }
+            out.candidate(id[i], sec[i], at_row, self.b);
         }
     }
 
     #[inline(always)]
-    fn event(&self, c: &Cell<'_, 7>, ts: i64, out: &mut Scan) {
-        let Some(id) = event_key(self.s, c.field(0)) else { return };
-        let Some(sec) = self.clock.ingest_s(c.field(3)) else { return };
-        let mut at_row = None;
-        if let Some(val) = self.payload(c, ts, sec * 1000) {
-            // Mixed until renaming.
-            let key = hash(user_key(self.s, c.field(1)));
-            let bin = (key >> (64 - self.b.user)) as usize;
-            // SAFETY: bin < 1 << user == ev.len(), asserted once per batch.
-            let v = unsafe { out.ev.get_unchecked_mut(bin) };
-            at_row = Some((bin, v.len()));
-            v.push(Event { key, val });
-        }
-        out.candidate(id, sec, at_row, self.b);
-    }
-
-    #[inline(always)]
-    fn payload(&self, c: &Cell<'_, 7>, ts: i64, at: i64) -> Option<u64> {
+    fn payload(&self, f: &[&[u8]; 7], ts: i64, at: i64) -> Option<u64> {
         // Whole-word compares: a view/cart split costs no branch.
-        let purchase = match *c.field(4) {
+        let purchase = match *f[4] {
             [a, b, c, d] => {
                 let w = u32::from_le_bytes([a, b, c, d]);
                 if w != VIEW && w != CART { return None; }
@@ -271,21 +286,27 @@ impl Decoder<'_, '_> {
             [a, b, c, d, e, g, h, i] if u64::from_le_bytes([a, b, c, d, e, g, h, i]) == PURCHASE => true,
             _ => return None,
         };
-        if c.field(1).is_empty() || c.field(5).is_empty() { return None; }
+        if f[1].is_empty() || f[5].is_empty() { return None; }
         // One unsigned compare per bound pair; it rejects the invalid sentinel.
         if ts.wrapping_sub(self.start) as u64 >= self.span || at.wrapping_sub(ts) > DAY_MS {
             return None;
         }
-        let pay = if purchase { parse_price(c.field(6))? | u32::from(product_cat(self.cx, c.field(5))) << 24 } else { 0 };
+        let pay = if purchase { parse_price(f[6])? | u32::from(product_cat(self.cx, f[5])) << 24 } else { 0 };
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
     #[inline(never)]
     fn clicks(&self, buf: &[u8], rows: &[Cell<'_, 4>], out: &mut Scan) {
-        assert!(out.cl.len() == 1 << self.b.user);
-        let ts = self.stamps(rows, 3);
-        for (c, &ts) in rows.iter().zip(&ts) {
-            self.click(buf, c, ts, out);
+        assert!(out.cl.len() == 1 << self.b.user && rows.len() <= BATCH);
+        let n = rows.len();
+        let mut f = [[&[][..]; 4]; BATCH];
+        for (i, c) in rows.iter().enumerate() {
+            f[i] = c.fields();
+        }
+        let f = &f[..n];
+        let ts = self.stamps(f, 3);
+        for (f, &ts) in f.iter().zip(&ts) {
+            self.click(buf, f, ts, out);
         }
     }
 
@@ -293,13 +314,12 @@ impl Decoder<'_, '_> {
     // per campaign and credit is a min/max over keys. Both are idempotent:
     // duplicating an identical tuple cannot change either, so clicks skip dedup.
     #[inline(always)]
-    fn click(&self, buf: &[u8], c: &Cell<'_, 4>, ts: i64, out: &mut Scan) {
-        let (id, user) = (c.field(0), c.field(1));
-        if id.is_empty() || user.is_empty() { return; }
+    fn click(&self, buf: &[u8], f: &[&[u8]; 4], ts: i64, out: &mut Scan) {
+        if f[0].is_empty() || f[1].is_empty() { return; }
         if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { return; }
-        let Some(camp) = self.campaign(buf, c.field(2)) else { return };
-        let key = hash(user_key(self.s, user));
-        let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, id), camp };
+        let Some(camp) = self.campaign(buf, f[2]) else { return };
+        let key = hash(user_key(self.s, f[1]));
+        let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
         // SAFETY: the bin is < 1 << user == cl.len(), asserted once per batch.
         unsafe { out.cl.get_unchecked_mut((key >> (64 - self.b.user)) as usize) }.push(Click { key, hit });
     }
@@ -859,7 +879,8 @@ mod bench {
             wire::cells::<7>(&buf, first, buf.len(), |c| {
                 let Some(id) = id_key(&shared, c.field(0)) else { return };
                 let Some(at) = clock.ingest(c.field(3)) else { return };
-                let v = dec.payload(&c, clock.parse(c.field(2)).unwrap_or(i64::MIN), at).unwrap_or(0);
+                let f = c.fields();
+                let v = dec.payload(&f, clock.parse(f[2]).unwrap_or(i64::MIN), at).unwrap_or(0);
                 acc ^= id ^ at as u64 ^ v;
             });
             std::hint::black_box(acc);
@@ -869,7 +890,8 @@ mod bench {
             wire::cells::<7>(&buf, first, buf.len(), |c| {
                 let Some(id) = id_key(&shared, c.field(0)) else { return };
                 let Some(at) = clock.ingest(c.field(3)) else { return };
-                let v = dec.payload(&c, clock.parse(c.field(2)).unwrap_or(i64::MIN), at).unwrap_or(0);
+                let f = c.fields();
+                let v = dec.payload(&f, clock.parse(f[2]).unwrap_or(i64::MIN), at).unwrap_or(0);
                 let u = c.field(1);
                 let u = if u.is_empty() { 0 } else { user_key(&shared, u) };
                 acc ^= id ^ at as u64 ^ v ^ u;
