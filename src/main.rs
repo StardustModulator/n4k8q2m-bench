@@ -79,16 +79,21 @@ fn cmp_interned(a:u64,b:u64,slow:&SlowIntern)->Ordering{
     res
 }
 
-struct ChunkLite {file:usize,kind:u8,start:usize,end:usize}
-fn split_chunks(file:usize,kind:u8,b:&[u8])->Vec<ChunkLite>{
-    let Some(header)=memchr::memchr(b'\n',b) else{return Vec::new()};
-    let mut ret=Vec::new(); let mut start=header+1;
-    while start<b.len(){
-        let split=(start+1024*1024).min(b.len());
-        let end=memchr::memchr(b'\n', &b[split..]).map_or(b.len(),|i|split+i+1);
-        ret.push(ChunkLite{file,kind,start,end});start=end;
-    }
-    ret
+/// Chunk k of a file, cut at line boundaries by the worker that takes it so
+/// planning never touches file pages. It runs from just past the first LF at
+/// or after byte k*CHUNK-1 (past the header for k = 0) to the same point for
+/// k+1, so consecutive chunks tile the file exactly; a line longer than a
+/// chunk leaves later chunks empty.
+struct ChunkLite {file:usize,kind:u8,k:usize}
+const CHUNK:usize=1<<20;
+#[inline]
+fn chunk_bounds(b:&[u8],k:usize)->(usize,usize){
+    let cut=|k:usize|{
+        let p=(k*CHUNK).saturating_sub(1).min(b.len());
+        memchr::memchr(b'\n',&b[p..]).map_or(b.len(),|i|p+i+1)
+    };
+    let start=cut(k);
+    (start,cut(k+1).max(start))
 }
 fn list_csv(dir:&Path)->io::Result<Vec<PathBuf>>{
     let mut v=Vec::new();
