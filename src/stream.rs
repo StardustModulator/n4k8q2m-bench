@@ -540,6 +540,9 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     let organic=u16::try_from(camps.len())?;
     camps.push(Camp{name:b"organic".to_vec(),channel:b"organic".to_vec()});
     let cx=Ctx{prod_cat:&prod_cat,unknown,prod_other:&prod_other,camp_by_num:&camp_by_num,camp_other:&camp_other,window:&w};
+    let io_populate=std::env::var_os("POPULATE").is_some();
+    let io_pread=std::env::var_os("PREAD").is_some();
+    let mut files=Vec::<File>::new();
     let mut maps=Vec::<Mmap>::new();
     let mut chunks=Vec::new();
     let mut bytes=[0usize;3];
@@ -547,11 +550,14 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         for p in list_csv(&data.join(dir))? {
             let f=File::open(p)?;
             if f.metadata()?.len()==0 {continue;}
-            let m=unsafe{Mmap::map(&f)?};
+            // I/O experiment: POPULATE pre-faults the mapping; PREAD copies
+            // chunks into a per-thread buffer instead of mapping at all.
+            let m=unsafe{ if io_populate { memmap2::MmapOptions::new().populate().map(&f)? } else { Mmap::map(&f)? } };
             let _=m.advise(Advice::Sequential);
             bytes[kind as usize]+=m.len();
             chunks.extend(split_chunks(maps.len(),kind,&m));
             maps.push(m);
+            files.push(f);
         }
     }
     let event_bytes=bytes[0];
@@ -570,10 +576,16 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
                 cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
+            let mut rb:Vec<u8>=Vec::new();
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
-                let buf=&maps[c.file as usize][c.start..c.end];
+                let buf:&[u8]=if io_pread {
+                    use std::os::unix::fs::FileExt;
+                    rb.resize(c.end-c.start,0);
+                    files[c.file as usize].read_exact_at(&mut rb,c.start as u64).expect("pread");
+                    &rb
+                } else {&maps[c.file as usize][c.start..c.end]};
                 match c.kind {
                     0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
