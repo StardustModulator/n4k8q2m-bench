@@ -62,7 +62,7 @@ pub(super) struct Fields<'b, const N: usize> {
 
 impl<'b, const N: usize> Fields<'b, N> {
     /// The record's first byte. Every byte up to and including its last
-    /// separator (`ends()[N - 1]`) is readable; the byte before it is too.
+    /// separator (`end(N - 1)`) is readable; the byte before it is too.
     #[inline(always)]
     pub(super) fn first(&self) -> *const u8 {
         self.first

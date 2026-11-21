@@ -18,7 +18,7 @@ unsafe fn slice<'b>(p: *const u8, at: u32, n: u32) -> &'b [u8] {
     unsafe { std::slice::from_raw_parts(p.add(at as usize), n as usize) }
 }
 
-/// The event-row sink: fixed-sequence decode, exact decode for the rest.
+/// The event-row sink: the fast decode, the exact decode for the rest.
 struct Events<'a, 'c, 'o> {
     dec: &'a Decoder<'a, 'c>,
     out: &'o mut Scan,
@@ -98,10 +98,11 @@ fn sized<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
 #[inline(always)]
 fn push_far<T>(v: &mut Vec<T>, x: T) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch never faults, whatever the address.
+    // SAFETY: a prefetch never faults, whatever the address; the wrapping
+    // offset may point past the allocation.
     unsafe {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        _mm_prefetch(v.as_ptr().add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T0);
+        _mm_prefetch(v.as_ptr().wrapping_add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T0);
     }
     v.push(x);
 }
