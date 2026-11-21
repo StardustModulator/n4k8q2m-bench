@@ -38,6 +38,8 @@ pub(super) trait Sink<'b, const N: usize> {
     fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; N]);
     /// Any other well-formed record, with syntactic quotes removed.
     fn slow(&mut self, fields: [&'b [u8]; N]);
+    /// No more records will come.
+    fn finish(&mut self) {}
 }
 
 /// A sink that turns every record into field slices.
@@ -84,6 +86,7 @@ pub(super) unsafe fn unquoted<'b, const N: usize>(base: *const u8, row: usize, e
 #[inline]
 pub(super) fn records<'b, const N: usize>(buf: &'b [u8], window: usize, mut sink: impl Sink<'b, N>) {
     rows_window::<N>(buf, window, &mut sink);
+    sink.finish();
 }
 
 /// Bytes per two-stage window. A multiple of 64 so only the input's final

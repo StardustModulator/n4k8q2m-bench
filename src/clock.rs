@@ -15,6 +15,8 @@ struct Day {
 #[repr(align(16))]
 pub(super) struct Clock {
     days: [Day; 64],
+    #[cfg(test)]
+    origin: i64, // first day of the window
 }
 
 /// The cache slot of a date whose "YYYY-MM-" word is `lo` and whose
@@ -53,6 +55,9 @@ impl Clock {
             let e = entry(&text, day);
             days[slot(e.lo, e.hd as u32)] = e;
         }
+        #[cfg(test)]
+        return Self { days, origin: start.div_euclid(DAY_MS) };
+        #[cfg(not(test))]
         Self { days }
     }
 
@@ -68,6 +73,58 @@ impl Clock {
                 _ => epoch_ms(b),
             }
         }
+    }
+
+    /// `parse` for a `ts` field whose record extends at least 32 bytes past
+    /// the field's start, without a data-dependent branch: the F1/F2 and F3
+    /// readings are both computed from one set of loads and the length picks
+    /// one. Lengths with no fast reading (0..=8, 17..=19, 21..=24, 26..) take
+    /// the exact path. A cached date is the only way to a valid ISO reading
+    /// here: the cache covers every day that can reach the window even
+    /// through a zone offset, so an uncached date is out of the window and
+    /// its exact instant could not be used anyway.
+    ///
+    /// # Safety
+    /// 32 bytes must be readable at `p`.
+    #[inline(always)]
+    pub(super) unsafe fn parse_fast(&self, p: *const u8, n: usize) -> Option<i64> {
+        let digits = n.wrapping_sub(9) <= 7;
+        if !(digits || n == 20 || n == 25) {
+            // SAFETY: n bytes are readable: n <= 32 here or the field lies in
+            // the record, which the caller measured.
+            return parse_cold(self, unsafe { std::slice::from_raw_parts(p, n) });
+        }
+        // SAFETY: every offset is below 32 (max(n, 8) - 8 <= 24).
+        let (w0, w1, hms, tail, z) = unsafe {
+            (load::<u64>(p), load::<u32>(p.add(8)), load::<u64>(p.add(11)), load::<u64>(p.add(17)), load::<u64>(p.add(n.max(8) - 8)))
+        };
+        // ISO: cached date, HH:MM:SS, then 'Z' or a checked "HH:MM" offset.
+        let day = self.days[slot(w0, w1)];
+        let day_ok = day.lo == w0 && day.hd as u32 & 0xff_ffff == w1 & 0xff_ffff;
+        let (t, t_ok) = hms_pair(hms);
+        let local = ((day.hd >> 24) as u32 as i32 as i64) * (DAY_MS / 1000) + t;
+        let b19 = (tail >> 16) as u8;
+        let (off, off_ok) = hms_pair((tail >> 24) | (HMS_MIN & (u64::MAX << 40)));
+        let zone_ok = if n == 25 { (b19 == b'+' || b19 == b'-') && off_ok } else { b19 == b'Z' };
+        let signed = if b19 == b'+' { -off } else { off };
+        let iso = (local + if n == 25 { signed } else { 0 }) * 1000;
+        let iso_ok = day_ok && t_ok && zone_ok;
+        // F3: the first n - 8 digits left-padded to eight lanes, then the
+        // last eight, with every lane checked for '0'..='9'.
+        const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
+        let hi = w0.wrapping_sub(ZEROS);
+        let lo = z.wrapping_sub(ZEROS);
+        let f3_ok = digits && (hi | lo | w0.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
+        let prefix = hi << ((16 - n.clamp(9, 16)) * 8);
+        let f3 = (decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64;
+        let (v, ok) = if digits { (f3, f3_ok) } else { (iso, iso_ok) };
+        ok.then_some(v)
+    }
+
+    /// The window start the cache was built for, as a day boundary (tests).
+    #[cfg(test)]
+    pub(super) fn days_origin(&self) -> i64 {
+        self.origin * DAY_MS
     }
 
     /// The ingest column has its own F1-only entry point. In particular an
@@ -143,9 +200,17 @@ const HIGH: u64 = 0x8080_8080_8080_8080;
 const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const HMS_MIN: u64 = u64::from_le_bytes(*b"00:00:00");
 const HMS_BIAS: u64 = LOW7 - u64::from_le_bytes(*b"29:59:59");
+const ZEROS: u64 = u64::from_le_bytes(*b"00000000");
 
 #[inline(always)]
 fn hms_s(raw: u64) -> Option<i64> {
+    let (v, ok) = hms_pair(raw);
+    ok.then_some(v)
+}
+
+/// Seconds of "HH:MM:SS" and whether it was one, without a branch.
+#[inline(always)]
+fn hms_pair(raw: u64) -> (i64, bool) {
     // In each lane require MIN <= byte <= MAX (the two colons have min=max).
     // Valid lanes cannot carry/borrow into a neighbor, so the *first* invalid
     // lane necessarily contributes a high bit to one of these two words.
@@ -154,12 +219,16 @@ fn hms_s(raw: u64) -> Option<i64> {
     // 2561 = 10*256+1: each ones byte receives ten times its tens byte.
     let pairs = digits.wrapping_mul(2561) >> 8;
     let h = i64::from(pairs as u8);
-    if bad != 0 || h > 23 {
-        return None;
-    }
     let m = i64::from((pairs >> 24) as u8);
     let s = i64::from((pairs >> 48) as u8);
-    Some((h * 60 + m) * 60 + s)
+    ((h * 60 + m) * 60 + s, bad == 0 && h <= 23)
+}
+
+/// Any form, any length, off the hot path.
+#[cold]
+#[inline(never)]
+fn parse_cold(c: &Clock, b: &[u8]) -> Option<i64> {
+    c.parse(b)
 }
 
 #[inline(always)]
@@ -170,12 +239,11 @@ fn epoch_ms(b: &[u8]) -> Option<i64> {
     }
     // Two in-bounds loads cover all bytes, even when they overlap. Left-pad
     // the first n-8 digits to eight lanes; the last eight need no adjustment.
-    const ZERO: u64 = u64::from_le_bytes(*b"00000000");
     const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
     let a = word(&b[..8]);
     let z = word(&b[n - 8..]);
-    let hi = a.wrapping_sub(ZERO);
-    let lo = z.wrapping_sub(ZERO);
+    let hi = a.wrapping_sub(ZEROS);
+    let lo = z.wrapping_sub(ZEROS);
     if (hi | lo | a.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH != 0 {
         return None;
     }
@@ -295,6 +363,43 @@ mod tests {
             "2000-02-29T12:34:56+0100",
         ] {
             assert_eq!(c.parse(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    /// `parse_fast` on a field inside a longer record agrees with `parse`.
+    fn fast(c: &Clock, b: &[u8]) -> Option<i64> {
+        let mut rec = b.to_vec();
+        rec.extend_from_slice(b",2026-01-01T00:00:00Z,view,p1,100\n");
+        unsafe { c.parse_fast(rec.as_ptr(), b.len()) }
+    }
+
+    #[test]
+    fn fast_path_matches_parse() {
+        let c = window("2000-02-25T00:00:00Z");
+        for original in [
+            &b"2000-02-29T23:59:59Z"[..], b"2000-02-29T23:59:59-23:59", b"2000-02-29T23:59:59+00:00",
+            b"951868799000", b"0951868799000", b"000000951868799000", b"95186879", b"00000000000000000000951868799000",
+        ] {
+            let mut s = original.to_vec();
+            for i in 0..s.len() {
+                for byte in 0..=u8::MAX {
+                    s[i] = byte;
+                    let want = c.parse(&s);
+                    let got = fast(&c, &s);
+                    // Outside the cached dates the fast path reports a miss;
+                    // such an instant is out of every window the cache serves.
+                    let cached = want.is_some_and(|ms| (-9 * DAY_MS..=23 * DAY_MS).contains(&(ms - c.days_origin())));
+                    if cached || want.is_none() || s.len() != original.len() || !(s.len() == 20 || s.len() == 25) {
+                        assert_eq!(got, want, "byte {byte} at {i} in {original:?}");
+                    }
+                }
+                s[i] = original[i];
+            }
+            for n in 0..original.len() {
+                let t = &original[..n];
+                let want = c.parse(t);
+                if !(n == 20 || n == 25) { assert_eq!(fast(&c, t), want, "{t:?}"); }
+            }
         }
     }
 
