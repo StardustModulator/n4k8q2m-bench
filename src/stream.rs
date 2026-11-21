@@ -184,19 +184,10 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
-    /// Decode a batch of records of `buf`. A record with `wire::PAD` bytes of
-    /// `buf` after its last field takes the padded path (whole-word loads,
-    /// the timestamp form selected rather than branched on); the few at a
-    /// chunk's end take the exact one.
     #[inline(never)]
-    fn events(&self, buf: &[u8], rows: &[[&[u8]; 7]], out: &mut Scan) {
-        let end = buf.as_ptr() as usize + buf.len();
+    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
         for f in rows {
-            if f[6].as_ptr() as usize + f[6].len() + wire::PAD <= end {
-                self.event_fast(f, out);
-            } else {
-                self.event(f, out);
-            }
+            self.event(f, out);
         }
     }
 
@@ -214,48 +205,6 @@ impl Decoder<'_, '_> {
             v.push(Event { key, val });
         }
         out.candidate(id, sec, at_row, self.b);
-    }
-
-    /// `event` for a record with `wire::PAD` readable bytes past every field
-    /// start (see `events`): the type is checked as a whole word and the
-    /// timestamp form is selected, not branched on.
-    #[inline(always)]
-    fn event_fast(&self, f: &[&[u8]; 7], out: &mut Scan) {
-        let Some(id) = event_key(self.s, f[0]) else { return };
-        let Some(sec) = self.clock.ingest_s(f[3]) else { return };
-        let mut at_row = None;
-        if let Some(val) = self.payload_padded(f, sec * 1000) {
-            let key = hash(user_key(self.s, f[1]));
-            let bin = (key >> (64 - self.b.user)) as usize;
-            let v = &mut out.ev[bin];
-            at_row = Some((bin, v.len()));
-            v.push(Event { key, val });
-        }
-        out.candidate(id, sec, at_row, self.b);
-    }
-
-    /// `payload` with the fixed-sequence checks `event_fast` describes.
-    #[inline(always)]
-    fn payload_padded(&self, f: &[&[u8]; 7], at: i64) -> Option<u64> {
-        const { assert!(wire::PAD >= 25) };
-        let t = f[4];
-        // SAFETY: PAD >= 8 bytes are readable from the field's start.
-        let w = unsafe { u64::from_le_bytes(t.as_ptr().cast::<[u8; 8]>().read_unaligned()) };
-        let n = t.len();
-        let plain = (n == 4) & ((w as u32 == VIEW) | (w as u32 == CART));
-        let purchase = (n == 8) & (w == PURCHASE);
-        // SAFETY: PAD >= 25 bytes are readable from the field's start.
-        let (ts, sure) = unsafe { self.clock.select(f[2]) };
-        let ts = if sure { ts } else { self.clock.parse(f[2])? };
-        // In-window instants never overflow the lateness difference; outside
-        // the window the flag is already false.
-        let ok = (plain | purchase) & !f[1].is_empty() & !f[5].is_empty()
-            & ((ts.wrapping_sub(self.start) as u64) < self.span) & (at.wrapping_sub(ts) <= DAY_MS);
-        if !ok {
-            return None;
-        }
-        let pay = if purchase { parse_price(f[6])? | u32::from(product_cat(self.cx, f[5])) << 24 } else { 0 };
-        Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
     #[inline(always)]
@@ -282,24 +231,9 @@ impl Decoder<'_, '_> {
 
     #[inline(never)]
     fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
-        let end = buf.as_ptr() as usize + buf.len();
         for f in rows {
-            if f[3].as_ptr() as usize + f[3].len() + wire::PAD <= end {
-                self.click_fast(buf, f, out);
-            } else {
-                self.click(buf, f, out);
-            }
+            self.click(buf, f, out);
         }
-    }
-
-    /// `click` for a record with `wire::PAD` readable bytes past every field start.
-    #[inline(always)]
-    fn click_fast(&self, buf: &[u8], f: &[&[u8]; 4], out: &mut Scan) {
-        if f[0].is_empty() || f[1].is_empty() { return; }
-        // SAFETY: PAD >= 25 bytes are readable from the field's start.
-        let (ts, sure) = unsafe { self.clock.select(f[3]) };
-        let Some(ts) = (if sure { Some(ts) } else { self.clock.parse(f[3]) }) else { return };
-        self.click_at(buf, f, ts, out);
     }
 
     // All copies of a click are identical. Window membership is existential
@@ -309,11 +243,6 @@ impl Decoder<'_, '_> {
     fn click(&self, buf: &[u8], f: &[&[u8]; 4], out: &mut Scan) {
         if f[0].is_empty() || f[1].is_empty() { return; }
         let Some(ts) = self.clock.parse(f[3]) else { return };
-        self.click_at(buf, f, ts, out);
-    }
-
-    #[inline(always)]
-    fn click_at(&self, buf: &[u8], f: &[&[u8]; 4], ts: i64, out: &mut Scan) {
         if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { return; }
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
@@ -646,7 +575,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(buf,rows,&mut out)),
+                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -902,7 +831,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(body, rows, &mut out));
+            batched::<7>(body, |rows| dec.events(rows, &mut out));
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());

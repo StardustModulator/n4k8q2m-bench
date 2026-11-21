@@ -51,9 +51,12 @@ pub(super) fn try_pack(s: &[u8]) -> Option<u64> {
     let word = if let Some(tail) = s.last_chunk::<8>() {
         // One in-bounds word load for both common sizes. For n=8, shift out
         // the prefix; for n=9, the word already contains exactly the suffix.
-        // Ids of both widths are common, so the width is a shift count, not
-        // a branch.
-        u64::from_be_bytes(*tail) << (8 * (9 - n))
+        let word = u64::from_be_bytes(*tail);
+        if n == 8 {
+            word << 8
+        } else {
+            word
+        }
     } else {
         // Fixed-size loads keep even the short case free of a memcpy call.
         match s[1..] {

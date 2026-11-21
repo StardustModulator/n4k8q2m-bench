@@ -205,8 +205,7 @@ unsafe fn flatten_rev(dst: *mut u32, rel: u32, m: u64, k: usize) {
 
 /// Stage 1 state carried from block to block.
 struct Scan {
-    sp: *mut u32, // next separator slot (listing mode)
-    cp: *mut u64, // next comma-mask slot (mask mode)
+    sp: *mut u32, // next separator slot
     lp: *mut u32, // next LF slot
     prev_s: u64,  // bit 0: the byte before this block is a separator
     open: u64,    // 1 inside an open quote: the borrow out of the last block
@@ -214,17 +213,15 @@ struct Scan {
 }
 
 impl Scan {
-    /// List the LFs of the block at window offset `rel` and check its quotes.
-    /// With `MASKS` the block's comma mask is stored whole for the fused row
-    /// walk; otherwise every separator's offset is listed. `next_s` says
-    /// whether the byte after the block is a separator; `tail` marks EOF
-    /// inside a partial block.
+    /// List the separators and LFs of the block at window offset `rel` and
+    /// check its quotes. `next_s` says whether the byte after it is a
+    /// separator; `tail` marks EOF inside a partial block.
     ///
     /// # Safety
     /// The slots need room for this block's entries plus the slack of the
     /// unconditional writes.
     #[inline(always)]
-    unsafe fn block<const N: usize, const MASKS: bool>(&mut self, rel: u32, (c, n, q): (u64, u64, u64), next_s: u64, tail: u64) {
+    unsafe fn block<const N: usize>(&mut self, rel: u32, (c, n, q): (u64, u64, u64), next_s: u64, tail: u64) {
         let s = c | n;
         let o = q & ((s << 1) | self.prev_s);
         let z = q & (((s | tail) >> 1) | (next_s << 63));
@@ -236,13 +233,7 @@ impl Scan {
         let lfs = n.count_ones() as usize;
         // SAFETY: forwarded from the caller.
         unsafe {
-            if MASKS {
-                *self.cp = c;
-                self.cp = self.cp.add(1);
-            } else {
-                flatten(self.sp, rel, s, 7);
-                self.sp = self.sp.add(s.count_ones() as usize);
-            }
+            flatten(self.sp, rel, s, 7);
             flatten(self.lp, rel, n, lf_slots(N));
             if self.pending != 0 && n != 0 {
                 *self.lp |= POISON;
@@ -251,6 +242,7 @@ impl Scan {
             if bad != 0 {
                 self.pending = poison_block(self.lp, lfs);
             }
+            self.sp = self.sp.add(s.count_ones() as usize);
             self.lp = self.lp.add(lfs);
         }
     }
@@ -274,7 +266,7 @@ fn window_rows<'b, const N: usize>(
 ) -> usize {
     let len = buf.len();
     // A window starts at a record boundary.
-    let mut st = Scan { sp, cp: std::ptr::null_mut(), lp, prev_s: 1, open: 0, pending: 0 };
+    let mut st = Scan { sp, lp, prev_s: 1, open: 0, pending: 0 };
     // Blocks followed by a byte of `buf`. At EOF the final block, full or
     // partial, is left for after the loop.
     let inner = if end < len { end } else { start + (len - start - 1) / 64 * 64 };
@@ -289,7 +281,7 @@ fn window_rows<'b, const N: usize>(
         unsafe {
             let m = masks64(p);
             let next_s = is_sep(*p.add(64));
-            st.block::<N, false>(rel, m, next_s, 0);
+            st.block::<N>(rel, m, next_s, 0);
             p = p.add(64);
         }
         rel += 64;
@@ -302,7 +294,7 @@ fn window_rows<'b, const N: usize>(
         tmp[..rem].copy_from_slice(&buf[off..]);
         let (next_s, tail) = if rem == 64 { (1, 0) } else { (0, 1u64 << rem) };
         // SAFETY: `tmp` holds 64 bytes, zero padded: no structural byte.
-        unsafe { st.block::<N, false>(rel, masks64(tmp.as_ptr()), next_s, tail) };
+        unsafe { st.block::<N>(rel, masks64(tmp.as_ptr()), next_s, tail) };
         if buf[len - 1] != b'\n' {
             // EOF terminates an unterminated final record.
             let eof = (len - start) as u32;
@@ -381,234 +373,6 @@ fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *con
     // SAFETY: start + row <= len.
     let base = unsafe { buf.as_ptr().add(start) };
     f(Fields { base, ends, first: unsafe { base.add(row) }, _buf: std::marker::PhantomData }.all());
-}
-
-/// `rows`, with the row walk fused into the caller. `fast` receives every
-/// record that a fixed instruction sequence certified (see `window_fused`),
-/// `slow` every other well-formed record, through the simple scanner; both
-/// get the slices `rows` would pass, and the caller's state `s`. `fast` has
-/// one call site, so it inlines into the row loop.
-///
-/// A record reaches `fast` only when `PAD` bytes of `buf` follow its LF, so
-/// a decoder may read up to `PAD` bytes past any of its field starts without
-/// leaving `buf`; the bytes past a field are the record's own later bytes or
-/// those after it.
-#[cfg_attr(not(test), allow(dead_code))] // measured slower than `rows` plus batched decoding on x86
-#[inline]
-pub(super) fn rows_fused<'b, const N: usize, S: ?Sized>(
-    buf: &'b [u8],
-    s: &mut S,
-    fast: impl FnMut(&mut S, [&'b [u8]; N]),
-    slow: impl FnMut(&mut S, [&'b [u8]; N]),
-) {
-    const { assert!(2 <= N && N <= 8) };
-    fused_windows::<N, S>(buf, WINDOW, s, fast, slow);
-}
-
-/// `rows_fused` over windows of `window` bytes (a multiple of 64, at most
-/// `WINDOW`).
-#[inline]
-fn fused_windows<'b, const N: usize, S: ?Sized>(
-    buf: &'b [u8],
-    window: usize,
-    s: &mut S,
-    mut fast: impl FnMut(&mut S, [&'b [u8]; N]),
-    mut slow: impl FnMut(&mut S, [&'b [u8]; N]),
-) {
-    debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
-    let len = buf.len();
-    // Slack for the unconditional writes, the EOF entry and the guards.
-    let mut masks: Vec<u64> = Vec::with_capacity(WINDOW / 64 + 8);
-    let mut lines: Vec<u32> = Vec::with_capacity(WINDOW + 80);
-    // The first record goes to the simple scanner, so every window starts
-    // just after an LF (stage 1 assumes a separator before the window).
-    let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
-    rows_simple::<N>(buf, 0, start, &mut |r| slow(s, r));
-    while start < len {
-        let end = (start + window).min(len);
-        let next = window_fused::<N, S>(buf, start, end, masks.as_mut_ptr(), lines.as_mut_ptr(), s, &mut fast, &mut slow);
-        if next > start {
-            start = next;
-        } else {
-            let stop = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i + 1);
-            rows_simple::<N>(buf, start, stop, &mut |r| slow(s, r));
-            start = stop;
-        }
-    }
-}
-
-/// Bytes a fast-path record is guaranteed to have after its LF inside `buf`.
-pub(super) const PAD: usize = 32;
-
-/// `x` with every bit at or above `n` cleared; `n >= 64` keeps `x`.
-#[inline(always)]
-fn bzhi(x: u64, n: u32) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    // SAFETY: BMI2 is a compile-time target feature of this build.
-    unsafe { std::arch::x86_64::_bzhi_u64(x, n) }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-    if n >= 64 { x } else { x & ((1u64 << n) - 1) }
-}
-
-/// The comma masks of the 64 bytes from window offset `origin` and of the 64
-/// bytes before window offset `lf`. `cm[1 + b]` holds block b, `cm[0]` and
-/// the two slots past the last block are zero, so a span reaching before the
-/// window or past its blocks reads zeros there.
-///
-/// # Safety
-/// `origin <= lf`, and `lf` lies inside the window's blocks.
-#[inline(always)]
-unsafe fn commas_at(cm: *const u64, origin: u32, lf: u32) -> (u64, u64) {
-    #[inline(always)]
-    unsafe fn span(cm: *const u64, slot: usize, sh: u32) -> u64 {
-        // SAFETY: forwarded; `(x << 1) << (63 - sh)` is `x << (64 - sh)` and
-        // stays defined at sh == 0.
-        unsafe { (*cm.add(slot) >> sh) | ((*cm.add(slot + 1) << 1) << (63 - sh)) }
-    }
-    // SAFETY: origin's block is at most lf's, which is inside the window;
-    // the tail span starts at lf - 64 >= -64, whose slot is the zero guard.
-    unsafe {
-        let head = span(cm, (origin as usize >> 6) + 1, origin & 63);
-        let t = i64::from(lf) - 64;
-        let tail = span(cm, ((t >> 6) + 1) as usize, (t & 63) as u32);
-        (head, tail)
-    }
-}
-
-/// Stage 1 as in `window_rows`, but the separator list is replaced by one
-/// comma mask per block, and stage 2 walks records with no data-dependent
-/// loop: each record's first `N / 2` commas come from a trailing-zero chain
-/// over the 64 bytes at its start, its last `N - 1 - N / 2` from a
-/// leading-zero chain over the 64 bytes before its LF, and one popcount
-/// compare certifies that the record holds exactly `N - 1` commas, so the two
-/// chains found disjoint sets that together are all of them. Records over
-/// 128 bytes, poisoned ones, those without `PAD` bytes after them and those
-/// failing the count take the simple scanner.
-#[inline(always)]
-fn window_fused<'b, const N: usize, S: ?Sized>(
-    buf: &'b [u8],
-    start: usize,
-    end: usize,
-    cm: *mut u64,
-    lp: *mut u32,
-    s: &mut S,
-    fast: &mut impl FnMut(&mut S, [&'b [u8]; N]),
-    slow: &mut impl FnMut(&mut S, [&'b [u8]; N]),
-) -> usize {
-    let len = buf.len();
-    // SAFETY: capacity covers WINDOW / 64 blocks plus the guards.
-    unsafe { *cm = 0 };
-    let mut st = Scan { sp: std::ptr::null_mut(), cp: unsafe { cm.add(1) }, lp, prev_s: 1, open: 0, pending: 0 };
-    let inner = if end < len { end } else { start + (len - start - 1) / 64 * 64 };
-    // SAFETY: start <= inner <= len.
-    let (base, stop) = unsafe { (buf.as_ptr().add(start), buf.as_ptr().add(inner)) };
-    let mut p = base;
-    let mut rel = 0u32;
-    while p < stop {
-        // SAFETY: as in window_rows.
-        unsafe {
-            let m = masks64(p);
-            let next_s = is_sep(*p.add(64));
-            st.block::<N, true>(rel, m, next_s, 0);
-            p = p.add(64);
-        }
-        rel += 64;
-    }
-    if end == len {
-        let off = start + rel as usize;
-        let rem = len - off;
-        let mut tmp = [0u8; 64];
-        tmp[..rem].copy_from_slice(&buf[off..]);
-        let (next_s, tail) = if rem == 64 { (1, 0) } else { (0, 1u64 << rem) };
-        // SAFETY: `tmp` holds 64 bytes, zero padded: no structural byte.
-        unsafe { st.block::<N, true>(rel, masks64(tmp.as_ptr()), next_s, tail) };
-        if buf[len - 1] != b'\n' {
-            // EOF terminates an unterminated final record; it never takes
-            // the fast path (no PAD after it), so the poison is only kept.
-            let eof = (len - start) as u32;
-            // SAFETY: at most `window` LFs were listed.
-            unsafe {
-                *st.lp = eof | st.pending | if st.open != 0 { POISON } else { 0 };
-                st.lp = st.lp.add(1);
-            }
-        }
-    }
-    // SAFETY: two guard slots follow the last block within capacity.
-    unsafe {
-        *st.cp = 0;
-        *st.cp.add(1) = 0;
-    }
-    // SAFETY: the cursor only moved forward from its base.
-    let nl = unsafe { st.lp.offset_from(lp) as usize };
-    // SAFETY: entries 0..nl were initialized above.
-    let lines = unsafe { std::slice::from_raw_parts(lp, nl) };
-    // A record is fast only when its LF entry is clean (no POISON bit) and
-    // PAD bytes follow it in `buf`: one unsigned compare checks both.
-    let limit = (len - start).saturating_sub(PAD + 1) as u32;
-    let fh = N / 2; // commas taken from the record's head
-    let mut row = 0u32; // window offset of the record's first byte
-    for &line in lines {
-        let lf = line & !POISON;
-        let n = lf - row; // record length without its LF
-        // SAFETY: row <= lf, and lf lies in this window's blocks.
-        let (head, tail) = unsafe { commas_at(cm, row, lf) };
-        // Commas inside the record: the head's first min(n, 64) bits plus,
-        // past 64 bytes, the tail's top n - 64 bits.
-        let big = n > 64;
-        let in_head = if big { head } else { bzhi(head, n) };
-        let in_tail = if big { tail.wrapping_shr(128u32.wrapping_sub(n)) } else { 0 };
-        let count = in_head.count_ones() + in_tail.count_ones();
-        // The 64 bits ending at the LF, as the tail holds them; a short
-        // record shifts its head there so no byte before it is seen.
-        let last = if n >= 64 { tail } else { head.wrapping_shl(64 - n) };
-        let mut e = [0u32; N];
-        let mut h = head;
-        for x in e.iter_mut().take(fh) {
-            *x = h.trailing_zeros();
-            h &= h.wrapping_sub(1);
-        }
-        let mut t = last;
-        let mut p = 0u32; // the lowest comma the backward chain found
-        for x in e[fh..N - 1].iter_mut().rev() {
-            // 63 - lzcnt, or 127 for an empty word: that fails `p < 64`.
-            p = 63 ^ t.leading_zeros();
-            *x = p.wrapping_add(n).wrapping_sub(64);
-            t = bzhi(t, p);
-        }
-        e[N - 1] = n;
-        // One predictable branch: every term is a flag of a fixed sequence.
-        let ok = (line <= limit) & (n <= 128) & (count == N as u32 - 1) & (e[fh - 1] < 64) & (p < 64);
-        if ok {
-            // SAFETY: the record's bytes lie in the window; `e` holds its
-            // N - 1 comma offsets, ascending, then its length. Its quotes
-            // are valid (clean LF entry), so a field is wrapped exactly
-            // when its first byte is a quote, and then has two or more
-            // bytes. The probe at a field's start reads the record's own
-            // bytes or its LF.
-            unsafe {
-                let rp = base.add(row as usize);
-                let mut fields = [&buf[..0]; N];
-                let mut at = 0u32;
-                for (i, field) in fields.iter_mut().enumerate() {
-                    let w = u32::from(*rp.add(at as usize) == b'"');
-                    *field = std::slice::from_raw_parts(rp.add((at + w) as usize), (e[i] - at - 2 * w) as usize);
-                    at = e[i] + 1;
-                }
-                fast(s, fields);
-            }
-        } else {
-            slow_row::<N, S>(buf, start + row as usize, (start + lf as usize + 1).min(len), s, slow);
-        }
-        row = lf + 1;
-    }
-    (start + row as usize).min(len)
-}
-
-/// One record the fused walk did not certify, through the simple scanner.
-#[cold]
-#[inline(never)]
-fn slow_row<'b, const N: usize, S: ?Sized>(buf: &'b [u8], from: usize, to: usize, s: &mut S, f: &mut impl FnMut(&mut S, [&'b [u8]; N])) {
-    rows_simple::<N>(buf, from, to, &mut |r| f(s, r));
 }
 
 /// A block failed the quote check: poison its LFs, and return the poison for
@@ -790,7 +554,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fused_windows, rows, rows_fused, rows_simple, rows_window, PAD};
+    use super::{rows, rows_simple, rows_window};
 
     fn reference<'b, const N: usize>(buf: &'b [u8], mut emit: impl FnMut([&'b [u8]; N])) {
         fn line<'b, const N: usize>(line: &'b [u8]) -> Option<[&'b [u8]; N]> {
@@ -851,17 +615,6 @@ mod tests {
     fn check<const N: usize>(buf: &[u8]) {
         let want = owned::<N>(buf, false);
         assert_eq!(owned::<N>(buf, true), want, "input={buf:?}");
-        let end = buf.as_ptr() as usize + buf.len();
-        let fused = collect::<N>(buf, |b, f| rows_fused::<N, _>(b, f, |f, r| {
-            // A fast record has PAD readable bytes after its LF.
-            assert!(r[N - 1].as_ptr() as usize + r[N - 1].len() + 1 + PAD <= end, "pad input={b:?}");
-            f(r)
-        }, |f, r| f(r)));
-        assert_eq!(fused, want, "fused input={buf:?}");
-        for window in [64, 128, 192, 256] {
-            let got = collect::<N>(buf, |b, f| fused_windows::<N, _>(b, window, f, |f, r| f(r), |f, r| f(r)));
-            assert_eq!(got, want, "fused window={window} input={buf:?}");
-        }
         assert_eq!(collect::<N>(buf, |b, f| rows_simple::<N>(b, 0, b.len(), &mut |r| f(r))), want, "simple input={buf:?}");
         for window in [64, 128, 192, 256] {
             assert_eq!(collect::<N>(buf, |b, f| rows_window::<N>(b, window, &mut |r| f(r))), want, "window={window} input={buf:?}");
@@ -1120,24 +873,3 @@ pub(super) unsafe fn masks64_for_bench(p: *const u8) -> (u64, u64, u64) {
     unsafe { masks64(p) }
 }
 
-
-#[cfg(test)]
-mod rate {
-    // cargo test --release --bin solve fused_rate -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn fused_rate() {
-        for (path, n) in [("/tmp/ss-20m/events/part-00043.csv", 7usize), ("/tmp/ss-20m/clicks/part-00003.csv", 4)] {
-            let buf = std::fs::read(path).unwrap();
-            let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
-            let (mut fast, mut slow) = (0usize, 0usize);
-            let mut c = (&mut fast, &mut slow);
-            if n == 7 {
-                super::rows_fused::<7, _>(body, &mut c, |c, _| *c.0 += 1, |c, _| *c.1 += 1);
-            } else {
-                super::rows_fused::<4, _>(body, &mut c, |c, _| *c.0 += 1, |c, _| *c.1 += 1);
-            }
-            eprintln!("{path}: fast={fast} slow={slow} rate={:.5}", slow as f64 / (fast + slow) as f64);
-        }
-    }
-}

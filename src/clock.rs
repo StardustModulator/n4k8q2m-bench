@@ -81,55 +81,6 @@ impl Clock {
         self.iso(b)
     }
 
-    /// F1, F2 or F3 by one fixed instruction sequence: the calendar decode,
-    /// the zone offset and the digit decode are all computed, and the
-    /// field's length selects among them, so the form mix costs no branch.
-    /// Returns the instant in milliseconds and whether it is certain. An
-    /// uncertain result says only that `parse` must decide: a date outside
-    /// the cached days, an F3 width outside 9..=16, or a bad timestamp.
-    ///
-    /// # Safety
-    /// 25 bytes must be readable from `b.as_ptr()`, whatever `b.len()` is.
-    #[inline(always)]
-    pub(super) unsafe fn select(&self, b: &[u8]) -> (i64, bool) {
-        let p = b.as_ptr();
-        let n = b.len();
-        // SAFETY: every offset read here is at most 16 (F3) or 17 (zone),
-        // and reads eight bytes: inside the 25 the caller guarantees.
-        let rd = |o: usize| unsafe { u64::from_le_bytes(p.add(o).cast::<[u8; 8]>().read_unaligned()) };
-        let w0 = rd(0);
-        let w8 = rd(8);
-        // `slot` and `tag` over the words: bytes 6, 8, 9 and 0..12.
-        let dd = (w8 as u16).wrapping_mul(2561) >> 8;
-        let slot = (usize::from((w0 >> 48) as u8 & 1) << 5) | usize::from(dd & 31);
-        let day = &self.days[slot];
-        let dated = (day.lo == w0) & (day.hi == w8 as u32 & 0xff_ffff);
-        let (hms, hms_ok) = hms_flag(rd(11));
-        let local = day.midnight + hms;
-        let zone = rd(17);
-        let (off, off_ok) = hms_flag(zone >> 24 | (HMS_MIN & (u64::MAX << 40)));
-        let sign = (zone >> 16) as u8; // byte 19
-        let minus = sign == b'-';
-        let is20 = n == 20;
-        let is25 = n == 25;
-        // The zone applies only to F2, with its sign: masks, not branches.
-        let neg = i64::from(minus) - 1; // 0 for '-', -1 otherwise
-        let adj = ((off ^ neg) - neg) & -i64::from(is25);
-        let iso_ok = dated & hms_ok & ((is20 & (sign == b'Z')) | (is25 & off_ok & (minus | (sign == b'+'))));
-        // F3 as in `epoch_ms`: the last eight digits, and the rest left-padded.
-        const ZERO: u64 = u64::from_le_bytes(*b"00000000");
-        const BIAS: u64 = LOW7 - u64::from_le_bytes(*b"99999999");
-        let z = rd(n.clamp(8, 16) - 8);
-        let hi = w0.wrapping_sub(ZERO);
-        let lo = z.wrapping_sub(ZERO);
-        let digits = (hi | lo | w0.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
-        let ok3 = digits & (9..=16).contains(&n);
-        let prefix = hi.wrapping_shl(16u32.wrapping_sub(n as u32).wrapping_mul(8));
-        let iso = (local + adj) * 1000;
-        let f3 = (decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64;
-        (pick(is20 | is25, iso, f3), iso_ok | ok3)
-    }
-
     /// Seconds since the epoch.
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
@@ -155,26 +106,6 @@ impl Clock {
     }
 }
 
-/// `if c { a } else { b }` as one conditional move. The x86 backend turns a
-/// select whose operands have long dependency chains back into a branch,
-/// which the form mix would mispredict on a third of the rows; the asm pins
-/// the move.
-#[inline(always)]
-fn pick(c: bool, a: i64, b: i64) -> i64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut r = b;
-        // SAFETY: pure register arithmetic, no memory or flags live across it.
-        unsafe {
-            std::arch::asm!("test {c}, {c}", "cmovne {r}, {a}", c = in(reg) u64::from(c), a = in(reg) a, r = inout(reg) r,
-                            options(pure, nomem, nostack));
-        }
-        r
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    if c { a } else { b }
-}
-
 // Keep the general calendar conversion off the row-parsing hot path. ISO
 // forms are whole seconds (offsets are whole minutes), so the division is exact.
 #[cold]
@@ -195,13 +126,6 @@ const HMS_BIAS: u64 = LOW7 - u64::from_le_bytes(*b"29:59:59");
 
 #[inline(always)]
 fn hms_s(raw: u64) -> Option<i64> {
-    let (s, ok) = hms_flag(raw);
-    ok.then_some(s)
-}
-
-/// "HH:MM:SS" as seconds, and whether every lane was in range.
-#[inline(always)]
-fn hms_flag(raw: u64) -> (i64, bool) {
     // In each lane require MIN <= byte <= MAX (the two colons have min=max).
     // Valid lanes cannot carry/borrow into a neighbor, so the *first* invalid
     // lane necessarily contributes a high bit to one of these two words.
@@ -210,9 +134,12 @@ fn hms_flag(raw: u64) -> (i64, bool) {
     // 2561 = 10*256+1: each ones byte receives ten times its tens byte.
     let pairs = digits.wrapping_mul(2561) >> 8;
     let h = i64::from(pairs as u8);
+    if bad != 0 || h > 23 {
+        return None;
+    }
     let m = i64::from((pairs >> 24) as u8);
     let s = i64::from((pairs >> 48) as u8);
-    ((h * 60 + m) * 60 + s, (bad == 0) & (h <= 23))
+    Some((h * 60 + m) * 60 + s)
 }
 
 #[inline(always)]
@@ -402,54 +329,6 @@ mod tests {
         }
     }
 
-    /// `select` over a padded copy: certain results equal `parse`, and every
-    /// in-window instant of a well-formed field is certain.
-    fn select_padded(c: &Clock, s: &[u8]) -> (i64, bool) {
-        let mut pad = vec![b','; s.len() + 32];
-        pad[..s.len()].copy_from_slice(s);
-        unsafe { c.select(&pad[..s.len()]) }
-    }
-
-    #[test]
-    fn select_agrees_with_parse() {
-        let c = window("2027-12-09T00:00:00Z");
-        let mut cases: Vec<Vec<u8>> = Vec::new();
-        for original in [
-            &b"2027-12-20T23:59:59Z"[..],
-            &b"2027-12-20T19:59:59-04:00"[..],
-            &b"2027-12-20T19:59:59+13:30"[..],
-            &b"1829088235000"[..],
-            &b"0001829088235000"[..],
-            &b"182908823"[..],
-        ] {
-            cases.push(original.to_vec());
-            for i in 0..original.len() {
-                for byte in [0, b' ', b'+', b'-', b'/', b'0', b'5', b'9', b':', b'T', b'Z', b'z', 0x80, 0xff] {
-                    let mut s = original.to_vec();
-                    s[i] = byte;
-                    cases.push(s);
-                }
-            }
-        }
-        for s in ["", "1", "12345678", "12345678901234567", "00000000000000000000", "0000000000000000000000000",
-                  "2027-12-20T23:59:59z", "2027-12-20t23:59:59Z", "2027-12-20T23:59:59.000Z", "2027-12-20T23:59:59+0400",
-                  "2026-02-29T00:00:00Z", "2028-02-29T00:00:00Z", "2027-12-20T23:59:59-00:00", "1700-12-20T23:59:59Z"] {
-            cases.push(s.as_bytes().to_vec());
-        }
-        for s in &cases {
-            let want = parse_ts(s);
-            let (got, sure) = select_padded(&c, s);
-            let n = s.len();
-            // The cache holds 2027-12-01 through 2027-12-31 for this window.
-            let cached = n >= 10 && (&b"2027-12-01"[..]..=&b"2027-12-31"[..]).contains(&&s[..10]);
-            let certain = want.is_some() && ((n == 20 || n == 25) && cached || (9..=16).contains(&n));
-            assert_eq!(sure, certain, "{:?}", std::str::from_utf8(s));
-            if sure {
-                assert_eq!(Some(got), want, "{:?}", std::str::from_utf8(s));
-            }
-        }
-    }
-
     #[test]
     fn extreme_window_bounds_do_not_limit_ingest() {
         for (start, end) in [
@@ -463,26 +342,5 @@ mod tests {
             }
             assert_eq!(c.ingest(b"00000000000000000001"), None);
         }
-    }
-}
-
-#[cfg(test)]
-mod rate {
-    // cargo test --release --bin solve select_rate -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn select_rate() {
-        let data = std::path::Path::new("/tmp/ss-20m");
-        let w = crate::load_window(&data.join("manifest.json")).unwrap();
-        let c = super::Clock::new(w.start, w.end);
-        let buf = std::fs::read(data.join("events/part-00043.csv")).unwrap();
-        let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
-        let (mut rows, mut unsure, mut wrong) = (0usize, 0usize, 0usize);
-        crate::wire::rows::<7>(&body[..body.len() - 64], |f| {
-            rows += 1;
-            let (ms, sure) = unsafe { c.select(f[2]) };
-            if !sure { unsure += 1; } else if Some(ms) != c.parse(f[2]) { wrong += 1; }
-        });
-        eprintln!("rows={rows} unsure={unsure} ({:.5}) wrong={wrong}", unsure as f64 / rows as f64);
     }
 }
