@@ -15,6 +15,9 @@ on:
       envs:
         description: space-separated env variants per run; "-" is none, else A=1,B=2
         default: "-"
+      perf:
+        description: "true: also run each commit's binary natively under perf stat/record (NCPU=1)"
+        default: "false"
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -98,3 +101,23 @@ jobs:
               w, b = wall[c], inner[c] or [0]
               print(f"| {c[:12]} | {min(w)} | {st.median(w):.0f} | {min(b)} | {st.median(b):.0f} |")
           PY
+      - name: Hardware counters
+        if: inputs.perf == 'true'
+        run: |
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); [ -n "$PERF" ] || PERF=perf
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
+          for c in ${{ inputs.commits }}; do
+            id=$(docker create solver:$c) && docker cp $id:/solve ./solve-$c && docker rm $id >/dev/null
+            rm -rf out && mkdir out
+            echo "=== perf stat $c (NCPU=1)"
+            $PERF stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,dTLB-load-misses \
+              env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 STAGES=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>&1 | grep -vE "^\s*$"
+            rm -rf out && mkdir out
+            echo "=== perf record top symbols $c (NCPU=1)"
+            $PERF record -q -F 1999 -g -o perf-$c.data env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>/dev/null >/dev/null || true
+            $PERF report -i perf-$c.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | head -40
+            echo "=== perf annotate hottest symbol (branch-misses) $c"
+            $PERF record -q -e branch-misses -F 1999 -o bm-$c.data env DATA_DIR=$PWD/data OUTPUT_DIR=$PWD/out NCPU=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 ./solve-$c 2>/dev/null >/dev/null || true
+            $PERF report -i bm-$c.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+%" | head -25
+          done
