@@ -9,6 +9,7 @@ on:
       clicks: { default: "5000000" }
       seed: { default: "20" }
       runs: { default: "5" }
+      ncpu: { default: "4" }
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -66,7 +67,7 @@ jobs:
             for c in ${{ inputs.commits }}; do
               rm -rf out && mkdir out
               t0=$(date +%s%N)
-              inner=$(docker run --rm --user $(id -u):$(id -g) -e NCPU=4 -e STAGES=1 -v $PWD/data:/data:ro -v $PWD/out:/output solver:$c 2>&1 | tr '\n' ' ')
+              inner=$(docker run --rm --user $(id -u):$(id -g) -e NCPU=${{ inputs.ncpu }} -e STAGES=1 -v $PWD/data:/data:ro -v $PWD/out:/output solver:$c 2>&1 | tr '\n' ' ')
               t1=$(date +%s%N)
               echo "$c wall_ms=$(( (t1 - t0) / 1000000 )) $inner" | tee -a times.txt
             done
