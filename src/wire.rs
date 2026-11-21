@@ -290,7 +290,9 @@ fn window_rows<'b, const N: usize>(
         // the final block's start), so the block and the byte after it lie
         // inside `buf`. Capacity covers every slot (see rows_window).
         unsafe {
-            prefetch(p.add(WINDOW));
+            // Wrapping: in the last window the target lies past `buf`, which
+            // `add` forbids even for an address that is never dereferenced.
+            prefetch(p.wrapping_add(WINDOW));
             let m = masks64(p);
             let next_s = is_sep(*p.add(64));
             st.block::<N>(rel, m, next_s, 0);
