@@ -50,7 +50,7 @@ impl<'b, const N: usize, F: FnMut([&'b [u8]; N])> Sink<'b, N> for Slices<F> {
     fn fast(&mut self, base: *const u8, row: usize, ends: &[u16; N]) {
         // SAFETY: `records` only passes offsets inside the buffer it scans,
         // which outlives this call.
-        (self.0)(unsafe { unquoted::<N>(base, row, ends) })
+        (self.0)(unsafe { unquoted::<N>(base, row, ends, N) })
     }
     #[inline(always)]
     fn slow(&mut self, fields: [&'b [u8]; N]) {
@@ -58,28 +58,50 @@ impl<'b, const N: usize, F: FnMut([&'b [u8]; N])> Sink<'b, N> for Slices<F> {
     }
 }
 
-/// The field slices of a fast-path record (see `Sink::fast`).
+/// The field slices of a fast-path record (see `Sink::fast`). The first
+/// `eager` fields (a constant at every call site) have their quotes removed;
+/// the rest are raw, for a decoder that rarely needs them and strips them
+/// itself with `strip`.
 ///
 /// # Safety
 /// `base`, `row` and `ends` must come from `Sink::fast` for a buffer that
 /// lives for `'b`.
 #[inline(always)]
-pub(super) unsafe fn unquoted<'b, const N: usize>(base: *const u8, row: usize, ends: &[u16; N]) -> [&'b [u8]; N] {
+pub(super) unsafe fn unquoted<'b, const N: usize>(base: *const u8, row: usize, ends: &[u16; N], eager: usize) -> [&'b [u8]; N] {
     let mut fields = [&[][..]; N];
     let mut s = row;
-    for (field, &e) in fields.iter_mut().zip(ends) {
+    for (i, (field, &e)) in fields.iter_mut().zip(ends).enumerate() {
         let e = e as usize;
         // SAFETY: the probe reads the byte before the separator: the field's
         // last byte, or for an empty field the previous separator, at worst
         // the LF before the record. A valid field ending in a quote is
         // wrapped and has two or more bytes.
         unsafe {
-            let w = (*base.add(e - 1) == b'"') as usize;
-            *field = std::slice::from_raw_parts(base.add(s + w), e - s - 2 * w);
+            let w = if i < eager { (*base.add(e - 1) == b'"') as usize } else { 0 };
+            let start = s + w;
+            *field = std::slice::from_raw_parts(base.add(start), e - start - w);
         }
         s = e + 1;
     }
     fields
+}
+
+/// Remove the quotes of a raw field from a well-quoted record. A value never
+/// holds a quote, so a field starting with one is wrapped, and a field that
+/// was already stripped passes through unchanged.
+#[inline(always)]
+pub(super) fn strip(raw: &[u8]) -> &[u8] {
+    match raw {
+        [b'"', inner @ .., b'"'] => inner,
+        _ => raw,
+    }
+}
+
+/// Whether a raw field of a well-quoted record holds a non-empty value:
+/// only `""` is empty besides the empty field itself.
+#[inline(always)]
+pub(super) fn has_value(raw: &[u8]) -> bool {
+    !raw.is_empty() && !(raw.len() == 2 && raw[0] == b'"')
 }
 
 /// Feed every well-formed `N`-field record of `buf` to `sink` (see `rows`).

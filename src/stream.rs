@@ -169,15 +169,35 @@ struct Rec<const N: usize> {
 /// A row decoder. A trait rather than a closure so the implementation can
 /// demand inlining into the batch loop, where its constants stay in registers.
 trait Decode<'b, const N: usize> {
+    /// The timestamp field whose form (F1, F2 or F3) the decoder branches on.
+    /// Rows of a batch are decoded grouped by that field's raw length, so the
+    /// branch sees long runs of one outcome instead of a random mix.
+    const TS: usize;
+    /// How many leading fields arrive with quotes removed; the rest are raw
+    /// (see `wire::unquoted`).
+    const EAGER: usize;
     fn row(&mut self, f: &[&'b [u8]; N]);
 }
 
 impl<'b, const N: usize, D: Decode<'b, N>> Decode<'b, N> for &mut D {
+    const TS: usize = D::TS;
+    const EAGER: usize = D::EAGER;
     #[inline(always)]
     fn row(&mut self, f: &[&'b [u8]; N]) {
         (**self).row(f);
     }
 }
+
+/// Raw field length (bytes up to and including its separator) -> timestamp
+/// form group: F1 is 20 bytes, F2 25, each maybe wrapped in quotes.
+static FORM: [u8; 64] = {
+    let mut t = [2u8; 64];
+    t[21] = 0;
+    t[23] = 0;
+    t[26] = 1;
+    t[28] = 1;
+    t
+};
 
 /// Gathers fast-path records of one window into a batch and decodes them in
 /// bulk; slow-path records are decoded as they come. Rows are independent,
@@ -197,10 +217,26 @@ impl<'b, const N: usize, D: Decode<'b, N>> Batch<'b, N, D> {
 
     #[inline(never)]
     fn flush(&mut self) {
-        for r in &self.recs[..self.n] {
+        // Counting sort of the batch by timestamp form (see `Decode::TS`).
+        let recs = &self.recs[..self.n];
+        let mut group = [0u8; BATCH];
+        let mut at = [0usize; 4];
+        for (g, r) in group.iter_mut().zip(recs) {
+            *g = FORM[(r.ends[D::TS].wrapping_sub(r.ends[D::TS - 1]) as usize).min(63)];
+            at[*g as usize + 1] += 1;
+        }
+        at[2] += at[1];
+        at[3] += at[2];
+        let mut order = [0u8; BATCH];
+        for (i, &g) in group[..recs.len()].iter().enumerate() {
+            order[at[g as usize]] = i as u8;
+            at[g as usize] += 1;
+        }
+        for &i in &order[..recs.len()] {
+            let r = &recs[i as usize];
             // SAFETY: every record was handed over by the scanner for the
             // window at `base` (see `wire::Sink::fast`).
-            let f: [&'b [u8]; N] = unsafe { wire::unquoted(self.base, r.row as usize, &r.ends) };
+            let f: [&'b [u8]; N] = unsafe { wire::unquoted::<N>(self.base, r.row as usize, &r.ends, D::EAGER) };
             self.decode.row(&f);
         }
         self.n = 0;
@@ -242,6 +278,9 @@ struct EventRows<'a, 'c, 'd> {
 }
 
 impl<'b> Decode<'b, 7> for EventRows<'_, '_, '_> {
+    const TS: usize = 2;
+    // Product and price are read in full for purchases only.
+    const EAGER: usize = 5;
     #[inline(always)]
     fn row(&mut self, f: &[&'b [u8]; 7]) {
         self.dec.event(f, self.out);
@@ -255,6 +294,8 @@ struct ClickRows<'a, 'b, 'c, 'd> {
 }
 
 impl<'b> Decode<'b, 4> for ClickRows<'_, 'b, '_, '_> {
+    const TS: usize = 3;
+    const EAGER: usize = 4;
     #[inline(always)]
     fn row(&mut self, f: &[&'b [u8]; 4]) {
         self.dec.click(self.buf, f, self.out);
@@ -309,13 +350,16 @@ impl Decoder<'_, '_> {
             [a, b, c, d, e, g, h, i] if u64::from_le_bytes([a, b, c, d, e, g, h, i]) == PURCHASE => true,
             _ => return None,
         };
-        if f[1].is_empty() || f[5].is_empty() { return None; }
+        // Fields 5 and 6 may still carry their quotes (see `Decode::EAGER`).
+        if f[1].is_empty() || !wire::has_value(f[5]) { return None; }
         let ts = self.clock.parse(f[2])?;
         // One unsigned compare per bound pair; no instant overflows i64 here.
         if ts.wrapping_sub(self.start) as u64 >= self.span || at - ts > DAY_MS {
             return None;
         }
-        let pay = if purchase { parse_price(f[6])? | u32::from(product_cat(self.cx, f[5])) << 24 } else { 0 };
+        let pay = if purchase {
+            parse_price(wire::strip(f[6]))? | u32::from(product_cat(self.cx, wire::strip(f[5]))) << 24
+        } else { 0 };
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
@@ -873,6 +917,8 @@ mod bench {
         report("batch", &mut || {
             struct Len(usize);
             impl<'b> Decode<'b, 7> for Len {
+                const TS: usize = 2;
+                const EAGER: usize = 7;
                 #[inline(always)]
                 fn row(&mut self, f: &[&'b [u8]; 7]) { self.0 += f[0].len() + f[6].len(); }
             }
