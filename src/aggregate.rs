@@ -50,10 +50,10 @@ pub(super) struct Acc {
     order: Box<[u16; NB + 4]>,
     // (bucket, category << 24 | price)
     purchases: Vec<(u32, u32)>,
-    // Per session, at most one per bucket. Starts and lowers (start - WEEK)
-    // have room for padding to a power of two for the searches.
+    // Per session, at most one per bucket, with room for padding to whole
+    // chunks of eight for the counting; `summary` holds each chunk's last start.
     starts: Vec<u32>,
-    lowers: Vec<u32>,
+    summary: Vec<u32>,
     // ends[i + 1] is the number of events in sessions 0..=i; ends[0] = 0.
     ends: Vec<u32>,
     cents: Vec<i64>,
@@ -105,7 +105,7 @@ impl Acc {
         assert!(ndays <= 64);
         // Event offsets are below WEEK + ndays * DAY.
         let nb = (WEEK_MS as usize + ndays * DAY_MS as usize) / GAP_MS as usize + 1;
-        let room = (nb + 1).next_power_of_two();
+        let room = (nb + 8) & !7;
         Self {
             rows: Vec::new(),
             stats: vec![[0; 4]; n_camps * ndays],
@@ -122,7 +122,7 @@ impl Acc {
             order: Box::new([0; NB + 4]),
             purchases: Vec::new(),
             starts: vec![0; room],
-            lowers: vec![0; room],
+            summary: vec![0; room / 8 + 8],
             ends: vec![0; nb + 1],
             cents: vec![0; nb],
             day_of: vec![0; nb],
@@ -229,15 +229,20 @@ impl Acc {
         mask
     }
 
-    /// Session windows, days and same-day runs, plus padding for `rank`.
+    /// Session days and same-day runs, plus the padding and chunk summary
+    /// for `below2`. Returns the padded length.
     fn prepare(&mut self, ns: usize) -> usize {
-        let p = (ns + 1).next_power_of_two().max(8);
+        // At least one padding entry keeps the last chunk's summary at MAX.
+        let p = (ns + 8) & !7;
         for i in 0..ns {
-            self.lowers[i] = self.starts[i] - WEEK;
             self.day_of[i] = day_index(self.starts[i]) as u8;
         }
         self.starts[ns..p].fill(u32::MAX);
-        self.lowers[ns..p].fill(u32::MAX);
+        let q = (p / 8 + 7) & !7;
+        for j in 0..p / 8 {
+            self.summary[j] = self.starts[8 * j + 7];
+        }
+        self.summary[p / 8..q].fill(u32::MAX);
         let mut end = ns as u32;
         for i in (0..ns).rev() {
             self.run_end[i] = end;
@@ -253,14 +258,14 @@ impl Acc {
     /// Returns the day mask.
     fn attribute(&mut self, ns: usize, clicks: &[Hit], slow: &SlowIntern) -> u64 {
         let p = self.prepare(ns);
+        let q = (p / 8 + 7) & !7;
         // Click j is inside the windows of sessions [enter, leave):
-        // enter = #(start < ts), leave = #(start - WEEK <= ts).
+        // enter = #(start < ts), leave = #(start <= ts + WEEK).
         self.next.resize(clicks.len(), NONE);
         self.leave.resize(clicks.len(), 0);
         self.first[..=ns].fill(NONE);
         for (j, h) in clicks.iter().enumerate() {
-            let a = rank(&self.starts[..p], h.ts);
-            let b = rank(&self.lowers[..p], h.ts + 1);
+            let (a, b) = below2(&self.starts[..p], &self.summary[..q], h.ts, h.ts.saturating_add(WEEK + 1));
             self.leave[j] = b as u32;
             self.next[j] = self.first[a];
             self.first[a] = j as u32;
@@ -294,7 +299,7 @@ impl Acc {
                 j = self.next[j as usize];
             }
             let d = usize::from(self.day_of[i]);
-            let camp = if best_ts >= i64::from(self.lowers[i]) { best_camp } else { self.organic };
+            let camp = if best_ts + i64::from(WEEK) >= i64::from(self.starts[i]) { best_camp } else { self.organic };
             self.credit(i, camp, d);
             mask |= 1 << d;
         }
@@ -316,7 +321,9 @@ impl Acc {
         // Bucket the events instead of sorting them. Locals keep the slices
         // in registers; a 32-bit time divided by the gap indexes the fixed
         // tables without bounds checks.
-        let (mut lo, mut hi) = (usize::MAX, 0);
+        // Buckets of 64 form words; `words` marks the words with events so
+        // the sweep below skips the empty ones (a 32-bit offset has 38 words).
+        let mut words = 0u64;
         let purchases = &mut self.purchases;
         purchases.clear();
         {
@@ -329,8 +336,7 @@ impl Acc {
                 bmax[b] = bmax[b].max(ts);
                 bcnt[b] += 1;
                 occupied[b / 64] |= 1 << (b % 64);
-                lo = lo.min(b);
-                hi = hi.max(b);
+                words |= 1 << (b / 64);
                 let pay = e as u32;
                 if pay != 0 {
                     purchases.push((b as u32, pay));
@@ -342,7 +348,9 @@ impl Acc {
         // only words with more than four buckets branch.
         let order = &mut *self.order;
         let mut nb = 0;
-        for w in lo / 64..=hi / 64 {
+        while words != 0 {
+            let w = words.trailing_zeros() as usize;
+            words &= words - 1;
             let mut m = std::mem::take(&mut self.occupied[w]);
             let n = m.count_ones() as usize;
             let base = (w * 64) as u16;
@@ -535,17 +543,16 @@ fn below(a: &[u32], x: u32, y: u32) -> (usize, usize) {
     (cx, cy)
 }
 
-/// Number of entries below x in a sorted slice whose length is a power of
-/// two and whose last entry is u32::MAX. The steps are fixed by the length.
+/// `below` over a long slice in two steps: `summary` holds the last entry
+/// of each chunk of eight (padded with u32::MAX, like the slice), so the
+/// chunks wholly below a value are counted first, then that value's chunk.
 #[inline(always)]
-fn rank(a: &[u32], x: u32) -> usize {
-    let mut base = 0;
-    let mut step = a.len() / 2;
-    while step > 0 {
-        base = if a[base + step - 1] < x { base + step } else { base };
-        step /= 2;
-    }
-    base
+fn below2(a: &[u32], summary: &[u32], x: u32, y: u32) -> (usize, usize) {
+    let (cx, cy) = below(summary, x, y);
+    // The padding chunk ends in u32::MAX, so cx and cy index real chunks.
+    let (ax, _) = below(&a[8 * cx..8 * cx + 8], x, x);
+    let (_, by) = below(&a[8 * cy..8 * cy + 8], y, y);
+    (8 * cx + ax, 8 * cy + by)
 }
 
 #[inline]
