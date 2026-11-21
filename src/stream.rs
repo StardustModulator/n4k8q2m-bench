@@ -898,6 +898,143 @@ mod tests {
         }
     }
 
+    /// Event rows of every form the generator writes and every dirt kind the
+    /// rules name, plus shapes only the exact path handles.
+    fn synth_events(next: &mut impl FnMut() -> u64, w: &Window, rows: usize) -> Vec<u8> {
+        const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        fn word(next: &mut impl FnMut() -> u64, prefix: u8, n: usize) -> Vec<u8> {
+            let mut v = vec![prefix];
+            for _ in 0..n { v.push(B36[(next() % 36) as usize]); }
+            v
+        }
+        fn iso(t: i64, zone: &str) -> Vec<u8> {
+            let (d, s) = (t.div_euclid(DAY_MS), t.rem_euclid(DAY_MS) / 1000);
+            let mut date = [0u8; 10];
+            format_day(d as i32, &mut date);
+            format!("{}T{:02}:{:02}:{:02}{zone}", std::str::from_utf8(&date).unwrap(), s / 3600, s / 60 % 60, s % 60).into_bytes()
+        }
+        let mut out = Vec::new();
+        for _ in 0..rows {
+            let mut f: Vec<Vec<u8>> = Vec::with_capacity(7);
+            f.push(match next() % 64 {
+                0 => Vec::new(), 1 => word(next, b'E', 8), 2 => word(next, b'e', 7), 3 => word(next, b'e', 9),
+                4 => b"x1".to_vec(), 5 => word(next, b'e', 6), 6 => b"e\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f".to_vec(),
+                _ => word(next, b'e', 8),
+            });
+            f.push(match next() % 64 {
+                0 => Vec::new(), 1 => word(next, b'U', 8), 2 => word(next, b'u', 6), 3 => word(next, b'u', 9),
+                4 => b" u1".to_vec(), 5 => "u\u{e9}1234567".as_bytes().to_vec(), 6 => word(next, b'k', 7),
+                7 => b"u1234567\x7f".to_vec(), _ => { let n = 7 + (next() % 2) as usize; word(next, b'u', n) },
+            });
+            let t = w.start - 2 * DAY_MS + (next() % (18 * DAY_MS) as u64) as i64;
+            let t = t / 1000 * 1000 + if next() % 8 == 0 { (next() % 1000) as i64 } else { 0 };
+            let r = next() % 100;
+            f.push(if r < 50 {
+                if t % 1000 == 0 { iso(t, "Z") } else { t.to_string().into_bytes() }
+            } else if r < 62 {
+                let off = ((next() % 14) as i64 * 60 + [0, 30, 45][(next() % 3) as usize]) * 60_000;
+                let neg = next() % 2 == 0;
+                if t % 1000 == 0 {
+                    let mut s = iso(if neg { t - off } else { t + off }, "");
+                    s.extend_from_slice(format!("{}{:02}:{:02}", if neg { '-' } else { '+' }, off / 3_600_000, off / 60_000 % 60).as_bytes());
+                    s
+                } else { t.to_string().into_bytes() }
+            } else if r < 92 {
+                t.to_string().into_bytes()
+            } else {
+                match r {
+                    92 => Vec::new(), 93 => iso(t, "z"), 94 => format!("{t:020}").into_bytes(),
+                    95 => b"2028-02-30T00:00:00Z".to_vec(), 96 => iso(t, ".000Z"), 97 => b"2028-02-29T00:00:00Z".to_vec(),
+                    98 => iso(t, "+24:00"), _ => b"1.79e12".to_vec(),
+                }
+            });
+            let late = match next() % 50 { 0 => DAY_MS, 1 => DAY_MS + 1000, 2 => 3 * DAY_MS, 3 => -5000, _ => (next() % 3600) as i64 * 1000 };
+            let at = (t + late) / 1000 * 1000;
+            f.push(match next() % 100 {
+                0 => Vec::new(), 1 => at.to_string().into_bytes(), 2 => iso(at, "+00:00"),
+                3 => iso(w.start + 400 * DAY_MS, "Z"), 4 => iso(at, "z"), _ => iso(at, "Z"),
+            });
+            f.push(match next() % 100 {
+                0..=2 => b"purchase".to_vec(), 3 => b"Purchase".to_vec(), 4 => b"cart ".to_vec(), 5 => Vec::new(),
+                6..=20 => b"cart".to_vec(), _ => b"view".to_vec(),
+            });
+            f.push(match next() % 200 {
+                0 => Vec::new(), 1 => b"P123".to_vec(), 2 => b"p0123".to_vec(), 3 => b"p99999999".to_vec(),
+                _ => format!("p{}", next() % 60_000).into_bytes(),
+            });
+            f.push(match next() % 20 {
+                0 => Vec::new(), 1 => b"0".to_vec(), 2 => b"-5".to_vec(), 3 => b"1.5".to_vec(), 4 => b"10000001".to_vec(),
+                5 => b"0250".to_vec(), _ => (1 + next() % 50_000).to_string().into_bytes(),
+            });
+            let bad = next() % 400;
+            for (i, fld) in f.iter_mut().enumerate() {
+                if next() % 5 == 0 {
+                    let mut q = vec![b'"'];
+                    q.extend_from_slice(fld);
+                    q.push(b'"');
+                    *fld = q;
+                }
+                if bad == 1 && i == 2 { let at = fld.len().min(1); fld.insert(at, b'"'); }
+            }
+            match bad {
+                2 => { f.pop(); }
+                3 => f.push(b"extra".to_vec()),
+                4 => f.clear(),
+                5 => f[5] = vec![b'x'; 140],
+                6 => f[6].push(b'\r'),
+                7 => f[0] = b"\"".to_vec(),
+                8 => f[3] = b"\"\"".to_vec(),
+                _ => {}
+            }
+            out.extend_from_slice(&f.join(&b","[..]));
+            out.push(b'\n');
+        }
+        if next() % 3 == 0 { out.pop(); }
+        out
+    }
+
+    #[test]
+    fn fixed_sequence_matches_scalar_decoder() {
+        let start = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
+        let w = Window { start, end: start + 14 * DAY_MS, click_start: start - WEEK_MS, start_day: start.div_euclid(DAY_MS) as i32 };
+        let origin = w.start_day as i64 * DAY_MS - WEEK_MS;
+        let clock = Clock::new(w.start, w.end);
+        let prod_cat: Vec<u8> = (0..60_000u32).map(|i| if i % 97 == 0 { 255 } else { (i % 19) as u8 + 1 }).collect();
+        let (prod_other, camp_by_num, camp_other) = (HashMap::new(), Vec::new(), HashMap::new());
+        let cx = Ctx { prod_cat: &prod_cat, unknown: 0, prod_other: &prod_other, camp_by_num: &camp_by_num, camp_other: &camp_other, window: &w };
+        let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
+        let b = Bits { user: 4, id: 5 };
+        let dec = Decoder::new(&cx, &clock, &shared, origin, b);
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let fresh = || Scan { ev: bins(16), cl: Vec::new(), cand: bins(32), wide: Vec::new(), links: Vec::new() };
+        let (mut total, mut slow) = (0usize, 0usize);
+        for round in 0..60 {
+            let rows = 1 + (next() % 2500) as usize;
+            let buf = synth_events(&mut next, &w, rows);
+            let (mut a, mut c) = (fresh(), fresh());
+            batched::<7>(&buf, |rows| dec.events(rows, &mut a));
+            let mut l = Lists::new();
+            SLOW_ROWS.store(0, AtomicOrdering::Relaxed);
+            dec.event_rows(&buf, &mut c, &mut l);
+            total += rows;
+            slow += SLOW_ROWS.load(AtomicOrdering::Relaxed);
+            let ev = |s: &Scan| s.ev.iter().map(|v| v.iter().map(|e| (e.key, e.val)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let cand = |s: &Scan| s.cand.iter().map(|v| v.iter().map(|c| (c.h, c.sec, c.loc)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let wide = |s: &Scan| s.wide.iter().map(|v| v.iter().map(|x| (x.h, x.at, x.at_row)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            assert_eq!(ev(&a), ev(&c), "events, round {round}");
+            assert_eq!(cand(&a), cand(&c), "candidates, round {round}");
+            assert_eq!(wide(&a), wide(&c), "wide candidates, round {round}");
+        }
+        // Most synthetic rows have a generator shape: the fixed sequence must own them.
+        assert!(slow * 2 < total, "exact path took {slow} of {total} rows");
+    }
+
     #[test]
     fn canonical8_matches_canonical_number() {
         let mut cases: Vec<Vec<u8>> = Vec::new();
