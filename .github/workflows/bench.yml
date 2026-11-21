@@ -1,4 +1,5 @@
 name: x86 bench
+run-name: bench ${{ inputs.tag }} ${{ inputs.commits }}
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +19,9 @@ on:
       perf:
         description: "true: also run each commit's binary natively under perf stat/record (NCPU=1)"
         default: "false"
+      tag:
+        description: free label shown in the run name
+        default: ""
 jobs:
   bench:
     runs-on: ubuntu-latest
