@@ -4,20 +4,17 @@
 //! in one flat table laid out in hash order.
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Barrier, Mutex};
 use std::thread;
 
 use super::stream::hash;
 use super::{SlowIntern, cmp_keys};
 
-/// One renamed id. `hash` is `stream::hash(key)`, a bijection with
-/// hash(0) == 0: it identifies the key, and zero marks an empty slot.
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    hash: u64,
-    name: u64,
-}
+/// One renamed id as `[hash, name]`. The hash is `stream::hash(key)`, a
+/// bijection with hash(0) == 0: it identifies the key, and zero marks a hole.
+/// A plain array, so a table of holes comes straight from zeroed pages.
+type Slot = [u64; 2];
 
 /// Slots a lookup compares at once, without branching.
 const WINDOW: usize = 4;
@@ -51,9 +48,11 @@ impl Aliases {
         let w = unsafe { &*self.table.as_ptr().add(at).cast::<[Slot; WINDOW]>() };
         let mut name = k;
         for s in w {
-            name = if s.hash == h { s.name } else { name };
+            // About a third of lookups hit, at no predictable slot: a branch
+            // here would mispredict constantly.
+            name = std::hint::select_unpredictable(s[0] == h, s[1], name);
         }
-        if w[WINDOW - 1].hash > h {
+        if w[WINDOW - 1][0] > h {
             return self.far(h, at + WINDOW, k);
         }
         name
@@ -65,11 +64,11 @@ impl Aliases {
     fn far(&self, h: u64, mut at: usize, k: u64) -> u64 {
         // The table ends with WINDOW holes, so the scan stops in bounds.
         loop {
-            let s = self.table[at];
-            if s.hash == h {
-                return s.name;
+            let [hash, name] = self.table[at];
+            if hash == h {
+                return name;
             }
-            if s.hash < h {
+            if hash < h {
                 return k;
             }
             at += 1;
@@ -82,12 +81,12 @@ impl Aliases {
 /// later, when the following slice is no longer being written.
 #[inline]
 fn place(slots: &mut [Slot], offset: usize, cap: u64, mut e: Slot) -> Option<Slot> {
-    let mut at = home(e.hash, cap) - offset;
+    let mut at = home(e[0], cap) - offset;
     while at < slots.len() {
         let s = slots[at];
-        if s.hash < e.hash {
+        if s[0] < e[0] {
             slots[at] = e;
-            if s.hash == 0 {
+            if s[0] == 0 {
                 return None;
             }
             e = s;
@@ -102,21 +101,62 @@ fn part_of(h: u64, parts: usize) -> usize {
     ((u128::from(h) * parts as u128) >> 64) as usize
 }
 
-/// Follow parents with path halving. `link[x]` holds `x ^ parent(x)`, so
-/// zero (fresh zeroed memory) is a root. Parents only ever move to smaller
-/// keys, so a stale relaxed load still points at an ancestor.
+/// Hint that `x` is needed soon. Prefetches never fault and have no
+/// observable effect.
 #[inline(always)]
-fn root(link: &[AtomicU32], mut x: u32) -> u32 {
+fn prefetch<T>(x: &T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM only hints the cache; `x` is a valid reference.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) x as *const T, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PREFETCHT0 only hints the cache; `x` is a valid reference.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>((x as *const T).cast());
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = x;
+}
+
+/// A disjoint-set node holds its parent's index while linked, or its own key
+/// while a root. Keys are never below 2^32 (packed keys carry a nonzero
+/// prefix rank in bits 60..63, interned ones bit 63), so the two never mix,
+/// and a root's name arrives with the load that finds it.
+#[inline(always)]
+fn is_key(v: u64) -> bool {
+    v > u64::from(u32::MAX)
+}
+
+/// Find the root and its key. Nearly every vertex is a root or a root's
+/// child, which this resolves without a data-dependent branch.
+#[inline(always)]
+fn root(node: &[AtomicU64], x: u32) -> (u32, u64) {
+    let v = node[x as usize].load(Relaxed);
+    let p = std::hint::select_unpredictable(is_key(v), x, v as u32);
+    let w = node[p as usize].load(Relaxed);
+    if is_key(w) {
+        return (p, w);
+    }
+    deep(node, p)
+}
+
+/// Longer paths, with path halving. Parents only ever move to smaller keys,
+/// so a stale relaxed load still points at an ancestor.
+#[cold]
+#[inline(never)]
+fn deep(node: &[AtomicU64], mut x: u32) -> (u32, u64) {
     loop {
-        let p = x ^ link[x as usize].load(Relaxed);
-        if p == x {
-            return x;
+        let p = node[x as usize].load(Relaxed);
+        if is_key(p) {
+            return (x, p);
         }
-        let g = p ^ link[p as usize].load(Relaxed);
-        if g != p {
-            link[x as usize].store(x ^ g, Relaxed);
+        let g = node[p as usize].load(Relaxed);
+        if is_key(g) {
+            return (p as u32, g);
         }
-        x = g;
+        node[x as usize].store(g, Relaxed);
+        x = g as u32;
     }
 }
 
@@ -125,21 +165,20 @@ fn root(link: &[AtomicU32], mut x: u32) -> u32 {
 /// cannot form a cycle, and each root is its component's minimum. Returns
 /// whether this call linked two roots.
 #[inline(always)]
-fn unite(link: &[AtomicU32], keys: &[u64], slow: &SlowIntern, mut a: u32, mut b: u32) -> bool {
+fn unite(node: &[AtomicU64], slow: &SlowIntern, a: u32, b: u32) -> bool {
+    let (mut ra, mut ka) = root(node, a);
+    let (mut rb, mut kb) = root(node, b);
     loop {
-        a = root(link, a);
-        b = root(link, b);
-        if a == b {
+        if ra == rb {
             return false;
         }
-        let (lo, hi) = if cmp_keys(keys[a as usize], keys[b as usize], slow) == Ordering::Less {
-            (a, b)
-        } else {
-            (b, a)
-        };
-        if link[hi as usize].compare_exchange(0, hi ^ lo, Relaxed, Relaxed).is_ok() {
+        let a_first = cmp_keys(ka, kb, slow) == Ordering::Less;
+        let (lo, hi, key) = std::hint::select_unpredictable(a_first, (ra, rb, kb), (rb, ra, ka));
+        if node[hi as usize].compare_exchange(key, u64::from(lo), Relaxed, Relaxed).is_ok() {
             return true;
         }
+        (ra, ka) = root(node, ra);
+        (rb, kb) = root(node, rb);
     }
 }
 
@@ -153,30 +192,28 @@ fn intern(bins: &mut [Vec<u64>], seen: &mut Vec<u64>, index: &mut Vec<u32>) -> V
         index.resize(cap, 0);
     }
     let mask = cap - 1;
-    let mut keys = Vec::with_capacity(occurrences);
+    let mut keys = vec![0u64; occurrences];
+    let mut n = 0;
     for bin in bins {
         for x in bin.iter_mut() {
             let k = *x;
-            debug_assert_ne!(k, 0);
+            assert!(is_key(k), "id key collides with a vertex index");
             let mut at = hash(k) as usize & mask;
-            loop {
-                let s = seen[at];
-                if s == k {
-                    *x = u64::from(index[at]);
-                    break;
-                }
-                if s == 0 {
-                    seen[at] = k;
-                    index[at] = keys.len() as u32;
-                    *x = keys.len() as u64;
-                    keys.push(k);
-                    break;
-                }
+            while seen[at] != k && seen[at] != 0 {
                 at = (at + 1) & mask;
             }
+            // New and repeated keys are equally likely: no branch on which.
+            let new = seen[at] == 0;
+            let id = std::hint::select_unpredictable(new, n as u32, index[at]);
+            seen[at] = k;
+            index[at] = id;
+            keys[n] = k;
+            n += usize::from(new);
+            *x = u64::from(id);
         }
     }
     seen[..cap].fill(0);
+    keys.truncate(n);
     keys
 }
 
@@ -203,17 +240,18 @@ fn each<J: Send, S: Send>(jobs: Vec<J>, workers: usize, init: impl Fn() -> S + S
     })
 }
 
-/// Build an exact resolver from link endpoints only.
+/// Build an exact resolver from link endpoints only. The table is one array
+/// ordered by hash, so any user bin (a range of top hash bits) maps to one
+/// contiguous run of it, whatever `_user_bins` is.
 pub(super) fn build(
     parts: Vec<Vec<(u64, u64)>>,
     slow: &SlowIntern,
     threads: usize,
-    user_bins: usize,
+    _user_bins: usize,
 ) -> Aliases {
-    let _ = user_bins;
     let edge_count = parts.iter().map(Vec::len).sum::<usize>();
     if edge_count == 0 {
-        return Aliases { table: vec![Slot::default(); WINDOW].into_boxed_slice(), cap: 0 };
+        return Aliases { table: vec![[0; 2]; WINDOW].into_boxed_slice(), cap: 0 };
     }
     // Thread start-up costs more than a few thousand edges.
     let workers = threads.clamp(1, edge_count.div_ceil(1 << 13));
@@ -236,6 +274,7 @@ pub(super) fn build(
             }
         }
     }
+    let workers = spans.len();
 
     // Scatter endpoint occurrences by partition, in edge order.
     let hint = 2 * per / np + 16;
@@ -283,33 +322,56 @@ pub(super) fn build(
     }
     let vertices = base[np];
     assert!(vertices < u32::MAX as usize, "too many linked aliases");
-    let keys: Vec<u64> = uniq.concat();
-    drop(uniq);
 
-    // Replay each worker's edges: the cursors meet the interned indices in
-    // the order they were scattered, so no endpoint is looked up again.
-    let mut zeroed = vec![0u32; vertices];
-    // SAFETY: AtomicU32 has the size and alignment of u32, and `zeroed` is
-    // only accessed through this view until the view is dropped.
-    let link: &[AtomicU32] = unsafe { std::slice::from_raw_parts(zeroed.as_mut_ptr().cast(), vertices) };
+    // Every vertex starts as a root holding its key; each worker copies a
+    // share of them. Then it replays its own edges: the cursors meet the
+    // interned indices in the order they were scattered, so no endpoint is
+    // looked up again.
+    let mut cells = vec![0u64; vertices];
+    const _: () = assert!(std::mem::align_of::<AtomicU64>() == std::mem::align_of::<u64>());
+    // SAFETY: AtomicU64 has the size and (asserted) alignment of u64, and
+    // `cells` is only accessed through this view until the view is dead.
+    let node: &[AtomicU64] = unsafe { std::slice::from_raw_parts(cells.as_mut_ptr().cast(), vertices) };
     let renamed = AtomicUsize::new(0);
+    let ready = Barrier::new(workers);
     thread::scope(|scope| {
-        for (span, ids) in spans.iter().zip(&scattered) {
-            let (keys, base, renamed) = (&keys, &base, &renamed);
+        for (w, (span, ids)) in spans.iter().zip(&scattered).enumerate() {
+            let (base, uniq, renamed, ready) = (&base, &uniq, &renamed, &ready);
             scope.spawn(move || {
+                for p in w * np / workers..(w + 1) * np / workers {
+                    for (cell, &k) in node[base[p]..base[p + 1]].iter().zip(&uniq[p]) {
+                        cell.store(k, Relaxed);
+                    }
+                }
+                ready.wait();
                 let mut cursor = vec![0usize; np];
-                let mut linked = 0;
                 let mut next = |k: u64| {
                     let p = part_of(hash(k), np);
                     let local = ids[p][cursor[p]];
                     cursor[p] += 1;
                     (base[p] + local as usize) as u32
                 };
+                // A short software pipeline: resolve ids and prefetch both
+                // nodes LAG edges before they are joined.
+                const LAG: usize = 16;
+                let mut ring = [(0u32, 0u32); LAG];
+                let (mut n, mut linked) = (0usize, 0usize);
                 for slice in span {
                     for &(a, b) in *slice {
                         let (ga, gb) = (next(a), next(b));
-                        linked += usize::from(unite(link, keys, slow, ga, gb));
+                        prefetch(&node[ga as usize]);
+                        prefetch(&node[gb as usize]);
+                        let slot = &mut ring[n % LAG];
+                        if n >= LAG {
+                            linked += usize::from(unite(node, slow, slot.0, slot.1));
+                        }
+                        *slot = (ga, gb);
+                        n += 1;
                     }
+                }
+                for i in n.saturating_sub(LAG)..n {
+                    let (ga, gb) = ring[i % LAG];
+                    linked += usize::from(unite(node, slow, ga, gb));
                 }
                 renamed.fetch_add(linked, Relaxed);
             });
@@ -321,34 +383,47 @@ pub(super) fn build(
     // Half-full table; a multiple of `np` so partitions own whole slot runs.
     let cap = (renamed * 2).div_ceil(np).max(1) * np;
     let width = cap / np;
-    let mut table = vec![Slot::default(); cap + WINDOW];
+    let mut table = vec![[0u64; 2]; cap + WINDOW];
     // Partition p holds the hashes whose complement lies in run np - 1 - p.
     let mut runs: Vec<(usize, &mut [Slot])> = table[..cap].chunks_mut(width).enumerate().map(|(q, s)| (np - 1 - q, s)).collect();
     runs.reverse();
-    let spilled = each(runs, workers.min(np), Vec::new, |spill, (p, slots)| {
+    let spilled = each(runs, workers.min(np), || (Vec::new(), Vec::new()), |(spill, found), (p, slots)| {
         let offset = (np - 1 - p) * width;
-        for g in base[p]..base[p + 1] {
-            let r = root(link, g as u32) as usize;
-            if r != g {
-                let e = Slot { hash: hash(keys[g]), name: keys[r] };
-                if let Some(e) = place(slots, offset, cap as u64, e) {
-                    spill.push(e);
-                }
+        let keys = &uniq[p];
+        let nodes = &node[base[p]..base[p + 1]];
+        // Gather renamed ids without branching on which they are, fetching
+        // each vertex's parent LAG vertices ahead.
+        const LAG: usize = 16;
+        found.resize(keys.len(), [0; 2]);
+        let mut n = 0;
+        for (local, &k) in keys.iter().enumerate() {
+            if let Some(ahead) = nodes.get(local + LAG) {
+                let v = ahead.load(Relaxed);
+                prefetch(&node[std::hint::select_unpredictable(is_key(v), base[p] + local + LAG, v as usize)]);
+            }
+            let g = (base[p] + local) as u32;
+            let (r, name) = root(node, g);
+            found[n] = [hash(k), name];
+            n += usize::from(r != g);
+        }
+        for &e in &found[..n] {
+            if let Some(e) = place(slots, offset, cap as u64, e) {
+                spill.push(e);
             }
         }
     });
-    drop(zeroed);
-    let mut table = table;
-    for mut e in spilled.into_iter().flatten() {
-        let mut at = home(e.hash, cap as u64);
+    let spilled: Vec<Slot> = spilled.into_iter().flat_map(|(spill, _)| spill).collect();
+    drop(cells);
+    for mut e in spilled {
+        let mut at = home(e[0], cap as u64);
         loop {
             if at + WINDOW >= table.len() {
-                table.resize(at + WINDOW + 1, Slot::default());
+                table.resize(at + WINDOW + 1, [0; 2]);
             }
             let s = table[at];
-            if s.hash < e.hash {
+            if s[0] < e[0] {
                 table[at] = e;
-                if s.hash == 0 {
+                if s[0] == 0 {
                     break;
                 }
                 e = s;
@@ -417,6 +492,18 @@ mod bench {
         v.into_iter().map(|p| std::fs::read(p).unwrap()).collect()
     }
 
+    /// Process CPU seconds: less disturbed than wall time on a busy machine.
+    fn cpu_time() -> f64 {
+        #[repr(C)]
+        struct Timespec { sec: i64, nsec: i64 }
+        unsafe extern "C" { fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32; }
+        let clock = if cfg!(target_os = "macos") { 12 } else { 2 }; // CLOCK_PROCESS_CPUTIME_ID
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: `ts` is a valid out-pointer for the libc call.
+        unsafe { clock_gettime(clock, &mut ts) };
+        ts.sec as f64 + ts.nsec as f64 * 1e-9
+    }
+
     fn body(b: &[u8]) -> &[u8] {
         memchr::memchr(b'\n', b).map_or(&[], |i| &b[i + 1..])
     }
@@ -450,16 +537,18 @@ mod bench {
         // rename() visits keys bin by bin.
         let shift = 64 - (user_bins as u64).trailing_zeros();
         queries.sort_by_key(|&k| hash(k) >> shift);
+        let reps = std::env::var("LINKS_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
         for threads in [1, 8] {
-            let mut best = f64::MAX;
-            for _ in 0..5 {
+            let (mut best, mut cpu) = (f64::MAX, f64::MAX);
+            for _ in 0..reps {
                 let p = parts.clone();
-                let t = Instant::now();
+                let (t, c) = (Instant::now(), cpu_time());
                 let a = build(p, &slow, threads, user_bins);
                 best = best.min(t.elapsed().as_secs_f64());
+                cpu = cpu.min(cpu_time() - c);
                 std::hint::black_box(&a);
             }
-            eprintln!("build threads={threads}: {:7.2} ms {:6.1} ns/edge", best * 1e3, best * 1e9 / edges as f64);
+            eprintln!("build threads={threads}: {:7.2} ms {:6.1} ns/edge, cpu {:7.2} ms", best * 1e3, best * 1e9 / edges as f64, cpu * 1e3);
         }
         let aliases = build(parts.clone(), &slow, 8, user_bins);
         let mut best = f64::MAX;
