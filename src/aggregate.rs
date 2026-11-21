@@ -386,6 +386,7 @@ impl Acc {
                 prev = max;
             }
         }
+        if ns < 1_000_000 { return; }
         self.cents[..ns].fill(0);
         for &(b, pay) in &self.purchases {
             let i = self.bsess[b as usize] as usize;
@@ -409,7 +410,7 @@ impl Acc {
         }
         self.touched.clear();
         let mut mask = 0u64;
-        if clicks.is_empty() || ns <= 64 {
+        if clicks.is_empty() {
             for i in 0..ns {
                 let d = day_index(self.starts[i]);
                 let cents = self.cents[i];
