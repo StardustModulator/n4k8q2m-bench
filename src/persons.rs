@@ -11,6 +11,17 @@ use crate::group::Histories;
 use crate::links::Aliases;
 use crate::stream::{consume, hash};
 
+/// Inverse of `stream::hash` (the splitmix64 finalizer), for record flows that
+/// store `hash(user)` as the key so bin selection needs no second hash.
+#[inline(always)]
+pub(super) fn unhash(x: u64) -> u64 {
+    let x = x ^ (x >> 31) ^ (x >> 62);
+    let x = x.wrapping_mul(0x319642b2d24d8ec3);
+    let x = x ^ (x >> 27) ^ (x >> 54);
+    let x = x.wrapping_mul(0x96de1b173f119089);
+    x ^ (x >> 30) ^ (x >> 60)
+}
+
 #[derive(Clone, Copy)]
 struct Span {
     name: u64,
@@ -21,17 +32,19 @@ struct Span {
 struct Table {
     slots: Vec<(u64, u32)>,
     mask: usize,
+    mixed: bool,
 }
 
 impl Table {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, mixed: bool) -> Self {
         let cap = (2 * n).next_power_of_two().max(16);
-        Self { slots: vec![(0, 0); cap], mask: cap - 1 }
+        Self { slots: vec![(0, 0); cap], mask: cap - 1, mixed }
     }
     // Keys are nonzero. The top hash bits chose the bin; the low bits are free.
     #[inline(always)]
     fn find(&self, key: u64) -> usize {
-        let mut i = hash(key) as usize & self.mask;
+        let h = if self.mixed { key } else { hash(key) };
+        let mut i = h as usize & self.mask;
         loop {
             let k = self.slots[i].0;
             if k == key || k == 0 {
@@ -103,9 +116,10 @@ unsafe impl Sync for Bin {}
 impl Bin {
     fn empty() -> Self {
         let mut b = Bin {
-            keys: Vec::new(), renamed: Vec::new(), ev_at: vec![0], cl_at: vec![0], table: Table::new(0),
+            keys: Vec::new(), renamed: Vec::new(), ev_at: vec![0], cl_at: vec![0], table: Table::new(0, false),
             ev: Vec::new(), cl: Vec::new(), ev_ptr: std::ptr::null_mut(), cl_ptr: std::ptr::null_mut(),
         };
+        let _ = Table::new(0, false);
         b.ev_ptr = b.ev.as_mut_ptr();
         b.cl_ptr = b.cl.as_mut_ptr();
         b
@@ -141,13 +155,13 @@ impl Bin {
 }
 
 /// Group one raw-user bin and name each distinct raw user once.
-fn gather(mut parts: Vec<Histories>, aliases: &Aliases, shift: u32, bin: usize, spans: &mut [Vec<Span>]) -> Bin {
+fn gather(mut parts: Vec<Histories>, aliases: &Aliases, shift: u32, bin: usize, spans: &mut [Vec<Span>], mixed: bool) -> Bin {
     let ne: usize = parts.iter().map(|p| p.ev.len()).sum();
     let nc: usize = parts.iter().map(|p| p.cl.len()).sum();
     if ne + nc == 0 {
         return Bin::empty();
     }
-    let mut table = Table::new((ne + nc) / 6 + 16);
+    let mut table = Table::new((ne + nc) / 6 + 16, mixed);
     let mut keys = Vec::with_capacity((ne + nc) / 6 + 16);
     let (mut ecount, mut ccount) = (Vec::with_capacity(keys.capacity()), Vec::with_capacity(keys.capacity()));
     // The key field is ours now: it carries the group number to the scatter.
@@ -203,10 +217,13 @@ fn gather(mut parts: Vec<Histories>, aliases: &Aliases, shift: u32, bin: usize, 
             *at += 1;
         }
     }
+    // From here on `keys` holds raw ids: the mixed form was only for binning.
     let mut renamed = vec![false; groups];
     for g in 0..groups {
-        let name = aliases.resolve(keys[g]);
-        if name != keys[g] {
+        let raw = if mixed { unhash(keys[g]) } else { keys[g] };
+        keys[g] = raw;
+        let name = aliases.resolve(raw);
+        if name != raw {
             renamed[g] = true;
             spans[(hash(name) >> shift) as usize].push(Span { name, bin: bin as u32, group: g as u32 });
         }
@@ -233,8 +250,9 @@ fn finish(b: usize, bins: &[Bin], mut spans: Vec<Span>, acc: &mut Acc, sc: &mut 
     // A local group that also receives spans is processed with them.
     sc.root.clear();
     sc.root.resize(groups, false);
+    let lookup = |name: u64| me.table.get(if me.table.mixed { hash(name) } else { name });
     for s in &spans {
-        if let Some(g) = me.table.get(s.name) {
+        if let Some(g) = lookup(s.name) {
             sc.root[g] = true;
         }
     }
@@ -256,7 +274,7 @@ fn finish(b: usize, bins: &[Bin], mut spans: Vec<Span>, acc: &mut Acc, sc: &mut 
         }
         sc.ev.clear();
         sc.cl.clear();
-        if let Some(g) = me.table.get(name) {
+        if let Some(g) = lookup(name) {
             // SAFETY: the root group is not renamed and belongs to this job.
             let (ev, cl) = unsafe { me.rows(g) };
             sc.ev.extend_from_slice(ev);
@@ -276,9 +294,10 @@ fn finish(b: usize, bins: &[Bin], mut spans: Vec<Span>, acc: &mut Acc, sc: &mut 
 }
 
 /// Group raw-user bins (top `64 - shift` hash bits) into persons and sessionize
-/// them. Returns one accumulator per worker.
+/// them. With `mixed`, keys arrive as `hash(user)`. Returns one accumulator per
+/// worker.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usize, shift: u32,
+pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usize, shift: u32, mixed: bool,
                   acc: impl Fn() -> Acc + Sync, cats: &[Vec<u8>], slow: &SlowIntern, first_day: i32) -> Vec<Acc> {
     let nbins = by_user.len();
     let t0 = std::time::Instant::now();
@@ -286,7 +305,7 @@ pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usiz
     jobs.sort_unstable_by_key(|(_, p)| std::cmp::Reverse(p.iter().map(|h| h.ev.len() + h.cl.len()).sum::<usize>()));
     let grouped = consume(jobs, threads, || (Vec::new(), (0..nbins).map(|_| Vec::new()).collect::<Vec<Vec<Span>>>()),
         |(done, spans): &mut (Vec<(usize, Bin)>, Vec<Vec<Span>>), (b, parts)| {
-            done.push((b, gather(parts, aliases, shift, b, spans)));
+            done.push((b, gather(parts, aliases, shift, b, spans, mixed)));
         });
     let mut bins: Vec<Option<Bin>> = (0..nbins).map(|_| None).collect();
     let mut incoming: Vec<Vec<Span>> = (0..nbins).map(|_| Vec::new()).collect();
@@ -310,4 +329,21 @@ pub(super) fn run(by_user: Vec<Vec<Histories>>, aliases: &Aliases, threads: usiz
         eprintln!("persons gather={} finish={}", (t1 - t0).as_millis(), t1.elapsed().as_millis());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unhash_inverts_hash() {
+        let mut x = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..100_000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            assert_eq!(unhash(hash(x)), x);
+            assert_eq!(hash(unhash(x)), x);
+        }
+        assert_eq!(unhash(hash(1)), 1);
+        assert_eq!(unhash(hash(u64::MAX)), u64::MAX);
+    }
 }

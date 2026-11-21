@@ -25,8 +25,10 @@ pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], f: impl FnMut([&'b [u8]; N
 }
 
 /// Bytes per two-stage window. A multiple of 64 so only the input's final
-/// block is ever partial, and small enough for u16 window offsets.
-const WINDOW: usize = 1 << 15;
+/// block is ever partial, and small enough for u16 window offsets. Stage 2
+/// rereads the window, so it and its lists (about 10 KiB) should stay in L1
+/// next to the caller's own data; on M1 8 to 32 KiB measure the same.
+const WINDOW: usize = 1 << 13;
 /// Set on a line entry whose record must take the exact path.
 const POISON: u32 = 1 << 31;
 /// Written past the last separator: equals no window offset.
@@ -40,14 +42,23 @@ const NONE: u16 = u16::MAX;
 ///
 /// Quotes: a quote whose neighbours are both non-separators lies strictly
 /// inside a field ("stray") and always invalidates its record. Every other
-/// quote is a field's first or last byte (an "edge" quote), so a field holds
-/// zero, one or two of them, and is well quoted exactly when it holds an even
-/// number: two edge quotes of one field are distinct bytes only when it has
-/// two or more. Hence a record without stray quotes is well quoted exactly when
-/// the running parity of edge quotes is even at each of its separators. Stage
-/// 1 checks that per block; a block that fails poisons each record it touches,
-/// and poisoned records take the exact per-field path. Every other record has
-/// valid quotes, so its field is quoted exactly when its last byte is a quote.
+/// quote opens its field (it follows a separator), closes it (a separator
+/// follows it), or both, which makes the field a lone quote: invalid. A field
+/// is well quoted exactly when it has an opener and a closer or neither.
+///
+/// Stage 1 checks this per block by subtraction. `C - O - borrow` (closers
+/// minus openers as integers) borrows from an opener up to the next closer,
+/// so bit i of the difference is set exactly when byte i lies inside an open
+/// quote, except that an opener or a closer reached outside one also yields a
+/// set bit. A record whose quote state starts closed is then well quoted
+/// exactly when no separator and no closer of it has its bit set: the first
+/// opener left open sets the bit at its field's end, and a closer without an
+/// opener sets its own. A block that fails poisons every record it touches,
+/// and poisoned records take the exact per-field path. The state carried into
+/// a record is wrong only after a record left a quote open, and then the LF
+/// before it is set too, so its block fails and the record is poisoned.
+/// Every other record has valid quotes, so its field is quoted exactly when
+/// its last byte is a quote.
 #[inline]
 pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut f: impl FnMut([&'b [u8]; N])) {
     debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
@@ -55,7 +66,10 @@ pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut 
     // Slack for the unconditional writes, the EOF entry and the sentinels.
     let mut stops: Vec<u16> = Vec::with_capacity(window + 80);
     let mut lines: Vec<u32> = Vec::with_capacity(window + 80);
-    let mut start = 0;
+    // The first record goes to the simple scanner. Every window then starts
+    // just after an LF, which the fast path's quote probe may read.
+    let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
+    rows_simple::<N>(&buf[..start], &mut f);
     while start < len {
         let end = (start + window).min(len);
         let next = window_rows::<N>(buf, start, end, stops.as_mut_ptr(), lines.as_mut_ptr(), &mut f);
@@ -71,51 +85,66 @@ pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut 
     }
 }
 
+/// 1 for a separator byte: one load instead of two compares per block.
+static SEP: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[b',' as usize] = 1;
+    t[b'\n' as usize] = 1;
+    t
+};
+
 #[inline(always)]
 fn is_sep(b: u8) -> u64 {
-    u64::from(b == b',' || b == b'\n')
+    u64::from(SEP[b as usize])
 }
 
-/// Bit i is the XOR of bits 0..=i.
-#[inline(always)]
-fn prefix_xor(mut x: u64) -> u64 {
-    x ^= x << 1;
-    x ^= x << 2;
-    x ^= x << 4;
-    x ^= x << 8;
-    x ^= x << 16;
-    x ^= x << 32;
-    x
+/// A window offset as stored in a list.
+trait Slot: Copy {
+    fn at(v: u32) -> Self;
+}
+impl Slot for u16 {
+    #[inline(always)]
+    fn at(v: u32) -> u16 {
+        v as u16
+    }
+}
+impl Slot for u32 {
+    #[inline(always)]
+    fn at(v: u32) -> u32 {
+        v
+    }
 }
 
-/// Write `rel + i` for every set bit i of `m`, ascending, to `dst`. Eight
-/// slots are written unconditionally; those past the count hold garbage.
+/// Write `rel + i` for every set bit i of `m`, ascending, to `dst`. `k` slots
+/// (a constant after inlining) are written unconditionally; those past the
+/// count hold garbage. `k` covers almost every block of the input's row
+/// shapes, so the loop rarely runs.
 ///
 /// # Safety
-/// `dst` must be valid for `max(8, popcount(m))` writes.
+/// `dst` must be valid for `max(k, popcount(m))` writes.
 #[inline(always)]
-unsafe fn flatten(dst: *mut u16, rel: u32, m: u64) {
+unsafe fn flatten<T: Slot>(dst: *mut T, rel: u32, m: u64, k: usize) {
     // SAFETY: forwarded.
     #[cfg(target_arch = "aarch64")]
-    unsafe { flatten_rev(dst, rel, m) }
+    unsafe { flatten_rev(dst, rel, m, k) }
     // SAFETY: forwarded.
     #[cfg(not(target_arch = "aarch64"))]
-    unsafe { flatten_tz(dst, rel, m) }
+    unsafe { flatten_tz(dst, rel, m, k) }
 }
 
 /// For targets with a trailing-zero count and BLSR.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-unsafe fn flatten_tz(dst: *mut u16, rel: u32, mut m: u64) {
-    // SAFETY: the caller guarantees room for max(8, popcount(m)) slots.
+unsafe fn flatten_tz<T: Slot>(dst: *mut T, rel: u32, mut m: u64, k: usize) {
+    // SAFETY: the caller guarantees room for max(k, popcount(m)) slots.
     unsafe {
-        for j in 0..8 {
-            *dst.add(j) = (rel + m.trailing_zeros()) as u16;
+        for j in 0..k {
+            *dst.add(j) = T::at(rel + m.trailing_zeros());
             m &= m.wrapping_sub(1);
         }
-        let mut j = 8;
+        let mut j = k;
         while m != 0 {
-            *dst.add(j) = (rel + m.trailing_zeros()) as u16;
+            *dst.add(j) = T::at(rel + m.trailing_zeros());
             m &= m - 1;
             j += 1;
         }
@@ -126,24 +155,74 @@ unsafe fn flatten_tz(dst: *mut u16, rel: u32, mut m: u64) {
 /// An empty word yields 64, and the wrapping shift then clears nothing.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
-unsafe fn flatten_rev(dst: *mut u16, rel: u32, m: u64) {
+unsafe fn flatten_rev<T: Slot>(dst: *mut T, rel: u32, m: u64, k: usize) {
     const TOP: u64 = 1 << 63;
     let mut r = m.reverse_bits();
-    // SAFETY: the caller guarantees room for max(8, popcount(m)) slots.
+    // SAFETY: the caller guarantees room for max(k, popcount(m)) slots.
     unsafe {
-        for j in 0..8 {
+        for j in 0..k {
             let b = r.leading_zeros();
-            *dst.add(j) = (rel + b) as u16;
+            *dst.add(j) = T::at(rel + b);
             r &= !TOP.wrapping_shr(b);
         }
-        let mut j = 8;
+        let mut j = k;
         while r != 0 {
             let b = r.leading_zeros();
-            *dst.add(j) = (rel + b) as u16;
+            *dst.add(j) = T::at(rel + b);
             r &= !(TOP >> b);
             j += 1;
         }
     }
+}
+
+/// Stage 1 state carried from block to block.
+struct Scan {
+    sp: *mut u16, // next separator slot
+    lp: *mut u32, // next LF slot
+    prev_s: u64,  // bit 0: the byte before this block is a separator
+    open: u64,    // 1 inside an open quote: the borrow out of the last block
+    pending: u32, // poison for the next LF
+}
+
+impl Scan {
+    /// List the separators and LFs of the block at window offset `rel` and
+    /// check its quotes. `next_s` says whether the byte after it is a
+    /// separator; `tail` marks EOF inside a partial block.
+    ///
+    /// # Safety
+    /// The slots need room for this block's entries plus the slack of the
+    /// unconditional writes.
+    #[inline(always)]
+    unsafe fn block<const N: usize>(&mut self, rel: u32, (c, n, q): (u64, u64, u64), next_s: u64, tail: u64) {
+        let s = c | n;
+        let o = q & ((s << 1) | self.prev_s);
+        let z = q & (((s | tail) >> 1) | (next_s << 63));
+        self.prev_s = s >> 63;
+        // O + open cannot overflow: an opener at every bit needs separators.
+        let (inside, borrow) = z.overflowing_sub(o + self.open);
+        self.open = borrow as u64;
+        let bad = (inside & (s | z)) | (q & !(o | z)) | (o & z);
+        let lfs = n.count_ones() as usize;
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            flatten(self.sp, rel, s, 7);
+            flatten(self.lp, rel, n, lf_slots(N));
+            if self.pending != 0 && n != 0 {
+                *self.lp |= POISON;
+                self.pending = 0;
+            }
+            if bad != 0 {
+                self.pending = poison_block(self.lp, lfs);
+            }
+            self.sp = self.sp.add(s.count_ones() as usize);
+            self.lp = self.lp.add(lfs);
+        }
+    }
+}
+
+/// Unconditional LF slots per block: rows of N fields are shorter for small N.
+const fn lf_slots(n: usize) -> usize {
+    if n >= 6 { 1 } else if n >= 3 { 2 } else { 4 }
 }
 
 /// Scan `buf[start..end]` and emit every complete row in it. Returns the
@@ -158,88 +237,50 @@ fn window_rows<'b, const N: usize>(
     f: &mut impl FnMut([&'b [u8]; N]),
 ) -> usize {
     let len = buf.len();
-    let (mut nc, mut nl) = (0usize, 0usize);
-    let mut prev_s = 1u64; // a window starts at a record boundary
-    let mut odd = 0u64; // all ones after an odd count of edge quotes since the last LF
-    // The buffer's first record takes the exact path: if its first field is
-    // empty, no byte precedes it for the fast path's quote probe.
-    let mut pending = if start == 0 { POISON } else { 0 }; // poison for the next LF
-    let mut off = start;
-    while off < end {
-        let rem = end - off;
-        let rel = (off - start) as u32;
-        // SAFETY: a full block lies inside `buf`; a partial one (only at EOF)
-        // is copied into zero padding, which holds no structural byte.
-        let (c, n, q) = unsafe {
-            if rem >= 64 {
-                masks64(buf.as_ptr().add(off))
-            } else {
-                let mut tmp = [0u8; 64];
-                tmp[..rem].copy_from_slice(&buf[off..end]);
-                masks64(tmp.as_ptr())
-            }
-        };
-        let s = c | n;
-        // The byte after this block, for quotes in its last lane. EOF counts as
-        // a separator; in a partial block it sits at bit `rem`.
-        let (next_s, tail) = if rem > 64 {
-            (is_sep(buf[off + 64]), 0)
-        } else if rem == 64 {
-            (if off + 64 < len { is_sep(buf[off + 64]) } else { 1 }, 0)
-        } else {
-            (0, 1u64 << rem)
-        };
-        let near = (s << 1) | prev_s | ((s | tail) >> 1) | (next_s << 63);
-        prev_s = s >> 63;
-        let edge = q & near;
-        let par = prefix_xor(edge) ^ odd;
-        let bad = (q & !near) | (par & s);
-
-        // SAFETY: capacity is window + 80 and a window has at most `window`
-        // separators, so the unconditional writes stay in bounds.
-        unsafe { flatten(sp.add(nc), rel, s) };
-
-        // LFs: two unconditional entries, then any extras.
-        let lfs = n.count_ones() as usize;
-        let first = pending & if n != 0 { POISON } else { 0 };
-        pending &= if n != 0 { 0 } else { POISON };
-        let n1 = n & n.wrapping_sub(1);
-        // SAFETY: as for separators; a window has at most `window` LFs.
+    // A window starts at a record boundary.
+    let mut st = Scan { sp, lp, prev_s: 1, open: 0, pending: 0 };
+    // Blocks followed by a byte of `buf`. At EOF the final block, full or
+    // partial, is left for after the loop.
+    let inner = if end < len { end } else { start + (len - start - 1) / 64 * 64 };
+    // SAFETY: start <= inner <= len.
+    let (base, stop) = unsafe { (buf.as_ptr().add(start), buf.as_ptr().add(inner)) };
+    let mut p = base;
+    let mut rel = 0u32;
+    while p < stop {
+        // SAFETY: p + 64 <= stop < len (stop is the window end before EOF, or
+        // the final block's start), so the block and the byte after it lie
+        // inside `buf`. Capacity covers every slot (see rows_window).
         unsafe {
-            *lp.add(nl) = (rel + n.trailing_zeros()) | first;
-            *lp.add(nl + 1) = rel + n1.trailing_zeros();
-            if lfs > 2 {
-                let mut m = n1 & n1.wrapping_sub(1);
-                let mut j = 2;
-                while m != 0 {
-                    *lp.add(nl + j) = rel + m.trailing_zeros();
-                    m &= m - 1;
-                    j += 1;
-                }
+            let m = masks64(p);
+            let next_s = is_sep(*p.add(64));
+            st.block::<N>(rel, m, next_s, 0);
+            p = p.add(64);
+        }
+        rel += 64;
+    }
+    if end == len {
+        // EOF is a separator after the final block, inside it if partial.
+        let off = start + rel as usize;
+        let rem = len - off;
+        let mut tmp = [0u8; 64];
+        tmp[..rem].copy_from_slice(&buf[off..]);
+        let (next_s, tail) = if rem == 64 { (1, 0) } else { (0, 1u64 << rem) };
+        // SAFETY: `tmp` holds 64 bytes, zero padded: no structural byte.
+        unsafe { st.block::<N>(rel, masks64(tmp.as_ptr()), next_s, tail) };
+        if buf[len - 1] != b'\n' {
+            // EOF terminates an unterminated final record.
+            let eof = (len - start) as u32;
+            // SAFETY: at most `window` separators and LFs were listed.
+            unsafe {
+                *st.sp = eof as u16;
+                *st.lp = eof | st.pending | if st.open != 0 { POISON } else { 0 };
+                st.sp = st.sp.add(1);
+                st.lp = st.lp.add(1);
             }
         }
-        if bad != 0 {
-            (pending, odd) = poison_block(lp, nl, lfs, n, edge, odd);
-        } else {
-            // No LF here had odd parity, so the parity restarted cleanly at
-            // each one and the top bit is exact.
-            odd = ((par as i64) >> 63) as u64;
-        }
-        nc += s.count_ones() as usize;
-        nl += lfs;
-        off += 64;
     }
-    if end == len && buf[len - 1] != b'\n' {
-        // EOF terminates an unterminated final record.
-        let eof = (len - start) as u32;
-        // SAFETY: at most `window` separators and LFs were counted.
-        unsafe {
-            *sp.add(nc) = eof as u16;
-            *lp.add(nl) = eof | pending | if odd != 0 { POISON } else { 0 };
-        }
-        nc += 1;
-        nl += 1;
-    }
+    // SAFETY: both cursors only moved forward from their bases.
+    let (nc, nl) = unsafe { (st.sp.offset_from(sp) as usize, st.lp.offset_from(lp) as usize) };
     // SAFETY: nc + N <= window + 1 + 8 is within capacity. Stage 2 reads up to
     // N - 1 slots past a record's first separator, which are now initialized.
     for j in 0..N {
@@ -263,9 +304,8 @@ fn window_rows<'b, const N: usize>(
             for (i, field) in fields.iter_mut().enumerate() {
                 // SAFETY: k + i < nc, and s <= e <= len - start. The probe
                 // reads the byte before the separator: the field's last byte,
-                // or for an empty field the previous separator. The record
-                // before it ends with LF unless this is the buffer's first
-                // record, which is poisoned, so e - 1 >= -start.
+                // or for an empty field the previous separator, at worst the
+                // LF at start - 1 (start >= 1, see rows_window).
                 let e = unsafe { *sp.add(k + i) } as usize;
                 let w = (unsafe { *base.add(e).sub(1) } == b'"') as usize;
                 // SAFETY: a valid field ending in a quote is wrapped and has
@@ -313,20 +353,16 @@ fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: &[u1
     f(fields);
 }
 
-/// A block failed the quote check: poison its LFs and the record continuing
-/// past it. The parity carried out only matters for that poisoned record: an
-/// unpoisoned record always starts at an LF whose parity was checked even. It
-/// is recomputed exactly anyway so a quoted field spanning the next block
-/// boundary does not poison that block too.
+/// A block failed the quote check: poison its LFs, and return the poison for
+/// the record continuing past it.
 #[cold]
 #[inline(never)]
-fn poison_block(lp: *mut u32, nl: usize, lfs: usize, n: u64, edge: u64, odd: u64) -> (u32, u64) {
+fn poison_block(lp: *mut u32, lfs: usize) -> u32 {
     for j in 0..lfs {
-        // SAFETY: entries nl..nl + lfs were written for this block's LFs.
-        unsafe { *lp.add(nl + j) |= POISON };
+        // SAFETY: lfs entries at lp were written for this block's LFs.
+        unsafe { *lp.add(j) |= POISON };
     }
-    let flip = if n == 0 { (odd ^ edge.count_ones() as u64) & 1 } else { (((edge >> (63 - n.leading_zeros())) >> 1).count_ones() & 1) as u64 };
-    (POISON, 0u64.wrapping_sub(flip))
+    POISON
 }
 
 /// The single-stage scanner: no row-length limit.
@@ -738,6 +774,26 @@ mod tests {
     }
 
     #[test]
+    fn open_quote_state_never_leaks_into_a_valid_verdict() {
+        // A record leaving a quote open, then records whose quotes would
+        // balance it, at every offset modulo 64 and across window ends.
+        for tail in [
+            b"de\",y\n".as_slice(), b"\"de\",y\n", b"d,\"y\"\n", b"\"\",y\n", b"de\",\"y\n", b"x,y\n",
+        ] {
+            for shift in 0..130usize {
+                let mut input = Vec::new();
+                input.extend(std::iter::repeat_n(b'x', shift % 61));
+                input.extend_from_slice(b",w\n");
+                input.extend(std::iter::repeat_n(b'v', shift));
+                input.extend_from_slice(b",\"abc\n");
+                input.extend_from_slice(tail);
+                input.extend_from_slice(b"\"p\",q\n");
+                check::<2>(&input);
+            }
+        }
+    }
+
+    #[test]
     fn flatten_variants_agree() {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut masks = vec![0, 1, 1 << 63, u64::MAX, 0x8000_0000_0000_0001, 0x5555_5555_5555_5555];
@@ -749,15 +805,18 @@ mod tests {
             masks.push(state);
         }
         for m in masks {
-            let (mut a, mut b) = ([0u16; 72], [0u16; 72]);
-            // SAFETY: 72 slots cover max(8, popcount) for any mask.
-            unsafe {
-                super::flatten_tz(a.as_mut_ptr(), 4096, m);
-                super::flatten_rev(b.as_mut_ptr(), 4096, m);
+            let want: Vec<u32> = (0..64).filter(|i| m >> i & 1 == 1).map(|i| 4096 + i).collect();
+            for k in [1, 2, 4, 7, 8] {
+                let (mut a, mut b) = ([0u16; 72], [0u32; 72]);
+                // SAFETY: 72 slots cover max(k, popcount) for any mask.
+                unsafe {
+                    super::flatten_tz(a.as_mut_ptr(), 4096, m, k);
+                    super::flatten_rev(b.as_mut_ptr(), 4096, m, k);
+                }
+                let a: Vec<u32> = a[..want.len()].iter().map(|&x| x as u32).collect();
+                assert_eq!(a, want, "tz m={m:#x} k={k}");
+                assert_eq!(&b[..want.len()], &want[..], "rev m={m:#x} k={k}");
             }
-            let want: Vec<u16> = (0..64).filter(|i| m >> i & 1 == 1).map(|i| 4096 + i as u16).collect();
-            assert_eq!(&a[..want.len()], &want[..], "tz m={m:#x}");
-            assert_eq!(&b[..want.len()], &want[..], "rev m={m:#x}");
         }
     }
 

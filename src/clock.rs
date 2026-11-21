@@ -54,6 +54,20 @@ impl Clock {
         Self { days }
     }
 
+    /// `parse` for a field already known to have F1's length.
+    #[inline(always)]
+    pub(super) fn parse20(&self, b: &[u8; 20]) -> Option<i64> {
+        if b[19] != b'Z' { return epoch_ms(b); }
+        Some(self.iso::<20>(b)? * 1000)
+    }
+
+    /// `parse` for a field already known to have F2's length.
+    #[inline(always)]
+    pub(super) fn parse25(&self, b: &[u8; 25]) -> Option<i64> {
+        if !matches!(b[19], b'+' | b'-') { return epoch_ms(b); }
+        Some(self.iso::<25>(b)? * 1000)
+    }
+
     /// F1, F2 or unsigned ASCII epoch milliseconds (F3).
     #[inline(always)]
     pub(super) fn parse(&self, b: &[u8]) -> Option<i64> {
@@ -66,7 +80,7 @@ impl Clock {
 
     /// The ingest column has its own F1-only entry point. In particular an
     /// old or very late ingest still participates in dedup at its real time.
-    #[inline(always)]
+    #[cfg(test)]
     pub(super) fn ingest(&self, b: &[u8]) -> Option<i64> {
         Some(self.ingest_s(b)? * 1000)
     }
@@ -165,7 +179,7 @@ fn epoch_ms(b: &[u8]) -> Option<i64> {
 
 /// Reduce eight little-endian digit lanes (values 0..9) to one integer.
 #[inline(always)]
-fn decimal8(digits: u64) -> u64 {
+pub(super) fn decimal8(digits: u64) -> u64 {
     let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
     // Select pairs 0 and 2, then 1 and 3. In the high 32 bits the products
     // are weighted by 10^6, 10^2 and by 10^4, 1 respectively.
