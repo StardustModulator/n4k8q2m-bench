@@ -54,20 +54,6 @@ impl Clock {
         Self { days }
     }
 
-    /// `parse` for a field already known to have F1's length.
-    #[inline(always)]
-    pub(super) fn parse20(&self, b: &[u8; 20]) -> Option<i64> {
-        if b[19] != b'Z' { return epoch_ms(b); }
-        Some(self.iso::<20>(b)? * 1000)
-    }
-
-    /// `parse` for a field already known to have F2's length.
-    #[inline(always)]
-    pub(super) fn parse25(&self, b: &[u8; 25]) -> Option<i64> {
-        if !matches!(b[19], b'+' | b'-') { return epoch_ms(b); }
-        Some(self.iso::<25>(b)? * 1000)
-    }
-
     /// F1, F2 or unsigned ASCII epoch milliseconds (F3).
     #[inline(always)]
     pub(super) fn parse(&self, b: &[u8]) -> Option<i64> {
@@ -99,9 +85,7 @@ impl Clock {
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
         let day = &self.days[slot(b)];
-        let (lo, hi) = tag(b);
-        // One branch for both words: a miss is rare and goes the slow way.
-        if (day.lo ^ lo) | u64::from(day.hi ^ hi) != 0 {
+        if (day.lo, day.hi) != tag(b) {
             return uncached_iso(b);
         }
         let local = day.midnight + hms_s(word(&b[11..19]))?;

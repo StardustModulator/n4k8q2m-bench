@@ -8,71 +8,11 @@
 //!
 //! Each 64-byte block becomes three bitmasks (comma, LF, quote); quotes are
 //! never visited one by one. The window scanner checks quotes per block with
-//! bit arithmetic (see `cells_window`). The simple scanner counts them per row:
+//! bit arithmetic (see `rows_window`). The simple scanner counts them per row:
 //! a row is well quoted exactly when its total quote count equals twice the
 //! number of fields that both begin and end with a quote, since each such field
 //! holds at least two quotes, so equality forces two per wrapped field and
 //! none anywhere else.
-//!
-//! Well-formed records are handed over as `Cell`s: a base pointer and the
-//! offsets of the record's separators. Slicing a field costs a few
-//! instructions, so a decoder slices only the fields it reads, and the hot
-//! loop carries one 40-byte cell per record instead of `N` fat slices.
-
-use std::marker::PhantomData;
-
-/// A well-formed record of `N` fields: `off[i]` is the offset from `base` of
-/// the separator ending field `i` (the last one is its LF, or EOF), and
-/// `off[7]` is the offset of its first byte. Every field has either no quote
-/// or exactly two wrapping it, so a field is quoted exactly when the byte
-/// before its separator is a quote.
-#[derive(Clone, Copy)]
-pub(super) struct Cell<'b, const N: usize> {
-    base: *const u8,
-    off: [u32; 8],
-    _buf: PhantomData<&'b [u8]>,
-}
-
-impl<'b, const N: usize> Cell<'b, N> {
-    /// A placeholder for batch arrays; never read as a record.
-    pub(super) const EMPTY: Self = Self { base: std::ptr::null(), off: [0; 8], _buf: PhantomData };
-
-    /// # Safety
-    /// `off[7] <= off[0] <= ... <= off[N-1]` index `base`'s buffer, and the
-    /// byte before every separator is readable (a record never starts at
-    /// the buffer's first byte).
-    #[inline(always)]
-    unsafe fn new(base: *const u8, off: [u32; 8]) -> Self {
-        debug_assert!(N <= 7 && (0..N).all(|i| if i == 0 { off[7] <= off[0] } else { off[i - 1] < off[i] }));
-        Self { base, off, _buf: PhantomData }
-    }
-
-    /// Field `i` with its wrapping quotes, if any, removed.
-    #[inline(always)]
-    pub(super) fn field(&self, i: usize) -> &'b [u8] {
-        debug_assert!(i < N);
-        let s = if i == 0 { self.off[7] } else { self.off[i - 1] + 1 } as usize;
-        let e = self.off[i] as usize;
-        // SAFETY: by `new`, s <= e index the buffer and base[e - 1] is
-        // readable: the field's last byte, or the previous separator (never
-        // a quote) when the field is empty. A field ending in a quote is
-        // wrapped, so it has two or more bytes.
-        unsafe {
-            let w = usize::from(*self.base.add(e - 1) == b'"');
-            std::slice::from_raw_parts(self.base.add(s + w), e - s - 2 * w)
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn fields(&self) -> [&'b [u8]; N] {
-        let mut fields = [&[][..]; N];
-        for (i, f) in fields.iter_mut().enumerate() {
-            *f = self.field(i);
-        }
-        fields
-    }
-
-}
 
 /// Call `f` for every well-formed record containing exactly `N` fields.
 ///
@@ -80,42 +20,8 @@ impl<'b, const N: usize> Cell<'b, N> {
 /// the end of a final unterminated record. Empty fields are returned as empty
 /// slices, and syntactic quotes are removed from returned quoted fields.
 #[inline]
-pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], mut f: impl FnMut([&'b [u8]; N])) {
-    // The first record may start at byte 0, which cells never do.
-    let start = memchr::memchr(b'\n', buf).map_or(buf.len(), |i| i + 1);
-    if let Some(fields) = first_record::<N>(&buf[..start]) {
-        f(fields);
-    }
-    cells::<N>(buf, start, buf.len(), |c| f(c.fields()));
-}
-
-/// Emit the well-formed `N`-field records of `buf[start..end]`. `start` is a
-/// record boundary at or after byte 1, so a separator is always preceded by
-/// a readable byte. `end` is `buf.len()` or the offset just past an LF.
-#[inline]
-pub(super) fn cells<'b, const N: usize>(buf: &'b [u8], start: usize, end: usize, f: impl FnMut(Cell<'b, N>)) {
-    cells_window::<N>(buf, start, end, WINDOW, f);
-}
-
-/// The record `line` (without its LF), split and checked byte by byte.
-#[cold]
-#[inline(never)]
-fn first_record<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let mut fields = [&line[..0]; N];
-    let mut count = 0usize;
-    for raw in line.split(|&b| b == b',') {
-        if count == N {
-            return None;
-        }
-        fields[count] = match raw.iter().filter(|&&b| b == b'"').count() {
-            0 => raw,
-            2 if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' => &raw[1..raw.len() - 1],
-            _ => return None,
-        };
-        count += 1;
-    }
-    (count == N && !line.is_empty()).then_some(fields)
+pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], f: impl FnMut([&'b [u8]; N])) {
+    rows_window::<N>(buf, WINDOW, f);
 }
 
 /// Bytes per two-stage window. A multiple of 64 so only the input's final
@@ -154,28 +60,26 @@ const NONE: u16 = u16::MAX;
 /// Every other record has valid quotes, so its field is quoted exactly when
 /// its last byte is a quote.
 #[inline]
-pub(super) fn cells_window<'b, const N: usize>(buf: &'b [u8], mut start: usize, len: usize, window: usize,
-                                                mut f: impl FnMut(Cell<'b, N>)) {
+pub(super) fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, mut f: impl FnMut([&'b [u8]; N])) {
     debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
-    if start >= len {
-        return;
-    }
-    assert!(N <= 7 && start >= 1 && len <= buf.len());
-    debug_assert!(buf[start - 1] == b'\n');
-    // Zeroed, with slack for the unconditional writes, the EOF entry and the
-    // sentinels: stage 2 copies eight slots per record, some past its own.
-    let mut stops: Vec<u16> = vec![0; window + 80];
-    let mut lines: Vec<u32> = vec![0; window + 80];
+    let len = buf.len();
+    // Slack for the unconditional writes, the EOF entry and the sentinels.
+    let mut stops: Vec<u16> = Vec::with_capacity(window + 80);
+    let mut lines: Vec<u32> = Vec::with_capacity(window + 80);
+    // The first record goes to the simple scanner. Every window then starts
+    // just after an LF, which the fast path's quote probe may read.
+    let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
+    rows_simple::<N>(&buf[..start], &mut f);
     while start < len {
         let end = (start + window).min(len);
-        let next = window_rows::<N>(buf, start, end, len, stops.as_mut_ptr(), lines.as_mut_ptr(), &mut f);
+        let next = window_rows::<N>(buf, start, end, stops.as_mut_ptr(), lines.as_mut_ptr(), &mut f);
         if next > start {
             start = next;
         } else {
             // A full window without LF: one long row. Hand it to the simple
             // scanner, which has no length limit.
-            let stop = memchr::memchr(b'\n', &buf[end..len]).map_or(len, |i| end + i + 1);
-            rows_simple::<N>(buf, start, stop, &mut f);
+            let stop = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i + 1);
+            rows_simple::<N>(&buf[start..stop], &mut f);
             start = stop;
         }
     }
@@ -321,32 +225,31 @@ const fn lf_slots(n: usize) -> usize {
     if n >= 6 { 1 } else if n >= 3 { 2 } else { 4 }
 }
 
-/// Scan `buf[start..end]` and emit every complete row in it; `len` is where
-/// the records end (EOF). Returns the offset just past the last complete row,
-/// or `start` if there was none.
+/// Scan `buf[start..end]` and emit every complete row in it. Returns the
+/// offset just past the last complete row, or `start` if there was none.
 #[inline(always)]
 fn window_rows<'b, const N: usize>(
     buf: &'b [u8],
     start: usize,
     end: usize,
-    len: usize,
     sp: *mut u16,
     lp: *mut u32,
-    f: &mut impl FnMut(Cell<'b, N>),
+    f: &mut impl FnMut([&'b [u8]; N]),
 ) -> usize {
+    let len = buf.len();
     // A window starts at a record boundary.
     let mut st = Scan { sp, lp, prev_s: 1, open: 0, pending: 0 };
-    // Blocks followed by a byte of the records. At EOF the final block, full
-    // or partial, is left for after the loop.
+    // Blocks followed by a byte of `buf`. At EOF the final block, full or
+    // partial, is left for after the loop.
     let inner = if end < len { end } else { start + (len - start - 1) / 64 * 64 };
-    // SAFETY: start <= inner <= len <= buf.len().
+    // SAFETY: start <= inner <= len.
     let (base, stop) = unsafe { (buf.as_ptr().add(start), buf.as_ptr().add(inner)) };
     let mut p = base;
     let mut rel = 0u32;
     while p < stop {
         // SAFETY: p + 64 <= stop < len (stop is the window end before EOF, or
         // the final block's start), so the block and the byte after it lie
-        // inside `buf`. Capacity covers every slot (see cells_window).
+        // inside `buf`. Capacity covers every slot (see rows_window).
         unsafe {
             let m = masks64(p);
             let next_s = is_sep(*p.add(64));
@@ -360,7 +263,7 @@ fn window_rows<'b, const N: usize>(
         let off = start + rel as usize;
         let rem = len - off;
         let mut tmp = [0u8; 64];
-        tmp[..rem].copy_from_slice(&buf[off..len]);
+        tmp[..rem].copy_from_slice(&buf[off..]);
         let (next_s, tail) = if rem == 64 { (1, 0) } else { (0, 1u64 << rem) };
         // SAFETY: `tmp` holds 64 bytes, zero padded: no structural byte.
         unsafe { st.block::<N>(rel, masks64(tmp.as_ptr()), next_s, tail) };
@@ -378,31 +281,39 @@ fn window_rows<'b, const N: usize>(
     }
     // SAFETY: both cursors only moved forward from their bases.
     let (nc, nl) = unsafe { (st.sp.offset_from(sp) as usize, st.lp.offset_from(lp) as usize) };
-    // SAFETY: nc + 8 <= window + 1 + 8 is within capacity. Stage 2 reads up to
-    // 7 slots past a record's first separator, which are now initialized.
-    for j in 0..8 {
+    // SAFETY: nc + N <= window + 1 + 8 is within capacity. Stage 2 reads up to
+    // N - 1 slots past a record's first separator, which are now initialized.
+    for j in 0..N {
         unsafe { *sp.add(nc + j) = NONE };
     }
     // SAFETY: entries 0..nl were initialized above.
     let lines = unsafe { std::slice::from_raw_parts(lp, nl) };
+    // SAFETY: start < len.
+    let base = unsafe { buf.as_ptr().add(start) };
 
     let mut row = 0usize; // window offset of the record's first byte
     let mut k = 0usize; // index of the record's first separator
     for &line in lines {
         let lf = (line & !POISON) as usize;
         // SAFETY: k <= nc (each record's separators end at its own LF, which
-        // is a separator), so k + 7 < nc + 8 is initialized.
+        // is a separator), so k + N - 1 < nc + N is initialized.
         let fast = unsafe { *sp.add(k + N - 1) } as usize == lf && line & POISON == 0;
         if fast {
-            // SAFETY: as above; `sp` is 2-aligned, so the eight-slot read is
-            // an aligned [u16; 8] read.
-            let ends = unsafe { *sp.add(k).cast::<[u16; 8]>() };
-            let mut off = ends.map(u32::from);
-            off[7] = row as u32;
-            // SAFETY: the record's separators ascend from `row` to its LF
-            // within the window, and base[-1] is the LF before the window
-            // (start >= 1) or a byte of the window.
-            f(unsafe { Cell::new(base, off) });
+            let mut fields = [&buf[..0]; N];
+            let mut s = row;
+            for (i, field) in fields.iter_mut().enumerate() {
+                // SAFETY: k + i < nc, and s <= e <= len - start. The probe
+                // reads the byte before the separator: the field's last byte,
+                // or for an empty field the previous separator, at worst the
+                // LF at start - 1 (start >= 1, see rows_window).
+                let e = unsafe { *sp.add(k + i) } as usize;
+                let w = (unsafe { *base.add(e).sub(1) } == b'"') as usize;
+                // SAFETY: a valid field ending in a quote is wrapped and has
+                // two or more bytes.
+                *field = unsafe { std::slice::from_raw_parts(base.add(s + w), e - s - 2 * w) };
+                s = e + 1;
+            }
+            f(fields);
             k += N;
         } else {
             // SAFETY: every LF entry is also a separator entry at or after k.
@@ -413,7 +324,7 @@ fn window_rows<'b, const N: usize>(
             if j - k == N - 1 {
                 // SAFETY: entries k..=j were initialized in stage 1.
                 let ends = unsafe { std::slice::from_raw_parts(sp.add(k), N) };
-                exact::<N>(buf, start, row, ends, f);
+                exact::<N>(buf, start, start + row, ends, f);
             }
             k = j + 1;
         }
@@ -422,27 +333,24 @@ fn window_rows<'b, const N: usize>(
     (start + row).min(len)
 }
 
-/// Check a poisoned record byte by byte and emit it if well formed. `row`
-/// and `ends` (its N separator offsets) are relative to `start`.
+/// Check a poisoned record byte by byte and emit it if well formed. `ends`
+/// holds its N separator offsets relative to `start`.
 #[cold]
 #[inline(never)]
-fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: &[u16], f: &mut impl FnMut(Cell<'b, N>)) {
-    let mut s = start + row;
-    let mut off = [0u32; 8];
-    for (i, &e) in ends.iter().enumerate() {
+fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: &[u16], f: &mut impl FnMut([&'b [u8]; N])) {
+    let mut fields = [&buf[..0]; N];
+    let mut s = row;
+    for (field, &e) in fields.iter_mut().zip(ends) {
         let e = start + e as usize;
         let raw = &buf[s..e];
-        let quotes = raw.iter().filter(|&&b| b == b'"').count();
-        if !(quotes == 0 || (quotes == 2 && raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"')) {
-            return;
-        }
-        off[i] = e as u32;
+        *field = match raw.iter().filter(|&&b| b == b'"').count() {
+            0 => raw,
+            2 if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' => &raw[1..raw.len() - 1],
+            _ => return,
+        };
         s = e + 1;
     }
-    off[7] = (start + row) as u32;
-    // SAFETY: offsets ascend from the record's first byte, which is at or
-    // after byte 1 of `buf`, to its LF or EOF, all inside `buf`.
-    f(unsafe { Cell::new(buf.as_ptr(), off) });
+    f(fields);
 }
 
 /// A block failed the quote check: poison its LFs, and return the poison for
@@ -457,37 +365,37 @@ fn poison_block(lp: *mut u32, lfs: usize) -> u32 {
     POISON
 }
 
-/// The single-stage scanner: no row-length limit. Scans `buf[start..end]`,
-/// `start >= 1` being a record boundary.
+/// The single-stage scanner: no row-length limit.
 #[inline]
-fn rows_simple<'b, const N: usize>(buf: &'b [u8], start: usize, end: usize, mut f: impl FnMut(Cell<'b, N>)) {
-    debug_assert!((2..=7).contains(&N) && start >= 1 && end <= buf.len());
-    if start >= end {
+fn rows_simple<'b, const N: usize>(buf: &'b [u8], mut f: impl FnMut([&'b [u8]; N])) {
+    debug_assert!((2..=8).contains(&N));
+    let len = buf.len();
+    if len == 0 {
         return;
     }
-    let mut st = Rows::<N> { ends: [0; 8], cnt: 0, row_start: start, qrow: 0, qbase: 0 };
-    let mut at = start;
-    while end - at >= 64 {
+    let mut st = Rows::<N> { ends: [0; 8], cnt: 0, row_start: 0, qrow: 0, qbase: 0 };
+    let mut at = 0usize;
+    while len - at >= 64 {
         // SAFETY: the loop condition keeps all 64 bytes inside `buf`.
         let (c, n, q) = unsafe { masks64(buf.as_ptr().add(at)) };
         st.block(buf, at, c, n, q, &mut f);
         at += 64;
     }
-    let tail_nl = buf[end - 1] != b'\n';
-    if at < end {
+    let tail_nl = buf[len - 1] != b'\n';
+    if at < len {
         // Zero bytes are not structural, so padding adds no bits.
         let mut tmp = [0u8; 64];
-        tmp[..end - at].copy_from_slice(&buf[at..end]);
+        tmp[..len - at].copy_from_slice(&buf[at..]);
         // SAFETY: `tmp` holds exactly 64 bytes.
         let (c, mut n, q) = unsafe { masks64(tmp.as_ptr()) };
         if tail_nl {
             // EOF terminates an unterminated final record.
-            n |= 1u64 << (end - at);
+            n |= 1u64 << (len - at);
         }
         st.block(buf, at, c, n, q, &mut f);
     } else if tail_nl {
         let rowq = st.qbase - st.qrow;
-        st.finish(buf, end, rowq, &mut f);
+        st.finish(buf, len, rowq, &mut f);
     }
 }
 
@@ -511,7 +419,7 @@ impl<const N: usize> Rows<N> {
 
     #[inline(always)]
     fn block<'b>(&mut self, buf: &'b [u8], base: usize, mut c: u64, mut n: u64, q: u64,
-                 f: &mut impl FnMut(Cell<'b, N>)) {
+                 f: &mut impl FnMut([&'b [u8]; N])) {
         while n != 0 {
             let bit = n.trailing_zeros();
             let below = (1u64 << bit) - 1;
@@ -528,25 +436,28 @@ impl<const N: usize> Rows<N> {
 
     /// Close the record whose terminator (LF or EOF) is at `end`.
     #[inline(always)]
-    fn finish<'b>(&mut self, buf: &'b [u8], end: usize, rowq: u32, f: &mut impl FnMut(Cell<'b, N>)) {
+    fn finish<'b>(&mut self, buf: &'b [u8], end: usize, rowq: u32, f: &mut impl FnMut([&'b [u8]; N])) {
         if self.cnt == N - 1 {
+            let last = buf.len() - 1;
+            let mut fields = [&buf[..0]; N];
             let mut wrapped = 0u32;
             let mut s = self.row_start;
-            let mut off = [0u32; 8];
-            for i in 0..N {
+            for (i, field) in fields.iter_mut().enumerate() {
                 let e = if i == N - 1 { end } else { self.ends[i] };
-                debug_assert!(s <= e && e <= buf.len() && s >= 1);
-                // A quoted field has two or more bytes; `s >= 1` keeps the
-                // byte before an empty field's separator in bounds.
-                wrapped += 2 * u32::from(e - s >= 2 && buf[s] == b'"' && buf[e - 1] == b'"');
-                off[i] = e as u32;
+                debug_assert!(s <= e && e <= buf.len());
+                // SAFETY: both indexes are clamped into a non-empty `buf`.
+                let (first, final_) = unsafe {
+                    (*buf.get_unchecked(s.min(last)), *buf.get_unchecked(e.saturating_sub(1)))
+                };
+                let w = ((e - s >= 2) & (first == b'"') & (final_ == b'"')) as usize;
+                // SAFETY: separators are visited in increasing order, so
+                // `s <= e`, and `w` is 1 only when the field has 2+ bytes.
+                *field = unsafe { buf.get_unchecked(s + w..e - w) };
+                wrapped += 2 * w as u32;
                 s = e + 1;
             }
-            off[7] = self.row_start as u32;
             if wrapped == rowq {
-                // SAFETY: separators were visited in increasing order from
-                // the record's first byte (>= 1) to `end <= buf.len()`.
-                f(unsafe { Cell::new(buf.as_ptr(), off) });
+                f(fields);
             }
         }
         self.cnt = 0;
@@ -620,7 +531,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cells_window, rows, rows_simple};
+    use super::{rows, rows_simple, rows_window};
 
     fn reference<'b, const N: usize>(buf: &'b [u8], mut emit: impl FnMut([&'b [u8]; N])) {
         fn line<'b, const N: usize>(line: &'b [u8]) -> Option<[&'b [u8]; N]> {
@@ -678,18 +589,12 @@ mod tests {
         out
     }
 
-    /// The cell scanners need a record boundary at or after byte 1: scan the
-    /// input behind one LF.
     fn check<const N: usize>(buf: &[u8]) {
         let want = owned::<N>(buf, false);
         assert_eq!(owned::<N>(buf, true), want, "input={buf:?}");
-        let mut led = vec![b'\n'];
-        led.extend_from_slice(buf);
-        let simple = collect::<N>(&led, |b, f| rows_simple::<N>(b, 1, b.len(), |c| f(c.fields())));
-        assert_eq!(simple, want, "simple input={buf:?}");
+        assert_eq!(collect::<N>(buf, |b, f| rows_simple::<N>(b, f)), want, "simple input={buf:?}");
         for window in [64, 128, 192, 256] {
-            let got = collect::<N>(&led, |b, f| cells_window::<N>(b, 1, b.len(), window, |c| f(c.fields())));
-            assert_eq!(got, want, "window={window} input={buf:?}");
+            assert_eq!(collect::<N>(buf, |b, f| rows_window::<N>(b, window, f)), want, "window={window} input={buf:?}");
         }
     }
 
