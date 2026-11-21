@@ -409,7 +409,7 @@ impl Acc {
         }
         self.touched.clear();
         let mut mask = 0u64;
-        if clicks.is_empty() {
+        if clicks.is_empty() || clicks.len() < 1_000_000 {
             for i in 0..ns {
                 let d = day_index(self.starts[i]);
                 let cents = self.cents[i];
