@@ -72,7 +72,7 @@ impl<'b, const N: usize> Fields<'b, N> {
 /// block is ever partial. Stage 2 rereads the window, so it and its lists
 /// (about 12 KiB) should stay in L1 next to the caller's own data; on M1 8 to
 /// 32 KiB measure the same.
-pub(super) const WINDOW: usize = 1 << 13;
+pub(super) const WINDOW: usize = 1 << 11;
 /// Set on a line entry whose record must take the exact path.
 pub(super) const POISON: u32 = 1 << 31;
 const ONES: u64 = 0x0101_0101_0101_0101;
