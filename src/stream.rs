@@ -60,8 +60,8 @@ fn sized<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
-/// Bytes of staged rows per bin: two cache lines.
-const STAGE: usize = 128;
+/// Bytes of staged rows per bin: one cache line.
+const STAGE: usize = 64;
 
 /// Rows bound for one bin gather in a two-line buffer and move to its vector
 /// together. A row then costs one write into a small resident area; the far
