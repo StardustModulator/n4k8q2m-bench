@@ -36,10 +36,11 @@ pub(super) struct Scratch {
     ids: Vec<u32>,
     ev: Vec<u64>,
     cl: Vec<Hit>,
+    /// Persons in the previous bin: bins are alike, so it sizes the table.
+    persons: usize,
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
-
 // Within a person shard the table and cursors fit in private caches: number
 // every row by its person's slot, count, then scatter each person's events
 // and clicks together. Neither events nor clicks get sorted (see `aggregate`).
@@ -50,8 +51,11 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     if ne == 0 { return; }
     let nc = parts.iter().map(|p| p.cl.len()).sum::<usize>();
     let t0 = Instant::now();
-    let mut bits = (ne / 8).max(64).next_power_of_two().trailing_zeros();
     let mut sc = std::mem::take(&mut acc.scratch);
+    // Half-full at the previous bin's person count (events over 16 for the
+    // first); a fuller table doubles below. Smaller tables stay in cache.
+    let est = if sc.persons == 0 { ne / 16 } else { sc.persons };
+    let mut bits = (est * 2).max(64).next_power_of_two().trailing_zeros();
     // Person numbers go to a reused array rather than into the parts, which
     // stay clean and are only read twice. A table that fills up is doubled
     // and the pass redone; the numbers so far are simply overwritten.
@@ -94,9 +98,11 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     }
     let t2 = Instant::now();
     let (mut e0, mut c0) = (0, 0);
+    let mut persons = 0;
     for p in &mut slots {
         let (e1, c1) = (p.ev as usize, p.cl as usize);
         if e1 > e0 {
+            persons += 1;
             acc.person(p.key, &mut ev[e0..e1], &mut cl[c0..c1], cats, slow, first_day);
         }
         e0 = e1; c0 = c1;
@@ -104,6 +110,7 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         *p = Slot::default();
     }
     sc.slots = slots;
+    sc.persons = persons;
     acc.scratch = sc;
     let t3 = Instant::now();
     #[cfg(test)]
@@ -125,25 +132,29 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
     let mut room = mask / 4 * 3;
     let (ev_ids, cl_ids) = ids.split_at_mut(parts.iter().map(|p| p.ev.len()).sum());
     let mut out = ev_ids.iter_mut();
-    for e in parts.iter().flat_map(|p| &p.ev) {
-        let key = e.key;
-        let s = (key.wrapping_mul(MUL) >> shift) as usize;
-        // A key sits in its home slot or the next one unless its run is
-        // long; only those and new keys take the probing path.
-        // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
-        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-        // SAFETY: as above; probe returns a slot <= mask.
-        if unsafe { slots.get_unchecked(id) }.key != key {
-            id = probe(slots, key, s, mask);
-            if slots[id].key == 0 {
-                if room == 0 { return false; }
-                room -= 1;
-                slots[id].key = key;
+    let home = |key: u64| (key.wrapping_mul(MUL) >> shift) as usize;
+    for p in parts {
+        let ev = &p.ev[..];
+        for e in ev.iter() {
+            let key = e.key;
+            let s = home(key);
+            // A key sits in its home slot or the next one unless its run is
+            // long; only those and new keys take the probing path.
+            // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
+            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+            // SAFETY: as above; probe returns a slot <= mask.
+            if unsafe { slots.get_unchecked(id) }.key != key {
+                id = probe(slots, key, s, mask);
+                if slots[id].key == 0 {
+                    if room == 0 { return false; }
+                    room -= 1;
+                    slots[id].key = key;
+                }
             }
+            // SAFETY: id <= mask + 1 < slots.len().
+            unsafe { slots.get_unchecked_mut(id) }.ev += 1;
+            if let Some(o) = out.next() { *o = id as u32; }
         }
-        // SAFETY: id <= mask + 1 < slots.len().
-        unsafe { slots.get_unchecked_mut(id) }.ev += 1;
-        if let Some(o) = out.next() { *o = id as u32; }
     }
     let mut out = cl_ids.iter_mut();
     for c in parts.iter().flat_map(|p| &p.cl) {
