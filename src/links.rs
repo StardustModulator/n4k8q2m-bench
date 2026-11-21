@@ -1,60 +1,41 @@
-//! Exact linked-id resolution. Endpoints are interned in hash-owned shards,
-//! connected in parallel with an atomic disjoint set, and the shard tables are
-//! then reused as the immutable key -> component-minimum lookup.
+//! Exact linked-id resolution. Link endpoints are interned per hash
+//! partition, joined by a lock-free disjoint set whose roots are always their
+//! component's bytewise-smallest id, and every id named by another id lands
+//! in one flat table laid out in hash order.
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 use super::stream::hash;
 use super::{SlowIntern, cmp_keys};
 
+/// One renamed id. `hash` is `stream::hash(key)`, a bijection with
+/// hash(0) == 0: it identifies the key, and zero marks an empty slot.
 #[derive(Clone, Copy, Default)]
-struct Entry {
-    key: u64,
-    // During construction this is a shard-local dense index. In the finished
-    // index it is the bytewise-smallest key in `key`'s component.
-    value: u64,
+struct Slot {
+    hash: u64,
+    name: u64,
 }
 
-struct Shard {
-    table: Box<[Entry]>,
-    mask: usize,
-    base: usize,
-}
+/// Slots a lookup compares at once, without branching.
+const WINDOW: usize = 4;
 
-impl Shard {
-    #[inline(always)]
-    fn slot(&self, key: u64, mixed: u64) -> usize {
-        let mut at = mixed as usize & self.mask;
-        loop {
-            let stored = self.table[at].key;
-            if stored == 0 || stored == key {
-                return at;
-            }
-            at = (at + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    fn local_index(&self, key: u64, mixed: u64) -> u32 {
-        let entry = self.table[self.slot(key, mixed)];
-        debug_assert_eq!(entry.key, key);
-        entry.value as u32
-    }
-}
-
-struct BuiltShard {
-    shard: Shard,
-    keys: Vec<u64>,
-}
-
-/// Immutable exact lookup over every ID cited by a valid link.
+/// Immutable id -> name lookup. Only ids named by another id are stored:
+/// absent ids and component minima both resolve to themselves.
 pub(super) struct Aliases {
-    shards: Box<[Shard]>,
-    shard_mask: usize,
-    shard_shift: u32,
+    // Robin Hood layout: hashes descend along the table and each key sits at
+    // or after its home. Homes rise with the top hash bits, so one user bin
+    // reads one contiguous stretch, and a window whose last hash is not
+    // above the query's (holes are zero) decides the lookup.
+    table: Box<[Slot]>,
+    cap: u64,
+}
+
+#[inline(always)]
+fn home(h: u64, cap: u64) -> usize {
+    ((u128::from(!h) * u128::from(cap)) >> 64) as usize
 }
 
 impl Aliases {
@@ -63,387 +44,319 @@ impl Aliases {
     #[inline(always)]
     pub(super) fn resolve(&self, k: u64) -> u64 {
         debug_assert_ne!(k, 0);
-        let mixed = hash(k);
-        let shard = &self.shards[shard_of(mixed, self.shard_mask, self.shard_shift)];
-        if shard.table.is_empty() {
-            return k;
+        let h = hash(k);
+        let at = home(h, self.cap);
+        // SAFETY: `at < cap` (or 0 when cap is 0), and the table always holds
+        // at least `cap + WINDOW` slots.
+        let w = unsafe { &*self.table.as_ptr().add(at).cast::<[Slot; WINDOW]>() };
+        let mut name = k;
+        for s in w {
+            name = if s.hash == h { s.name } else { name };
         }
-        let mut at = mixed as usize & shard.mask;
+        if w[WINDOW - 1].hash > h {
+            return self.far(h, at + WINDOW, k);
+        }
+        name
+    }
+
+    // Long clusters only: continue the scan past the window.
+    #[cold]
+    #[inline(never)]
+    fn far(&self, h: u64, mut at: usize, k: u64) -> u64 {
+        // The table ends with WINDOW holes, so the scan stops in bounds.
         loop {
-            let entry = shard.table[at];
-            if entry.key == k {
-                return entry.value;
+            let s = self.table[at];
+            if s.hash == h {
+                return s.name;
             }
-            if entry.key == 0 {
+            if s.hash < h {
                 return k;
             }
-            at = (at + 1) & shard.mask;
+            at += 1;
         }
     }
+}
+
+/// Robin Hood insertion into `slots`, which starts at table index `offset`.
+/// Returns the element that would leave the slice: the caller places it
+/// later, when the following slice is no longer being written.
+#[inline]
+fn place(slots: &mut [Slot], offset: usize, cap: u64, mut e: Slot) -> Option<Slot> {
+    let mut at = home(e.hash, cap) - offset;
+    while at < slots.len() {
+        let s = slots[at];
+        if s.hash < e.hash {
+            slots[at] = e;
+            if s.hash == 0 {
+                return None;
+            }
+            e = s;
+        }
+        at += 1;
+    }
+    Some(e)
 }
 
 #[inline(always)]
-fn shard_of(mixed: u64, mask: usize, shift: u32) -> usize {
-    (mixed >> shift) as usize & mask
+fn part_of(h: u64, parts: usize) -> usize {
+    ((u128::from(h) * parts as u128) >> 64) as usize
 }
 
-fn bins<T>(n: usize, capacity: usize) -> Vec<Vec<T>> {
-    (0..n).map(|_| Vec::with_capacity(capacity)).collect()
-}
-
-fn make_shard(inputs: Vec<Vec<u64>>) -> BuiltShard {
-    let occurrences = inputs.iter().map(Vec::len).sum::<usize>();
-    if occurrences == 0 {
-        return BuiltShard {
-            shard: Shard { table: Box::new([]), mask: 0, base: 0 },
-            keys: Vec::new(),
-        };
+/// Follow parents with path halving. `link[x]` holds `x ^ parent(x)`, so
+/// zero (fresh zeroed memory) is a root. Parents only ever move to smaller
+/// keys, so a stale relaxed load still points at an ancestor.
+#[inline(always)]
+fn root(link: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = x ^ link[x as usize].load(Relaxed);
+        if p == x {
+            return x;
+        }
+        let g = p ^ link[p as usize].load(Relaxed);
+        if g != p {
+            link[x as usize].store(x ^ g, Relaxed);
+        }
+        x = g;
     }
+}
 
-    // Unique endpoints cannot outnumber occurrences. Keep at least 25% of
-    // the table empty even when every endpoint is unique, so failed queries
-    // always terminate and successful probes remain short.
-    let needed = occurrences
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(2))
-        .map(|n| n / 3)
-        .expect("too many link endpoints");
-    let capacity = needed
-        .max(2)
-        .checked_next_power_of_two()
-        .expect("link endpoint table is too large");
-    let mut table = vec![Entry::default(); capacity].into_boxed_slice();
-    let mask = capacity - 1;
-    let mut keys = Vec::with_capacity(occurrences.min(capacity * 3 / 4));
+/// Lock-free union. The root with the larger key becomes a child of the
+/// other, so every parent has a smaller key than its child: concurrent links
+/// cannot form a cycle, and each root is its component's minimum. Returns
+/// whether this call linked two roots.
+#[inline(always)]
+fn unite(link: &[AtomicU32], keys: &[u64], slow: &SlowIntern, mut a: u32, mut b: u32) -> bool {
+    loop {
+        a = root(link, a);
+        b = root(link, b);
+        if a == b {
+            return false;
+        }
+        let (lo, hi) = if cmp_keys(keys[a as usize], keys[b as usize], slow) == Ordering::Less {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        if link[hi as usize].compare_exchange(0, hi ^ lo, Relaxed, Relaxed).is_ok() {
+            return true;
+        }
+    }
+}
 
-    for input in inputs {
-        for key in input {
-            debug_assert_ne!(key, 0);
-            let mut at = hash(key) as usize & mask;
+/// Intern one partition's endpoint occurrences in place: each key becomes
+/// its partition-local index. Returns the distinct keys in index order.
+fn intern(bins: &mut [Vec<u64>], seen: &mut Vec<u64>, index: &mut Vec<u32>) -> Vec<u64> {
+    let occurrences = bins.iter().map(Vec::len).sum::<usize>();
+    let cap = (occurrences * 2).next_power_of_two().max(16);
+    if seen.len() < cap {
+        seen.resize(cap, 0);
+        index.resize(cap, 0);
+    }
+    let mask = cap - 1;
+    let mut keys = Vec::with_capacity(occurrences);
+    for bin in bins {
+        for x in bin.iter_mut() {
+            let k = *x;
+            debug_assert_ne!(k, 0);
+            let mut at = hash(k) as usize & mask;
             loop {
-                let entry = table[at];
-                if entry.key == key {
+                let s = seen[at];
+                if s == k {
+                    *x = u64::from(index[at]);
                     break;
                 }
-                if entry.key == 0 {
-                    let local = u32::try_from(keys.len()).expect("too many aliases in one shard");
-                    table[at] = Entry { key, value: u64::from(local) };
-                    keys.push(key);
+                if s == 0 {
+                    seen[at] = k;
+                    index[at] = keys.len() as u32;
+                    *x = keys.len() as u64;
+                    keys.push(k);
                     break;
                 }
                 at = (at + 1) & mask;
             }
         }
     }
-
-    BuiltShard {
-        shard: Shard { table, mask, base: 0 },
-        keys,
-    }
+    seen[..cap].fill(0);
+    keys
 }
 
-#[inline(always)]
-fn index_of(shards: &[Shard], shard_mask: usize, shard_shift: u32, key: u64) -> u32 {
-    let mixed = hash(key);
-    let shard = &shards[shard_of(mixed, shard_mask, shard_shift)];
-    let local = shard.local_index(key, mixed) as usize;
-    u32::try_from(shard.base + local).expect("too many linked aliases")
+/// Hand out jobs to `workers` threads; each job is taken exactly once.
+fn each<J: Send, S: Send>(jobs: Vec<J>, workers: usize, init: impl Fn() -> S + Sync, run: impl Fn(&mut S, J) + Sync) -> Vec<S> {
+    let queue = Mutex::new(jobs.into_iter());
+    thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut s = init();
+                    loop {
+                        let job = queue.lock().unwrap().next();
+                        match job {
+                            Some(j) => run(&mut s, j),
+                            None => break,
+                        }
+                    }
+                    s
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
-/// Follow parents with opportunistic path splitting. Parent priorities only
-/// decrease, so a relaxed load can be stale but can never point back upward.
-#[inline(always)]
-fn atomic_root(parent: &[AtomicU32], mut node: u32) -> u32 {
-    loop {
-        let p = parent[node as usize].load(AtomicOrdering::Relaxed);
-        if p == node {
-            return node;
-        }
-        let grand = parent[p as usize].load(AtomicOrdering::Relaxed);
-        if grand != p {
-            let _ = parent[node as usize].compare_exchange_weak(
-                p,
-                grand,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            );
-        }
-        node = p;
-    }
-}
-
-#[inline(always)]
-fn priority_before(priority: &[u64], a: u32, b: u32) -> bool {
-    priority[a as usize] < priority[b as usize]
-        || (priority[a as usize] == priority[b as usize] && a < b)
-}
-
-/// Lock-free union using one immutable total priority per vertex. Every
-/// successful parent CAS points to a strictly lower priority. Consequently
-/// concurrent unions cannot form a cycle, even if the chosen winner ceases to
-/// be a root before the CAS. Uniform mixed priorities give logarithmic trees
-/// without a separately contended rank/size word.
-#[inline(always)]
-fn atomic_union(parent: &[AtomicU32], priority: &[u64], mut a: u32, mut b: u32) {
-    loop {
-        a = atomic_root(parent, a);
-        b = atomic_root(parent, b);
-        if a == b {
-            return;
-        }
-        let (winner, loser) = if priority_before(priority, a, b) { (a, b) } else { (b, a) };
-        if parent[loser as usize]
-            .compare_exchange_weak(
-                loser,
-                winner,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            )
-            .is_ok()
-        {
-            return;
-        }
-    }
-}
-
-#[inline(always)]
-fn update_minimum(best: &[AtomicU32], root: u32, candidate: u32, keys: &[u64], slow: &SlowIntern) {
-    let cell = &best[root as usize];
-    let mut old = cell.load(AtomicOrdering::Relaxed);
-    loop {
-        if old != u32::MAX
-            && cmp_keys(keys[candidate as usize], keys[old as usize], slow) != Ordering::Less
-        {
-            return;
-        }
-        match cell.compare_exchange_weak(
-            old,
-            candidate,
-            AtomicOrdering::Relaxed,
-            AtomicOrdering::Relaxed,
-        ) {
-            Ok(_) => return,
-            Err(now) => old = now,
-        }
-    }
-}
-
-/// Build an exact resolver from link endpoints only. Work is sharded by the
-/// high bits of the uniformly mixed key: endpoint interning and final table
-/// construction have one owner per shard, while connectivity is resolved in
-/// parallel over the original edge parts.
+/// Build an exact resolver from link endpoints only.
 pub(super) fn build(
     parts: Vec<Vec<(u64, u64)>>,
     slow: &SlowIntern,
     threads: usize,
     user_bins: usize,
 ) -> Aliases {
+    let _ = user_bins;
     let edge_count = parts.iter().map(Vec::len).sum::<usize>();
     if edge_count == 0 {
-        return Aliases {
-            shards: vec![Shard { table: Box::new([]), mask: 0, base: 0 }].into_boxed_slice(),
-            shard_mask: 0,
-            shard_shift: 0,
-        };
+        return Aliases { table: vec![Slot::default(); WINDOW].into_boxed_slice(), cap: 0 };
+    }
+    // Thread start-up costs more than a few thousand edges.
+    let workers = threads.clamp(1, edge_count.div_ceil(1 << 13));
+    let np = (edge_count / 2048).next_power_of_two().clamp(1, 512);
+
+    // Each worker owns one contiguous run of the edges, cut across parts.
+    let per = edge_count.div_ceil(workers);
+    let mut spans: Vec<Vec<&[(u64, u64)]>> = (0..workers).map(|_| Vec::new()).collect();
+    let (mut w, mut room) = (0, per);
+    for part in &parts {
+        let mut rest = &part[..];
+        while !rest.is_empty() {
+            let take = rest.len().min(room);
+            spans[w].push(&rest[..take]);
+            rest = &rest[take..];
+            room -= take;
+            if room == 0 && w + 1 < workers {
+                w += 1;
+                room = per;
+            }
+        }
     }
 
-    let workers = threads.max(1).min(parts.len().max(1));
-    let endpoint_count = edge_count.checked_mul(2).expect("too many link endpoints");
-    // Shards share the top hash bits with the caller's user bins, so a job
-    // that owns one user bin probes only one cache-sized shard.
-    let shard_count = endpoint_count
-        .div_ceil(1 << 12)
-        .max(1)
-        .checked_next_power_of_two()
-        .unwrap_or(user_bins)
-        .min(user_bins.max(1));
-    let shard_mask = shard_count - 1;
-    let shard_bits = shard_count.trailing_zeros();
-    let shard_shift = if shard_bits == 0 { 0 } else { 64 - shard_bits };
-
-    // First partition endpoint occurrences. Every worker writes only its own
-    // vectors; no endpoint insertion takes a lock.
-    let average = endpoint_count.div_ceil(workers * shard_count);
-    let distributed = thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|worker| {
-                let parts = &parts;
+    // Scatter endpoint occurrences by partition, in edge order.
+    let hint = 2 * per / np + 16;
+    let mut scattered: Vec<Vec<Vec<u64>>> = thread::scope(|scope| {
+        let handles: Vec<_> = spans
+            .iter()
+            .map(|span| {
                 scope.spawn(move || {
-                    let mut out = bins(shard_count, average);
-                    for part in parts.iter().skip(worker).step_by(workers) {
-                        for &(a, b) in part {
+                    let mut out: Vec<Vec<u64>> = (0..np).map(|_| Vec::with_capacity(hint)).collect();
+                    for slice in span {
+                        for &(a, b) in *slice {
                             debug_assert!(a != 0 && b != 0);
-                            let ah = hash(a);
-                            let bh = hash(b);
-                            out[shard_of(ah, shard_mask, shard_shift)].push(a);
-                            out[shard_of(bh, shard_mask, shard_shift)].push(b);
+                            out[part_of(hash(a), np)].push(a);
+                            out[part_of(hash(b), np)].push(b);
                         }
                     }
                     out
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut shard_inputs: Vec<Vec<Vec<u64>>> = (0..shard_count).map(|_| Vec::new()).collect();
-    for local in distributed {
-        for (shard, input) in local.into_iter().enumerate() {
-            if !input.is_empty() {
-                shard_inputs[shard].push(input);
+    // Intern each partition with one reusable scratch table per worker.
+    let jobs: Vec<(usize, Vec<Vec<u64>>)> = (0..np)
+        .map(|p| (p, scattered.iter_mut().map(|bins| std::mem::take(&mut bins[p])).collect()))
+        .collect();
+    let done = each(jobs, workers.min(np), || (Vec::new(), Vec::new(), Vec::new()), |(seen, index, out), (p, mut bins)| {
+        let keys = intern(&mut bins, seen, index);
+        out.push((p, keys, bins));
+    });
+    let mut uniq: Vec<Vec<u64>> = (0..np).map(|_| Vec::new()).collect();
+    for (_, _, out) in done {
+        for (p, keys, bins) in out {
+            uniq[p] = keys;
+            for (w, bin) in bins.into_iter().enumerate() {
+                scattered[w][p] = bin;
             }
         }
     }
-
-    // Shards vary slightly in size. A tiny job queue keeps their zero-fill and
-    // interning work balanced; the mutex is acquired once per whole shard.
-    let build_workers = workers.min(shard_count);
-    let queue = Mutex::new(shard_inputs.into_iter().enumerate());
-    let built_parts = thread::scope(|scope| {
-        let handles: Vec<_> = (0..build_workers)
-            .map(|_| {
-                let queue = &queue;
-                scope.spawn(move || {
-                    let mut mine = Vec::new();
-                    loop {
-                        let job = queue.lock().unwrap().next();
-                        let Some((index, input)) = job else { break };
-                        mine.push((index, make_shard(input)));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
-    });
-
-    let mut ordered: Vec<Option<BuiltShard>> = (0..shard_count).map(|_| None).collect();
-    for worker in built_parts {
-        for (index, shard) in worker {
-            ordered[index] = Some(shard);
-        }
+    let mut base = Vec::with_capacity(np + 1);
+    base.push(0usize);
+    for keys in &uniq {
+        base.push(base.last().unwrap() + keys.len());
     }
+    let vertices = base[np];
+    assert!(vertices < u32::MAX as usize, "too many linked aliases");
+    let keys: Vec<u64> = uniq.concat();
+    drop(uniq);
 
-    let unique_count = ordered
-        .iter()
-        .map(|s| s.as_ref().unwrap().keys.len())
-        .sum::<usize>();
-    assert!(unique_count < u32::MAX as usize, "too many linked aliases");
-    let mut keys = Vec::with_capacity(unique_count);
-    let mut shards = Vec::with_capacity(shard_count);
-    for item in ordered {
-        let mut built = item.unwrap();
-        built.shard.base = keys.len();
-        keys.append(&mut built.keys);
-        shards.push(built.shard);
-    }
-
-    let parent: Vec<AtomicU32> = (0..unique_count as u32).map(AtomicU32::new).collect();
-    let priority: Vec<u64> = keys.iter().map(|&key| hash(key)).collect();
-
-    // Atomic parent changes publish no associated mutable data, and all other
-    // arrays are immutable in this phase, so relaxed atomic ordering suffices.
+    // Replay each worker's edges: the cursors meet the interned indices in
+    // the order they were scattered, so no endpoint is looked up again.
+    let mut zeroed = vec![0u32; vertices];
+    // SAFETY: AtomicU32 has the size and alignment of u32, and `zeroed` is
+    // only accessed through this view until the view is dropped.
+    let link: &[AtomicU32] = unsafe { std::slice::from_raw_parts(zeroed.as_mut_ptr().cast(), vertices) };
+    let renamed = AtomicUsize::new(0);
     thread::scope(|scope| {
-        for worker in 0..workers {
-            let parts = &parts;
-            let shards = &shards;
-            let parent = &parent;
-            let priority = &priority;
+        for (span, ids) in spans.iter().zip(&scattered) {
+            let (keys, base, renamed) = (&keys, &base, &renamed);
             scope.spawn(move || {
-                for part in parts.iter().skip(worker).step_by(workers) {
-                    for &(a, b) in part {
-                        let ia = index_of(shards, shard_mask, shard_shift, a);
-                        let ib = index_of(shards, shard_mask, shard_shift, b);
-                        atomic_union(parent, priority, ia, ib);
+                let mut cursor = vec![0usize; np];
+                let mut linked = 0;
+                let mut next = |k: u64| {
+                    let p = part_of(hash(k), np);
+                    let local = ids[p][cursor[p]];
+                    cursor[p] += 1;
+                    (base[p] + local as usize) as u32
+                };
+                for slice in span {
+                    for &(a, b) in *slice {
+                        let (ga, gb) = (next(a), next(b));
+                        linked += usize::from(unite(link, keys, slow, ga, gb));
                     }
                 }
+                renamed.fetch_add(linked, Relaxed);
             });
         }
     });
-    drop(parts);
-    drop(priority);
+    drop(scattered);
+    let renamed = renamed.into_inner();
 
-    // Resolve every vertex and choose each component's exact bytewise minimum
-    // in parallel. CAS candidates monotonically improve under cmp_keys.
-    let best: Vec<AtomicU32> = (0..unique_count)
-        .map(|_| AtomicU32::new(u32::MAX))
-        .collect();
-    let mut roots = vec![0u32; unique_count];
-    let chunk = unique_count.div_ceil(workers);
-    thread::scope(|scope| {
-        for (chunk_index, output) in roots.chunks_mut(chunk).enumerate() {
-            let start = chunk_index * chunk;
-            let parent = &parent;
-            let best = &best;
-            let keys = &keys;
-            scope.spawn(move || {
-                for (offset, root_out) in output.iter_mut().enumerate() {
-                    let node = (start + offset) as u32;
-                    let root = atomic_root(parent, node);
-                    *root_out = root;
-                    update_minimum(best, root, node, keys, slow);
+    // Half-full table; a multiple of `np` so partitions own whole slot runs.
+    let cap = (renamed * 2).div_ceil(np).max(1) * np;
+    let width = cap / np;
+    let mut table = vec![Slot::default(); cap + WINDOW];
+    // Partition p holds the hashes whose complement lies in run np - 1 - p.
+    let mut runs: Vec<(usize, &mut [Slot])> = table[..cap].chunks_mut(width).enumerate().map(|(q, s)| (np - 1 - q, s)).collect();
+    runs.reverse();
+    let spilled = each(runs, workers.min(np), Vec::new, |spill, (p, slots)| {
+        let offset = (np - 1 - p) * width;
+        for g in base[p]..base[p + 1] {
+            let r = root(link, g as u32) as usize;
+            if r != g {
+                let e = Slot { hash: hash(keys[g]), name: keys[r] };
+                if let Some(e) = place(slots, offset, cap as u64, e) {
+                    spill.push(e);
                 }
-            });
+            }
         }
     });
-    drop(parent);
-
-    // Convert local dense IDs in-place to final component minima. This reuses
-    // the expensive endpoint hash tables instead of building a second index.
-    let finish_workers = workers.min(shards.len());
-    let width = shards.len().div_ceil(finish_workers);
-    thread::scope(|scope| {
-        for slice in shards.chunks_mut(width) {
-            let roots = &roots;
-            let best = &best;
-            let keys = &keys;
-            scope.spawn(move || {
-                for shard in slice {
-                    // Keep only ids named by another id. Absent keys and
-                    // component minima both resolve to themselves, and most
-                    // queries are misses, so a sparse table ends them early.
-                    let mut renamed = Vec::new();
-                    for entry in shard.table.iter() {
-                        if entry.key == 0 {
-                            continue;
-                        }
-                        let node = shard.base + entry.value as usize;
-                        let root = roots[node] as usize;
-                        let minimum = best[root].load(AtomicOrdering::Relaxed);
-                        debug_assert_ne!(minimum, u32::MAX);
-                        let value = keys[minimum as usize];
-                        if value != entry.key {
-                            renamed.push(Entry { key: entry.key, value });
-                        }
-                    }
-                    let (table, mask) = if renamed.is_empty() {
-                        (Vec::new().into_boxed_slice(), 0)
-                    } else {
-                        let capacity = (renamed.len() * 4).next_power_of_two();
-                        let mut table = vec![Entry::default(); capacity].into_boxed_slice();
-                        let mask = capacity - 1;
-                        for e in renamed {
-                            let mut at = hash(e.key) as usize & mask;
-                            while table[at].key != 0 {
-                                at = (at + 1) & mask;
-                            }
-                            table[at] = e;
-                        }
-                        (table, mask)
-                    };
-                    shard.table = table;
-                    shard.mask = mask;
-                    shard.base = 0;
+    drop(zeroed);
+    let mut table = table;
+    for mut e in spilled.into_iter().flatten() {
+        let mut at = home(e.hash, cap as u64);
+        loop {
+            if at + WINDOW >= table.len() {
+                table.resize(at + WINDOW + 1, Slot::default());
+            }
+            let s = table[at];
+            if s.hash < e.hash {
+                table[at] = e;
+                if s.hash == 0 {
+                    break;
                 }
-            });
+                e = s;
+            }
+            at += 1;
         }
-    });
-
-    Aliases {
-        shards: shards.into_boxed_slice(),
-        shard_mask,
-        shard_shift,
     }
+    Aliases { table: table.into_boxed_slice(), cap: cap as u64 }
 }
 
 #[cfg(test)]
@@ -488,5 +401,82 @@ mod tests {
 
         let empty = build(Vec::new(), &slow, 0, 16);
         assert_eq!(empty.resolve(absent), absent);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::{user_key, wire, Shared};
+    use std::path::Path;
+    use std::time::Instant;
+
+    fn bodies(dir: &Path) -> Vec<Vec<u8>> {
+        let mut v: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        v.sort();
+        v.into_iter().map(|p| std::fs::read(p).unwrap()).collect()
+    }
+
+    fn body(b: &[u8]) -> &[u8] {
+        memchr::memchr(b'\n', b).map_or(&[], |i| &b[i + 1..])
+    }
+
+    // cargo test --release --bin solve bench_links -- --ignored --nocapture
+    // LINKS_DATA=/tmp/ss-finalshape-73 for the 60M shape.
+    #[test]
+    #[ignore]
+    fn bench_links() {
+        let data = std::env::var("LINKS_DATA").unwrap_or_else(|_| "/tmp/ss-20m".into());
+        let data = Path::new(&data);
+        let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
+        let mut parts: Vec<Vec<(u64, u64)>> = (0..8).map(|_| Vec::new()).collect();
+        for (i, b) in bodies(&data.join("links")).iter().enumerate() {
+            wire::rows::<2>(body(b), |[a, b]| {
+                if !a.is_empty() && !b.is_empty() && a != b {
+                    parts[i % 8].push((user_key(&shared, a), user_key(&shared, b)));
+                }
+            });
+        }
+        let mut queries = Vec::new();
+        for b in bodies(&data.join("events")) {
+            wire::rows::<7>(body(&b), |f| if !f[1].is_empty() { queries.push(user_key(&shared, f[1])) });
+        }
+        for b in bodies(&data.join("clicks")) {
+            wire::rows::<4>(body(&b), |f| if !f[1].is_empty() { queries.push(user_key(&shared, f[1])) });
+        }
+        let slow = shared.slow.into_inner().unwrap();
+        let edges = parts.iter().map(Vec::len).sum::<usize>();
+        let user_bins = 512;
+        // rename() visits keys bin by bin.
+        let shift = 64 - (user_bins as u64).trailing_zeros();
+        queries.sort_by_key(|&k| hash(k) >> shift);
+        for threads in [1, 8] {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let p = parts.clone();
+                let t = Instant::now();
+                let a = build(p, &slow, threads, user_bins);
+                best = best.min(t.elapsed().as_secs_f64());
+                std::hint::black_box(&a);
+            }
+            eprintln!("build threads={threads}: {:7.2} ms {:6.1} ns/edge", best * 1e3, best * 1e9 / edges as f64);
+        }
+        let aliases = build(parts.clone(), &slow, 8, user_bins);
+        let mut best = f64::MAX;
+        let mut renamed = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let mut acc = 0u64;
+            renamed = 0;
+            for &k in &queries {
+                let n = aliases.resolve(k);
+                renamed += usize::from(n != k);
+                acc ^= n;
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+            std::hint::black_box(acc);
+        }
+        eprintln!("resolve: {:6.2} ns/query, {} queries, {:.1}% renamed, {edges} edges",
+            best * 1e9 / queries.len() as f64, queries.len(), renamed as f64 * 100.0 / queries.len() as f64);
     }
 }
