@@ -130,6 +130,17 @@ fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, f: &mut impl Fn
     }
 }
 
+/// Ask for the line at `p` ahead of use: one hint per block for the block one
+/// window ahead. A hint never faults.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch hint has no architectural effect.
+    unsafe { std::arch::x86_64::_mm_prefetch(p.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 /// 1 for a separator byte: one load instead of two compares per block.
 static SEP: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -279,6 +290,7 @@ fn window_rows<'b, const N: usize>(
         // the final block's start), so the block and the byte after it lie
         // inside `buf`. Capacity covers every slot (see rows_window).
         unsafe {
+            prefetch(p.add(WINDOW));
             let m = masks64(p);
             let next_s = is_sep(*p.add(64));
             st.block::<N>(rel, m, next_s, 0);
