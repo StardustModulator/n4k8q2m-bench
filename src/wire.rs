@@ -393,14 +393,29 @@ fn exact<'b, const N: usize>(buf: &'b [u8], start: usize, row: usize, ends: *con
 /// a decoder may read up to `PAD` bytes past any of its field starts without
 /// leaving `buf`; the bytes past a field are the record's own later bytes or
 /// those after it.
+#[cfg_attr(not(test), allow(dead_code))] // measured slower than `rows` plus batched decoding on x86
 #[inline]
 pub(super) fn rows_fused<'b, const N: usize, S: ?Sized>(
     buf: &'b [u8],
     s: &mut S,
+    fast: impl FnMut(&mut S, [&'b [u8]; N]),
+    slow: impl FnMut(&mut S, [&'b [u8]; N]),
+) {
+    const { assert!(2 <= N && N <= 8) };
+    fused_windows::<N, S>(buf, WINDOW, s, fast, slow);
+}
+
+/// `rows_fused` over windows of `window` bytes (a multiple of 64, at most
+/// `WINDOW`).
+#[inline]
+fn fused_windows<'b, const N: usize, S: ?Sized>(
+    buf: &'b [u8],
+    window: usize,
+    s: &mut S,
     mut fast: impl FnMut(&mut S, [&'b [u8]; N]),
     mut slow: impl FnMut(&mut S, [&'b [u8]; N]),
 ) {
-    const { assert!(2 <= N && N <= 8) };
+    debug_assert!(window % 64 == 0 && window > 0 && window <= WINDOW);
     let len = buf.len();
     // Slack for the unconditional writes, the EOF entry and the guards.
     let mut masks: Vec<u64> = Vec::with_capacity(WINDOW / 64 + 8);
@@ -410,7 +425,7 @@ pub(super) fn rows_fused<'b, const N: usize, S: ?Sized>(
     let mut start = memchr::memchr(b'\n', buf).map_or(len, |i| i + 1);
     rows_simple::<N>(buf, 0, start, &mut |r| slow(s, r));
     while start < len {
-        let end = (start + WINDOW).min(len);
+        let end = (start + window).min(len);
         let next = window_fused::<N, S>(buf, start, end, masks.as_mut_ptr(), lines.as_mut_ptr(), s, &mut fast, &mut slow);
         if next > start {
             start = next;
@@ -775,7 +790,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rows, rows_fused, rows_simple, rows_window, PAD};
+    use super::{fused_windows, rows, rows_fused, rows_simple, rows_window, PAD};
 
     fn reference<'b, const N: usize>(buf: &'b [u8], mut emit: impl FnMut([&'b [u8]; N])) {
         fn line<'b, const N: usize>(line: &'b [u8]) -> Option<[&'b [u8]; N]> {
@@ -843,6 +858,10 @@ mod tests {
             f(r)
         }, |f, r| f(r)));
         assert_eq!(fused, want, "fused input={buf:?}");
+        for window in [64, 128, 192, 256] {
+            let got = collect::<N>(buf, |b, f| fused_windows::<N, _>(b, window, f, |f, r| f(r), |f, r| f(r)));
+            assert_eq!(got, want, "fused window={window} input={buf:?}");
+        }
         assert_eq!(collect::<N>(buf, |b, f| rows_simple::<N>(b, 0, b.len(), &mut |r| f(r))), want, "simple input={buf:?}");
         for window in [64, 128, 192, 256] {
             assert_eq!(collect::<N>(buf, |b, f| rows_window::<N>(b, window, &mut |r| f(r))), want, "window={window} input={buf:?}");

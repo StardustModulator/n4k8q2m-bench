@@ -125,12 +125,9 @@ impl Clock {
         let digits = (hi | lo | w0.wrapping_add(BIAS) | z.wrapping_add(BIAS)) & HIGH == 0;
         let ok3 = digits & (9..=16).contains(&n);
         let prefix = hi.wrapping_shl(16u32.wrapping_sub(n as u32).wrapping_mul(8));
-        // Both candidates are opaque, so neither form's work can sink under a
-        // branch on the width: the choice stays one conditional move.
-        let iso = std::hint::black_box((local + adj) * 1000);
-        let f3 = std::hint::black_box((decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64);
-        let ms = if is20 | is25 { iso } else { f3 };
-        (ms, iso_ok | ok3)
+        let iso = (local + adj) * 1000;
+        let f3 = (decimal8(prefix) * 100_000_000 + decimal8(lo)) as i64;
+        (pick(is20 | is25, iso, f3), iso_ok | ok3)
     }
 
     /// Seconds since the epoch.
@@ -156,6 +153,26 @@ impl Clock {
             Some(local)
         }
     }
+}
+
+/// `if c { a } else { b }` as one conditional move. The x86 backend turns a
+/// select whose operands have long dependency chains back into a branch,
+/// which the form mix would mispredict on a third of the rows; the asm pins
+/// the move.
+#[inline(always)]
+fn pick(c: bool, a: i64, b: i64) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut r = b;
+        // SAFETY: pure register arithmetic, no memory or flags live across it.
+        unsafe {
+            std::arch::asm!("test {c}, {c}", "cmovne {r}, {a}", c = in(reg) u64::from(c), a = in(reg) a, r = inout(reg) r,
+                            options(pure, nomem, nostack));
+        }
+        r
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    if c { a } else { b }
 }
 
 // Keep the general calendar conversion off the row-parsing hot path. ISO
@@ -446,5 +463,26 @@ mod tests {
             }
             assert_eq!(c.ingest(b"00000000000000000001"), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod rate {
+    // cargo test --release --bin solve select_rate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn select_rate() {
+        let data = std::path::Path::new("/tmp/ss-20m");
+        let w = crate::load_window(&data.join("manifest.json")).unwrap();
+        let c = super::Clock::new(w.start, w.end);
+        let buf = std::fs::read(data.join("events/part-00043.csv")).unwrap();
+        let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
+        let (mut rows, mut unsure, mut wrong) = (0usize, 0usize, 0usize);
+        crate::wire::rows::<7>(&body[..body.len() - 64], |f| {
+            rows += 1;
+            let (ms, sure) = unsafe { c.select(f[2]) };
+            if !sure { unsure += 1; } else if Some(ms) != c.parse(f[2]) { wrong += 1; }
+        });
+        eprintln!("rows={rows} unsure={unsure} ({:.5}) wrong={wrong}", unsure as f64 / rows as f64);
     }
 }

@@ -184,11 +184,19 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // the parse bench's batched layer
+    /// Decode a batch of records of `buf`. A record with `wire::PAD` bytes of
+    /// `buf` after its last field takes the padded path (whole-word loads,
+    /// the timestamp form selected rather than branched on); the few at a
+    /// chunk's end take the exact one.
     #[inline(never)]
-    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
+    fn events(&self, buf: &[u8], rows: &[[&[u8]; 7]], out: &mut Scan) {
+        let end = buf.as_ptr() as usize + buf.len();
         for f in rows {
-            self.event(f, out);
+            if f[6].as_ptr() as usize + f[6].len() + wire::PAD <= end {
+                self.event_fast(f, out);
+            } else {
+                self.event(f, out);
+            }
         }
     }
 
@@ -208,9 +216,9 @@ impl Decoder<'_, '_> {
         out.candidate(id, sec, at_row, self.b);
     }
 
-    /// `event` for a record from `wire::rows_fused`'s fast path: `wire::PAD`
-    /// bytes are readable past every field start, so the type is checked as
-    /// a whole word and the timestamp form is selected, not branched on.
+    /// `event` for a record with `wire::PAD` readable bytes past every field
+    /// start (see `events`): the type is checked as a whole word and the
+    /// timestamp form is selected, not branched on.
     #[inline(always)]
     fn event_fast(&self, f: &[&[u8]; 7], out: &mut Scan) {
         let Some(id) = event_key(self.s, f[0]) else { return };
@@ -272,15 +280,19 @@ impl Decoder<'_, '_> {
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(never)]
     fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
+        let end = buf.as_ptr() as usize + buf.len();
         for f in rows {
-            self.click(buf, f, out);
+            if f[3].as_ptr() as usize + f[3].len() + wire::PAD <= end {
+                self.click_fast(buf, f, out);
+            } else {
+                self.click(buf, f, out);
+            }
         }
     }
 
-    /// `click` for a record from `wire::rows_fused`'s fast path (see `event_fast`).
+    /// `click` for a record with `wire::PAD` readable bytes past every field start.
     #[inline(always)]
     fn click_fast(&self, buf: &[u8], f: &[&[u8]; 4], out: &mut Scan) {
         if f[0].is_empty() || f[1].is_empty() { return; }
@@ -634,8 +646,8 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>wire::rows_fused::<7,_>(buf,&mut out,#[inline(always)]|out,f|dec.event_fast(&f,out),#[inline(never)]|out,f|dec.event(&f,out)),
-                    1=>wire::rows_fused::<4,_>(buf,&mut out,#[inline(always)]|out,f|dec.click_fast(buf,&f,out),#[inline(never)]|out,f|dec.click(buf,&f,out)),
+                    0=>batched::<7>(buf,|rows|dec.events(buf,rows,&mut out)),
+                    1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));
@@ -890,7 +902,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(rows, &mut out));
+            batched::<7>(body, |rows| dec.events(body, rows, &mut out));
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());
