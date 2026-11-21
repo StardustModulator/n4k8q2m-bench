@@ -3,7 +3,8 @@
 //! its own bin: a name's person bin is that name's raw bin, because both use
 //! the top bits of the same hash. A renamed user hands only a span (bin,
 //! group) to its name's bin. Rows are copied again only for persons that
-//! actually span several raw users.
+//! actually span several raw users. Event rows with key 0 are dead (killed by
+//! dedup in place) and are dropped here.
 use super::*;
 use crate::aggregate::{Acc, Hit};
 use crate::group::Histories;
@@ -150,11 +151,18 @@ fn gather(mut parts: Vec<Histories>, aliases: &Aliases, shift: u32, bin: usize, 
     let mut keys = Vec::with_capacity((ne + nc) / 6 + 16);
     let (mut ecount, mut ccount) = (Vec::with_capacity(keys.capacity()), Vec::with_capacity(keys.capacity()));
     // The key field is ours now: it carries the group number to the scatter.
+    // A row dedup killed in place has key 0 and is skipped here, not copied.
+    let mut live = 0;
     for p in &mut parts {
         for e in &mut p.ev {
+            if e.key == 0 {
+                e.key = u64::MAX;
+                continue;
+            }
             let g = table.intern(e.key, &mut keys, &mut ecount, &mut ccount);
             ecount[g] += 1;
             e.key = g as u64;
+            live += 1;
         }
         for c in &mut p.cl {
             let g = table.intern(c.key, &mut keys, &mut ecount, &mut ccount);
@@ -178,10 +186,13 @@ fn gather(mut parts: Vec<Histories>, aliases: &Aliases, shift: u32, bin: usize, 
     }
     ev_at.push(es);
     cl_at.push(cs);
-    let mut ev = vec![0u64; ne];
+    let mut ev = vec![0u64; live];
     let mut cl = vec![Hit { id: 0, ts: 0, camp: 0 }; nc];
     for p in parts {
         for e in p.ev {
+            if e.key == u64::MAX {
+                continue;
+            }
             let at = &mut ecount[e.key as usize];
             ev[*at as usize] = e.val;
             *at += 1;
