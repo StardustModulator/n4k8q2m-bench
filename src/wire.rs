@@ -72,144 +72,9 @@ impl<'b, const N: usize> Fields<'b, N> {
 /// block is ever partial. Stage 2 rereads the window, so it and its lists
 /// (about 12 KiB) should stay in L1 next to the caller's own data; on M1 8 to
 /// 32 KiB measure the same.
-pub(super) const WINDOW: usize = 1 << 13;
+const WINDOW: usize = 1 << 13;
 /// Set on a line entry whose record must take the exact path.
-pub(super) const POISON: u32 = 1 << 31;
-const ONES: u64 = 0x0101_0101_0101_0101;
-
-/// Stage-1 lists of one window for a caller that walks the records itself
-/// (the event decoder). `stops` holds every separator in order, commas and
-/// LFs alike, as its window offset mod 128: a record shorter than 128 bytes
-/// recovers its field ends from seven consecutive bytes by byte arithmetic
-/// against its own origin. `lines` holds every LF's window offset, POISON set
-/// when its record touched a block whose quotes are not well formed.
-pub(super) struct Lists {
-    pub(super) stops: Vec<u8>,
-    pub(super) lines: Vec<u32>,
-}
-
-impl Lists {
-    pub(super) fn new() -> Self {
-        // Slack for the unconditional writes, the EOF entry and the reader's
-        // 8-byte load at the last record's first stop.
-        Self { stops: vec![0; WINDOW + 80], lines: vec![0; WINDOW + 80] }
-    }
-}
-
-/// Stage 1 over `buf[start..end]`, `start` at a record boundary and `end -
-/// start <= WINDOW`. Returns the counts of stops and lines written. EOF inside
-/// the window terminates an unterminated final record with a virtual
-/// separator at offset `len - start` in both lists.
-#[inline(never)]
-pub(super) fn scan_window(buf: &[u8], start: usize, end: usize, l: &mut Lists) -> (usize, usize) {
-    debug_assert!(start < end && end <= buf.len() && end - start <= WINDOW);
-    let len = buf.len();
-    let (sp, lp) = (l.stops.as_mut_ptr(), l.lines.as_mut_ptr());
-    let mut st = Pack { sp, lp, prev_s: 1, open: 0, pending: 0 };
-    // Blocks followed by a byte of `buf`; at EOF the final block, full or
-    // partial, is left for after the loop.
-    let inner = if end < len { end } else { start + (len - start - 1) / 64 * 64 };
-    // SAFETY: start <= inner <= len.
-    let (base, stop) = unsafe { (buf.as_ptr().add(start), buf.as_ptr().add(inner)) };
-    let mut p = base;
-    let mut rel = 0u32;
-    while p < stop {
-        // SAFETY: p + 64 <= stop < len, so the block and the byte after it
-        // lie inside `buf`; the lists have room for every slot (see `Lists`).
-        unsafe {
-            prefetch(p.add(WINDOW));
-            let m = masks64(p);
-            st.block(rel, m, is_sep(*p.add(64)), 0);
-            p = p.add(64);
-        }
-        rel += 64;
-    }
-    if end == len {
-        let off = start + rel as usize;
-        let rem = len - off;
-        let mut tmp = [0u8; 64];
-        tmp[..rem].copy_from_slice(&buf[off..]);
-        let (next_s, tail) = if rem == 64 { (1, 0) } else { (0, 1u64 << rem) };
-        // SAFETY: `tmp` holds 64 bytes, zero padded: no structural byte.
-        unsafe { st.block(rel, masks64(tmp.as_ptr()), next_s, tail) };
-        if buf[len - 1] != b'\n' {
-            let eof = (len - start) as u32;
-            // SAFETY: at most `window` separators and LFs were listed.
-            unsafe {
-                *st.sp = (eof & 127) as u8;
-                *st.lp = eof | st.pending | if st.open != 0 { POISON } else { 0 };
-                st.sp = st.sp.add(1);
-                st.lp = st.lp.add(1);
-            }
-        }
-    }
-    // SAFETY: both cursors only moved forward from their bases.
-    unsafe { (st.sp.offset_from(sp) as usize, st.lp.offset_from(lp) as usize) }
-}
-
-/// Stage 1 state for `scan_window`: as `Scan`, with byte stops.
-struct Pack {
-    sp: *mut u8,
-    lp: *mut u32,
-    prev_s: u64,
-    open: u64,
-    pending: u32,
-}
-
-impl Pack {
-    /// # Safety
-    /// As `Scan::block`.
-    #[inline(always)]
-    unsafe fn block(&mut self, rel: u32, (c, n, q): (u64, u64, u64), next_s: u64, tail: u64) {
-        let s = c | n;
-        let o = q & ((s << 1) | self.prev_s);
-        let z = q & (((s | tail) >> 1) | (next_s << 63));
-        self.prev_s = s >> 63;
-        let (inside, borrow) = z.overflowing_sub(o + self.open);
-        self.open = borrow as u64;
-        let bad = (inside & (s | z)) | (q & !(o | z)) | (o & z);
-        let lfs = n.count_ones() as usize;
-        // Seven positions packed into one word and one store: a block holds
-        // at most seven separators for almost every row shape. An exhausted
-        // mask yields 64, which still fits its byte next to the block base.
-        let mut m = s;
-        let mut w = 0u64;
-        for j in 0..7 {
-            w |= u64::from(m.trailing_zeros()) << (8 * j);
-            m &= m.wrapping_sub(1);
-        }
-        // SAFETY: forwarded from the caller.
-        unsafe {
-            self.sp.cast::<u64>().write_unaligned(w + u64::from(rel & 64) * ONES);
-            if m != 0 {
-                more_stops(self.sp, rel, m);
-            }
-            flatten(self.lp, rel, n, 2);
-            if self.pending != 0 && n != 0 {
-                *self.lp |= POISON;
-                self.pending = 0;
-            }
-            if bad != 0 {
-                self.pending = poison_block(self.lp, lfs);
-            }
-            self.sp = self.sp.add(s.count_ones() as usize);
-            self.lp = self.lp.add(lfs);
-        }
-    }
-}
-
-/// The block's separators past the seventh, `m` holding those bits.
-#[cold]
-#[inline(never)]
-unsafe fn more_stops(sp: *mut u8, rel: u32, mut m: u64) {
-    let mut j = 7;
-    while m != 0 {
-        // SAFETY: the caller's slot capacity covers every separator.
-        unsafe { *sp.add(j) = ((rel & 64) + m.trailing_zeros()) as u8 };
-        m &= m - 1;
-        j += 1;
-    }
-}
+const POISON: u32 = 1 << 31;
 /// Written past the last separator: equals no LF entry, poisoned or not
 /// (window offsets stay far below POISON).
 const NONE: u32 = u32::MAX;
@@ -265,11 +130,8 @@ fn rows_window<'b, const N: usize>(buf: &'b [u8], window: usize, f: &mut impl Fn
     }
 }
 
-/// Ask for the line at `p` ahead of use. Stage 1 streams the input at a pace
-/// the hardware prefetcher does not always follow across pages, and a window
-/// scanned twice leaves the next one cold; one hint per block for the block
-/// one window ahead keeps about a dozen lines in flight. A hint never faults,
-/// so an address past the mapping is harmless.
+/// Ask for the line at `p` ahead of use: one hint per block for the block one
+/// window ahead. A hint never faults.
 #[inline(always)]
 fn prefetch(p: *const u8) {
     #[cfg(target_arch = "x86_64")]

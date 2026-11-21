@@ -7,7 +7,6 @@ use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
 use crate::clock::Clock;
 use crate::links::Aliases;
-use crate::wire::{Lists, POISON, WINDOW};
 
 /// The splitmix64 finalizer. Every step is invertible, so `hash` is a
 /// bijection: a mixed key identifies its key exactly, and rows carry mixed
@@ -100,34 +99,7 @@ const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
-const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
-
-#[cfg(test)]
-static SLOW_ROWS: AtomicUsize = AtomicUsize::new(0);
-
-/// Unaligned little-endian word at `p`.
-///
-/// # Safety
-/// Eight bytes at `p` must be readable.
-#[inline(always)]
-unsafe fn ld8(p: *const u8) -> u64 {
-    // SAFETY: forwarded.
-    u64::from_le(unsafe { p.cast::<u64>().read_unaligned() })
-}
-
-/// Bytes 0..=6 of `rel` strictly increasing; byte 7 is ignored.
-#[inline(always)]
-fn ascending7(rel: u64) -> bool {
-    // Byte i of d is 0x80 + r[i] - r[i-1] (byte 0: 0x80 + r[0]): no borrow
-    // crosses a byte, since every minuend has its high bit set and every
-    // subtrahend is below 0x80. Strict increase means bytes 1..=6 are all at
-    // least 0x81: high bit set and low seven bits nonzero.
-    let d = (rel | HIGH).wrapping_sub((rel << 8) & LOW7);
-    let nz = (d & LOW7).wrapping_add(LOW7) & HIGH;
-    const BYTES: u64 = 0x0080_8080_8080_8000;
-    (d & nz) & BYTES == BYTES
-}
 
 /// Event-ID key, for equality and hashing only (never order). `e` and seven
 /// or eight more bytes in 1..=127, the generator's shape, pack without a
@@ -217,167 +189,6 @@ impl Decoder<'_, '_> {
         for f in rows {
             self.event(f, out);
         }
-    }
-
-    /// The event rows of one chunk, which starts at a record boundary. Stage 1
-    /// lists each window's separators; then every record is certified from
-    /// seven stop bytes and decoded in one fixed sequence, or handed to the
-    /// exact row path: one that fails certification, one the fixed sequence
-    /// does not cover, or one too close to the end of `buf` for its loads.
-    #[inline(never)]
-    fn event_rows(&self, buf: &[u8], out: &mut Scan, l: &mut Lists) {
-        let len = buf.len();
-        let mut start = 0usize;
-        while start < len {
-            let end = (start + WINDOW).min(len);
-            let (_, nl) = wire::scan_window(buf, start, end, l);
-            if nl == 0 {
-                // A full window without LF: one long record.
-                let lf = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i);
-                self.slow_event(buf, start, lf, out);
-                start = lf + 1;
-                continue;
-            }
-            let stops = l.stops.as_ptr();
-            let mut o = start; // the record's first byte
-            let mut cur = 0usize; // its first stop
-            for &line in &l.lines[..nl] {
-                let lf = start + (line & !POISON) as usize;
-                // SAFETY: every record's stops end at its own LF (or EOF),
-                // which is listed, so cur never passes the stops written, and
-                // the list has eight bytes of slack after them.
-                let st = unsafe { ld8(stops.add(cur)) };
-                // Field ends relative to the record: (stop - origin) mod 128
-                // per byte. The seventh must be this record's LF and the
-                // seven must ascend; together they prove that exactly these
-                // seven separators lie in the record, which is under 128
-                // bytes (an LF in the first six would repeat the seventh's
-                // byte, a comma past the sixth would push the LF out).
-                let rel = (st | HIGH).wrapping_sub(u64::from((o - start) as u8 & 127) * ONES) & LOW7;
-                let certified = (rel >> 48) as u8 as usize == lf - o && ascending7(rel) && line & POISON == 0 && lf + 32 <= len;
-                if certified && self.fast_event(buf, o, rel, out) {
-                    cur += 7;
-                } else {
-                    cur += self.slow_event(buf, o, lf, out);
-                }
-                o = lf + 1;
-            }
-            start = o;
-        }
-    }
-
-    /// One certified record in a fixed sequence: every field is loaded and
-    /// checked, and the verdicts select. Returns false, having written
-    /// nothing, for a shape the sequence does not cover (an id outside the
-    /// literal form, an uncached date, a rare timestamp form); those take
-    /// the exact row path, which decides them as before.
-    #[inline(always)]
-    fn fast_event(&self, buf: &[u8], o: usize, rel: u64, out: &mut Scan) -> bool {
-        // SAFETY: the record spans buf[o..o + e6] with e6 < 128 and 32 more
-        // bytes of `buf` follow it; every load below starts inside the record
-        // and reads at most 32 bytes from there.
-        unsafe {
-            let row = buf.as_ptr().add(o);
-            let e = |i: u32| (rel >> (8 * i)) as u8 as usize;
-            // A field is quoted exactly when its first byte is a quote: stage
-            // 1 certified the record's quotes well formed.
-            let q = |at: usize| usize::from(*row.add(at) == b'"');
-            // Event id: `e` and seven or eight bytes in 1..=127, as event_key.
-            let q0 = q(0);
-            let p0 = row.add(q0);
-            let n0 = e(0).wrapping_sub(2 * q0);
-            let w0 = ld8(p0.add(1)) & u64::MAX.wrapping_shr((9usize.wrapping_sub(n0) as u32).wrapping_mul(8));
-            let pad = u64::from(n0 == 8) << 56;
-            let id_ok = ((n0 | 1) == 9) & (*p0 == b'e') & (((w0 | pad) | (w0 | pad).wrapping_sub(ONES)) & HIGH == 0);
-            let id = w0 | 1 << 63;
-            // User id: try_pack's eight or nine byte shape.
-            let s1 = e(0) + 1;
-            let q1 = q(s1);
-            let p1 = row.add(s1 + q1);
-            let n1 = e(1).wrapping_sub(s1).wrapping_sub(2 * q1);
-            let tail = ld8(p1.add(n1.wrapping_sub(8).min(1))).swap_bytes();
-            let (user_ok, ukey) = atom::pack_tail(*p1, tail, n1);
-            // Timestamp and ingest. Their clocks decode side by side; F1 and
-            // the digit form are both computed and the width selects, since a
-            // dispatch on the form mix mispredicts almost every other row and
-            // discards the rows in flight behind it. F2 stays a branch: one
-            // row in ten.
-            let s2 = e(1) + 1;
-            let q2 = q(s2);
-            let p2 = row.add(s2 + q2);
-            let n2 = e(2).wrapping_sub(s2).wrapping_sub(2 * q2);
-            let s3 = e(2) + 1;
-            let q3 = q(s3);
-            let p3 = row.add(s3 + q3);
-            let n3 = e(3).wrapping_sub(s3).wrapping_sub(2 * q3);
-            let (hit2, mid2) = self.clock.probe(p2);
-            let (hit3, mid3) = self.clock.probe(p3);
-            let (hms_ok2, hms_ok3, sec2, sec3) = clock::hms2(ld8(p2.add(11)), ld8(p3.add(11)));
-            let zone = *p2.add(19);
-            let local = mid2 + sec2;
-            let (dig_ok, f3v) = clock::epoch16(ld8(p2), ld8(p2.add(n2.wrapping_sub(8).min(8))), n2);
-            let f3 = (n2.wrapping_sub(9) <= 7) & dig_ok;
-            let mut ts_ok = f3 | ((n2 == 20) & (zone == b'Z') & hit2 & hms_ok2);
-            let mut ts = if f3 { f3v } else { local * 1000 };
-            if n2 == 25 {
-                let (off_ok, off) = clock::offset(ld8(p2.add(17)));
-                ts_ok = hit2 & hms_ok2 & off_ok & ((zone == b'+') | (zone == b'-'));
-                ts = (if zone == b'+' { local - off } else { local + off }) * 1000;
-            }
-            // Ingest: F1 only, as ingest_s.
-            let ingest_ok = (n3 == 20) & (*p3.add(19) == b'Z') & hit3 & hms_ok3;
-            let sec = mid3 + sec3;
-            // Type: whole-word compares.
-            let s4 = e(3) + 1;
-            let q4 = q(s4);
-            let p4 = row.add(s4 + q4);
-            let n4 = e(4).wrapping_sub(s4).wrapping_sub(2 * q4);
-            let w4 = ld8(p4);
-            let purchase = (n4 == 8) & (w4 == PURCHASE);
-            let type_ok = ((n4 == 4) & ((w4 as u32 == VIEW) | (w4 as u32 == CART))) | purchase;
-            // Product: non-empty.
-            let s5 = e(4) + 1;
-            let q5 = q(s5);
-            let n5 = e(5).wrapping_sub(s5).wrapping_sub(2 * q5);
-            if !(id_ok & ingest_ok & ts_ok & (user_ok | (n1 == 0))) {
-                return false;
-            }
-            let at = sec * 1000;
-            let in_window = (ts.wrapping_sub(self.start) as u64) < self.span;
-            let mut valid = type_ok & (n5 != 0) & (n1 != 0) & in_window & (at - ts <= DAY_MS);
-            let mut pay = 0u32;
-            if purchase & valid {
-                let s6 = e(5) + 1;
-                let q6 = q(s6);
-                match parse_price(&buf[o + s6 + q6..o + e(6) - q6]) {
-                    Some(p) => pay = p | u32::from(product_cat(self.cx, &buf[o + s5 + q5..o + e(5) - q5])) << 24,
-                    None => valid = false,
-                }
-            }
-            let mut at_row = None;
-            if valid {
-                let key = hash(ukey);
-                let bin = (key >> (64 - self.b.user)) as usize;
-                let v = &mut out.ev[bin];
-                at_row = Some((bin, v.len()));
-                v.push(Event { key, val: ((ts - self.origin) as u64) << 32 | u64::from(pay) });
-            }
-            out.candidate(id, sec, at_row, self.b);
-            true
-        }
-    }
-
-    /// The exact path for the record `buf[o..lf]`: the general scanner on
-    /// that one record, then the scalar decoder. Returns the number of
-    /// separators the record holds: its commas and its LF or EOF.
-    #[cold]
-    #[inline(never)]
-    fn slow_event(&self, buf: &[u8], o: usize, lf: usize, out: &mut Scan) -> usize {
-        #[cfg(test)]
-        SLOW_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
-        let row = &buf[o..lf];
-        wire::rows::<7>(row, |f| self.event(&f, out));
-        memchr::memchr_iter(b',', row).count() + 1
     }
 
     #[inline(always)]
@@ -759,13 +570,12 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
                 cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
-            let mut lists=Lists::new();
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>dec.event_rows(buf,&mut out,&mut lists),
+                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -901,143 +711,6 @@ mod tests {
         }
     }
 
-    /// Event rows of every form the generator writes and every dirt kind the
-    /// rules name, plus shapes only the exact path handles.
-    fn synth_events(next: &mut impl FnMut() -> u64, w: &Window, rows: usize) -> Vec<u8> {
-        const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        fn word(next: &mut impl FnMut() -> u64, prefix: u8, n: usize) -> Vec<u8> {
-            let mut v = vec![prefix];
-            for _ in 0..n { v.push(B36[(next() % 36) as usize]); }
-            v
-        }
-        fn iso(t: i64, zone: &str) -> Vec<u8> {
-            let (d, s) = (t.div_euclid(DAY_MS), t.rem_euclid(DAY_MS) / 1000);
-            let mut date = [0u8; 10];
-            format_day(d as i32, &mut date);
-            format!("{}T{:02}:{:02}:{:02}{zone}", std::str::from_utf8(&date).unwrap(), s / 3600, s / 60 % 60, s % 60).into_bytes()
-        }
-        let mut out = Vec::new();
-        for _ in 0..rows {
-            let mut f: Vec<Vec<u8>> = Vec::with_capacity(7);
-            f.push(match next() % 64 {
-                0 => Vec::new(), 1 => word(next, b'E', 8), 2 => word(next, b'e', 7), 3 => word(next, b'e', 9),
-                4 => b"x1".to_vec(), 5 => word(next, b'e', 6), 6 => b"e\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f".to_vec(),
-                _ => word(next, b'e', 8),
-            });
-            f.push(match next() % 64 {
-                0 => Vec::new(), 1 => word(next, b'U', 8), 2 => word(next, b'u', 6), 3 => word(next, b'u', 9),
-                4 => b" u1".to_vec(), 5 => "u\u{e9}1234567".as_bytes().to_vec(), 6 => word(next, b'k', 7),
-                7 => b"u1234567\x7f".to_vec(), _ => { let n = 7 + (next() % 2) as usize; word(next, b'u', n) },
-            });
-            let t = w.start - 2 * DAY_MS + (next() % (18 * DAY_MS) as u64) as i64;
-            let t = t / 1000 * 1000 + if next() % 8 == 0 { (next() % 1000) as i64 } else { 0 };
-            let r = next() % 100;
-            f.push(if r < 50 {
-                if t % 1000 == 0 { iso(t, "Z") } else { t.to_string().into_bytes() }
-            } else if r < 62 {
-                let off = ((next() % 14) as i64 * 60 + [0, 30, 45][(next() % 3) as usize]) * 60_000;
-                let neg = next() % 2 == 0;
-                if t % 1000 == 0 {
-                    let mut s = iso(if neg { t - off } else { t + off }, "");
-                    s.extend_from_slice(format!("{}{:02}:{:02}", if neg { '-' } else { '+' }, off / 3_600_000, off / 60_000 % 60).as_bytes());
-                    s
-                } else { t.to_string().into_bytes() }
-            } else if r < 92 {
-                t.to_string().into_bytes()
-            } else {
-                match r {
-                    92 => Vec::new(), 93 => iso(t, "z"), 94 => format!("{t:020}").into_bytes(),
-                    95 => b"2028-02-30T00:00:00Z".to_vec(), 96 => iso(t, ".000Z"), 97 => b"2028-02-29T00:00:00Z".to_vec(),
-                    98 => iso(t, "+24:00"), _ => b"1.79e12".to_vec(),
-                }
-            });
-            let late = match next() % 50 { 0 => DAY_MS, 1 => DAY_MS + 1000, 2 => 3 * DAY_MS, 3 => -5000, _ => (next() % 3600) as i64 * 1000 };
-            let at = (t + late) / 1000 * 1000;
-            f.push(match next() % 100 {
-                0 => Vec::new(), 1 => at.to_string().into_bytes(), 2 => iso(at, "+00:00"),
-                3 => iso(w.start + 400 * DAY_MS, "Z"), 4 => iso(at, "z"), _ => iso(at, "Z"),
-            });
-            f.push(match next() % 100 {
-                0..=2 => b"purchase".to_vec(), 3 => b"Purchase".to_vec(), 4 => b"cart ".to_vec(), 5 => Vec::new(),
-                6..=20 => b"cart".to_vec(), _ => b"view".to_vec(),
-            });
-            f.push(match next() % 200 {
-                0 => Vec::new(), 1 => b"P123".to_vec(), 2 => b"p0123".to_vec(), 3 => b"p99999999".to_vec(),
-                _ => format!("p{}", next() % 60_000).into_bytes(),
-            });
-            f.push(match next() % 20 {
-                0 => Vec::new(), 1 => b"0".to_vec(), 2 => b"-5".to_vec(), 3 => b"1.5".to_vec(), 4 => b"10000001".to_vec(),
-                5 => b"0250".to_vec(), _ => (1 + next() % 50_000).to_string().into_bytes(),
-            });
-            let bad = next() % 400;
-            for (i, fld) in f.iter_mut().enumerate() {
-                if next() % 5 == 0 {
-                    let mut q = vec![b'"'];
-                    q.extend_from_slice(fld);
-                    q.push(b'"');
-                    *fld = q;
-                }
-                if bad == 1 && i == 2 { let at = fld.len().min(1); fld.insert(at, b'"'); }
-            }
-            match bad {
-                2 => { f.pop(); }
-                3 => f.push(b"extra".to_vec()),
-                4 => f.clear(),
-                5 => f[5] = vec![b'x'; 140],
-                6 => f[6].push(b'\r'),
-                7 => f[0] = b"\"".to_vec(),
-                8 => f[3] = b"\"\"".to_vec(),
-                _ => {}
-            }
-            out.extend_from_slice(&f.join(&b","[..]));
-            out.push(b'\n');
-        }
-        if next() % 3 == 0 { out.pop(); }
-        out
-    }
-
-    #[test]
-    fn fixed_sequence_matches_scalar_decoder() {
-        let start = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
-        let w = Window { start, end: start + 14 * DAY_MS, click_start: start - WEEK_MS, start_day: start.div_euclid(DAY_MS) as i32 };
-        let origin = w.start_day as i64 * DAY_MS - WEEK_MS;
-        let clock = Clock::new(w.start, w.end);
-        let prod_cat: Vec<u8> = (0..60_000u32).map(|i| if i % 97 == 0 { 255 } else { (i % 19) as u8 + 1 }).collect();
-        let (prod_other, camp_by_num, camp_other) = (HashMap::new(), Vec::new(), HashMap::new());
-        let cx = Ctx { prod_cat: &prod_cat, unknown: 0, prod_other: &prod_other, camp_by_num: &camp_by_num, camp_other: &camp_other, window: &w };
-        let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
-        let b = Bits { user: 4, id: 5 };
-        let dec = Decoder::new(&cx, &clock, &shared, origin, b);
-        let mut state = 0x1234_5678_9abc_def1u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let fresh = || Scan { ev: bins(16), cl: Vec::new(), cand: bins(32), wide: Vec::new(), links: Vec::new() };
-        let (mut total, mut slow) = (0usize, 0usize);
-        for round in 0..60 {
-            let rows = 1 + (next() % 2500) as usize;
-            let buf = synth_events(&mut next, &w, rows);
-            let (mut a, mut c) = (fresh(), fresh());
-            batched::<7>(&buf, |rows| dec.events(rows, &mut a));
-            let mut l = Lists::new();
-            SLOW_ROWS.store(0, AtomicOrdering::Relaxed);
-            dec.event_rows(&buf, &mut c, &mut l);
-            total += rows;
-            slow += SLOW_ROWS.load(AtomicOrdering::Relaxed);
-            let ev = |s: &Scan| s.ev.iter().map(|v| v.iter().map(|e| (e.key, e.val)).collect::<Vec<_>>()).collect::<Vec<_>>();
-            let cand = |s: &Scan| s.cand.iter().map(|v| v.iter().map(|c| (c.h, c.sec, c.loc)).collect::<Vec<_>>()).collect::<Vec<_>>();
-            let wide = |s: &Scan| s.wide.iter().map(|v| v.iter().map(|x| (x.h, x.at, x.at_row)).collect::<Vec<_>>()).collect::<Vec<_>>();
-            assert_eq!(ev(&a), ev(&c), "events, round {round}");
-            assert_eq!(cand(&a), cand(&c), "candidates, round {round}");
-            assert_eq!(wide(&a), wide(&c), "wide candidates, round {round}");
-        }
-        // Most synthetic rows have a generator shape: the fixed sequence must own them.
-        assert!(slow * 2 < total, "exact path took {slow} of {total} rows");
-    }
-
     #[test]
     fn canonical8_matches_canonical_number() {
         let mut cases: Vec<Vec<u8>> = Vec::new();
@@ -1160,27 +833,6 @@ mod bench {
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
             batched::<7>(body, |rows| dec.events(rows, &mut out));
             std::hint::black_box(&out.ev);
-        });
-        report("stage1", &mut || {
-            let mut l = Lists::new();
-            let mut acc = 0usize;
-            let mut start = 0;
-            while start < body.len() {
-                let end = (start + WINDOW).min(body.len());
-                let (nc, nl) = wire::scan_window(body, start, end, &mut l);
-                acc += nc;
-                start = if nl == 0 { end } else { start + (l.lines[nl - 1] & !POISON) as usize + 1 };
-            }
-            std::hint::black_box(acc);
-        });
-        report("event_rows", &mut || {
-            let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
-                                 cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            let mut l = Lists::new();
-            SLOW_ROWS.store(0, AtomicOrdering::Relaxed);
-            dec.event_rows(body, &mut out, &mut l);
-            std::hint::black_box(&out.ev);
-            eprintln!("slow rows: {}", SLOW_ROWS.load(AtomicOrdering::Relaxed));
         });
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
