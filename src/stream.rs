@@ -7,6 +7,7 @@ use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
 use crate::clock::Clock;
 use crate::links::Aliases;
+use crate::wire::Cell;
 
 /// The splitmix64 finalizer. Every step is invertible, so `hash` is a
 /// bijection: a mixed key identifies its key exactly, and rows carry mixed
@@ -147,16 +148,17 @@ fn canonical8(w: u64, n: usize) -> Option<u32> {
 }
 
 /// Rows per decode batch. The scanner invokes its callback from several
-/// sites; a callback that only stores fields stays small enough to inline,
+/// sites; a callback that only stores cells stays small enough to inline,
 /// and each decoder runs as one loop with its constants in registers.
 const BATCH: usize = 32;
 
+/// Decode the records of `buf[start..end]` (see `wire::cells`) in batches.
 #[inline(always)]
-fn batched<'b, const N: usize>(buf: &'b [u8], mut decode: impl FnMut(&[[&'b [u8]; N]])) {
-    let mut batch = [[&buf[..0]; N]; BATCH];
+fn batched<'b, const N: usize>(buf: &'b [u8], start: usize, end: usize, mut decode: impl FnMut(&[Cell<'b, N>])) {
+    let mut batch = [Cell::EMPTY; BATCH];
     let mut n = 0;
-    wire::rows::<N>(buf, |f| {
-        batch[n % BATCH] = f;
+    wire::cells::<N>(buf, start, end, |c| {
+        batch[n % BATCH] = c;
         n += 1;
         if n == BATCH {
             decode(&batch);
@@ -191,14 +193,17 @@ impl Decoder<'_, '_> {
     /// shuffled input a per-row F1/F2/F3 branch mispredicts about every
     /// other row, while three loops over the lists never branch on form.
     #[inline(always)]
-    fn stamps<const N: usize>(&self, rows: &[[&[u8]; N]], col: usize) -> [i64; BATCH] {
+    fn stamps<const N: usize>(&self, rows: &[Cell<'_, N>], col: usize) -> [i64; BATCH] {
         debug_assert!(rows.len() <= BATCH);
         // Every slot read later is written below: each row joins one form.
         let mut ts = [0i64; BATCH];
+        let mut field = [&[][..]; BATCH];
         let mut form = [[0u8; BATCH]; 3];
         let (mut a, mut b, mut c) = (0, 0, 0);
-        for (i, f) in rows.iter().enumerate() {
-            let n = f[col].len();
+        for (i, r) in rows.iter().enumerate() {
+            let f = r.field(col);
+            field[i] = f;
+            let n = f.len();
             let (f1, f2) = (n == 20, n == 25);
             // SAFETY: each cursor counts earlier rows, so it is < i + 1 <= BATCH.
             unsafe {
@@ -212,39 +217,39 @@ impl Decoder<'_, '_> {
         }
         // SAFETY (all three loops): listed indexes are rows of this batch, and
         // a row is listed under F1 or F2 only when its field has that length.
-        let field = |i: u8| unsafe { *rows.get_unchecked(usize::from(i)).get_unchecked(col) };
+        let at = |i: u8| unsafe { *field.get_unchecked(usize::from(i)) };
         for &i in &form[0][..a] {
-            let t = self.clock.parse20(unsafe { &*field(i).as_ptr().cast() });
+            let t = self.clock.parse20(unsafe { &*at(i).as_ptr().cast() });
             unsafe { *ts.get_unchecked_mut(usize::from(i)) = t.unwrap_or(i64::MIN) };
         }
         for &i in &form[1][..b] {
-            let t = self.clock.parse25(unsafe { &*field(i).as_ptr().cast() });
+            let t = self.clock.parse25(unsafe { &*at(i).as_ptr().cast() });
             unsafe { *ts.get_unchecked_mut(usize::from(i)) = t.unwrap_or(i64::MIN) };
         }
         for &i in &form[2][..c] {
-            let t = self.clock.parse(field(i));
+            let t = self.clock.parse(at(i));
             unsafe { *ts.get_unchecked_mut(usize::from(i)) = t.unwrap_or(i64::MIN) };
         }
         ts
     }
 
     #[inline(never)]
-    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
+    fn events(&self, rows: &[Cell<'_, 7>], out: &mut Scan) {
         assert!(out.ev.len() == 1 << self.b.user && out.cand.len() == 1 << self.b.id);
         let ts = self.stamps(rows, 2);
-        for (f, &ts) in rows.iter().zip(&ts) {
-            self.event(f, ts, out);
+        for (c, &ts) in rows.iter().zip(&ts) {
+            self.event(c, ts, out);
         }
     }
 
     #[inline(always)]
-    fn event(&self, f: &[&[u8]; 7], ts: i64, out: &mut Scan) {
-        let Some(id) = event_key(self.s, f[0]) else { return };
-        let Some(sec) = self.clock.ingest_s(f[3]) else { return };
+    fn event(&self, c: &Cell<'_, 7>, ts: i64, out: &mut Scan) {
+        let Some(id) = event_key(self.s, c.field(0)) else { return };
+        let Some(sec) = self.clock.ingest_s(c.field(3)) else { return };
         let mut at_row = None;
-        if let Some(val) = self.payload(f, ts, sec * 1000) {
+        if let Some(val) = self.payload(c, ts, sec * 1000) {
             // Mixed until renaming.
-            let key = hash(user_key(self.s, f[1]));
+            let key = hash(user_key(self.s, c.field(1)));
             let bin = (key >> (64 - self.b.user)) as usize;
             // SAFETY: bin < 1 << user == ev.len(), asserted once per batch.
             let v = unsafe { out.ev.get_unchecked_mut(bin) };
@@ -255,9 +260,9 @@ impl Decoder<'_, '_> {
     }
 
     #[inline(always)]
-    fn payload(&self, f: &[&[u8]; 7], ts: i64, at: i64) -> Option<u64> {
+    fn payload(&self, c: &Cell<'_, 7>, ts: i64, at: i64) -> Option<u64> {
         // Whole-word compares: a view/cart split costs no branch.
-        let purchase = match *f[4] {
+        let purchase = match *c.field(4) {
             [a, b, c, d] => {
                 let w = u32::from_le_bytes([a, b, c, d]);
                 if w != VIEW && w != CART { return None; }
@@ -266,21 +271,21 @@ impl Decoder<'_, '_> {
             [a, b, c, d, e, g, h, i] if u64::from_le_bytes([a, b, c, d, e, g, h, i]) == PURCHASE => true,
             _ => return None,
         };
-        if f[1].is_empty() || f[5].is_empty() { return None; }
+        if c.field(1).is_empty() || c.field(5).is_empty() { return None; }
         // One unsigned compare per bound pair; it rejects the invalid sentinel.
         if ts.wrapping_sub(self.start) as u64 >= self.span || at.wrapping_sub(ts) > DAY_MS {
             return None;
         }
-        let pay = if purchase { parse_price(f[6])? | u32::from(product_cat(self.cx, f[5])) << 24 } else { 0 };
+        let pay = if purchase { parse_price(c.field(6))? | u32::from(product_cat(self.cx, c.field(5))) << 24 } else { 0 };
         Some(((ts - self.origin) as u64) << 32 | u64::from(pay))
     }
 
     #[inline(never)]
-    fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
-        assert!(out.cl.len() == 1 << self.b.user && out.cand.len() == 1 << self.b.id);
+    fn clicks(&self, buf: &[u8], rows: &[Cell<'_, 4>], out: &mut Scan) {
+        assert!(out.cl.len() == 1 << self.b.user);
         let ts = self.stamps(rows, 3);
-        for (f, &ts) in rows.iter().zip(&ts) {
-            self.click(buf, f, ts, out);
+        for (c, &ts) in rows.iter().zip(&ts) {
+            self.click(buf, c, ts, out);
         }
     }
 
@@ -288,12 +293,13 @@ impl Decoder<'_, '_> {
     // per campaign and credit is a min/max over keys. Both are idempotent:
     // duplicating an identical tuple cannot change either, so clicks skip dedup.
     #[inline(always)]
-    fn click(&self, buf: &[u8], f: &[&[u8]; 4], ts: i64, out: &mut Scan) {
-        if f[0].is_empty() || f[1].is_empty() { return; }
+    fn click(&self, buf: &[u8], c: &Cell<'_, 4>, ts: i64, out: &mut Scan) {
+        let (id, user) = (c.field(0), c.field(1));
+        if id.is_empty() || user.is_empty() { return; }
         if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { return; }
-        let Some(camp) = self.campaign(buf, f[2]) else { return };
-        let key = hash(user_key(self.s, f[1]));
-        let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
+        let Some(camp) = self.campaign(buf, c.field(2)) else { return };
+        let key = hash(user_key(self.s, user));
+        let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, id), camp };
         // SAFETY: the bin is < 1 << user == cl.len(), asserted once per batch.
         unsafe { out.cl.get_unchecked_mut((key >> (64 - self.b.user)) as usize) }.push(Click { key, hit });
     }
@@ -623,11 +629,12 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
-                let buf=&maps[c.file as usize][c.start..c.end];
+                let buf=&maps[c.file as usize][..];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
-                    1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
-                    _=>wire::rows::<2>(buf,|[a,b]| {
+                    0=>batched::<7>(buf,c.start,c.end,|rows|dec.events(rows,&mut out)),
+                    1=>batched::<4>(buf,c.start,c.end,|rows|dec.clicks(buf,rows,&mut out)),
+                    _=>wire::cells::<2>(buf,c.start,c.end,|c| {
+                        let [a,b]=c.fields();
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));
                         }
@@ -794,7 +801,8 @@ mod bench {
         let cx = Ctx { prod_cat: &prod_cat, unknown, prod_other: &prod_other, camp_by_num: &camp_by_num,
                        camp_other: &camp_other, window: &w };
         let buf = fs::read(data.join("events/part-00043.csv")).unwrap();
-        let body = &buf[memchr::memchr(b'\n', &buf).unwrap() + 1..];
+        let first = memchr::memchr(b'\n', &buf).unwrap() + 1;
+        let body = &buf[first..];
         let rows_n = memchr::memchr_iter(b'\n', body).count();
         let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
         let b = Bits { user: 9, id: 11 };
@@ -820,56 +828,50 @@ mod bench {
             }
             std::hint::black_box(acc);
         });
-        report("rows<7>", &mut || {
+        report("cells<7>", &mut || {
             let mut acc = 0usize;
-            wire::rows::<7>(body, |f| acc += f[0].len() + f[6].len());
+            wire::cells::<7>(&buf, first, buf.len(), |c| acc += c.field(0).len() + c.field(6).len());
             std::hint::black_box(acc);
         });
         report("batch", &mut || {
             let mut acc = 0usize;
-            let mut batch = [[&body[..0]; 7]; BATCH];
-            let mut n = 0;
             #[inline(never)]
-            fn sink(rows: &[[&[u8]; 7]], acc: &mut usize) { for f in rows { *acc += f[0].len() + f[6].len(); } }
-            wire::rows::<7>(body, |f| {
-                batch[n % BATCH] = f;
-                n += 1;
-                if n == BATCH { sink(&batch, &mut acc); n = 0; }
-            });
-            sink(&batch[..n], &mut acc);
+            fn sink(rows: &[Cell<'_, 7>], acc: &mut usize) { for c in rows { *acc += c.field(0).len() + c.field(6).len(); } }
+            batched::<7>(&buf, first, buf.len(), |rows| sink(rows, &mut acc));
             std::hint::black_box(acc);
         });
         report("+id", &mut || {
             let mut acc = 0u64;
-            wire::rows::<7>(body, |f| { if let Some(id) = id_key(&shared, f[0]) { acc ^= id; } });
+            wire::cells::<7>(&buf, first, buf.len(), |c| { if let Some(id) = id_key(&shared, c.field(0)) { acc ^= id; } });
             std::hint::black_box(acc);
         });
         report("+ingest", &mut || {
             let mut acc = 0u64;
-            wire::rows::<7>(body, |f| {
-                let Some(id) = id_key(&shared, f[0]) else { return };
-                let Some(at) = clock.ingest(f[3]) else { return };
+            wire::cells::<7>(&buf, first, buf.len(), |c| {
+                let Some(id) = id_key(&shared, c.field(0)) else { return };
+                let Some(at) = clock.ingest(c.field(3)) else { return };
                 acc ^= id ^ at as u64;
             });
             std::hint::black_box(acc);
         });
         report("+payload", &mut || {
             let mut acc = 0u64;
-            wire::rows::<7>(body, |f| {
-                let Some(id) = id_key(&shared, f[0]) else { return };
-                let Some(at) = clock.ingest(f[3]) else { return };
-                let v = dec.payload(&f, clock.parse(f[2]).unwrap_or(i64::MIN), at).unwrap_or(0);
+            wire::cells::<7>(&buf, first, buf.len(), |c| {
+                let Some(id) = id_key(&shared, c.field(0)) else { return };
+                let Some(at) = clock.ingest(c.field(3)) else { return };
+                let v = dec.payload(&c, clock.parse(c.field(2)).unwrap_or(i64::MIN), at).unwrap_or(0);
                 acc ^= id ^ at as u64 ^ v;
             });
             std::hint::black_box(acc);
         });
         report("+user", &mut || {
             let mut acc = 0u64;
-            wire::rows::<7>(body, |f| {
-                let Some(id) = id_key(&shared, f[0]) else { return };
-                let Some(at) = clock.ingest(f[3]) else { return };
-                let v = dec.payload(&f, clock.parse(f[2]).unwrap_or(i64::MIN), at).unwrap_or(0);
-                let u = if f[1].is_empty() { 0 } else { user_key(&shared, f[1]) };
+            wire::cells::<7>(&buf, first, buf.len(), |c| {
+                let Some(id) = id_key(&shared, c.field(0)) else { return };
+                let Some(at) = clock.ingest(c.field(3)) else { return };
+                let v = dec.payload(&c, clock.parse(c.field(2)).unwrap_or(i64::MIN), at).unwrap_or(0);
+                let u = c.field(1);
+                let u = if u.is_empty() { 0 } else { user_key(&shared, u) };
                 acc ^= id ^ at as u64 ^ v ^ u;
             });
             std::hint::black_box(acc);
@@ -877,7 +879,7 @@ mod bench {
         report("scan_events", &mut || {
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(rows, &mut out));
+            batched::<7>(&buf, first, buf.len(), |rows| dec.events(rows, &mut out));
             std::hint::black_box(&out.ev);
         });
         eprintln!("rows={rows_n} bytes={}", body.len());
