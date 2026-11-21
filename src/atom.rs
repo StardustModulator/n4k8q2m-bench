@@ -20,7 +20,7 @@ const RANK: [u8; 256] = {
 };
 
 /// Remove the (already checked) zero high bit of each byte.
-#[inline]
+#[inline(always)]
 fn gather_ascii(x: u64) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
@@ -52,7 +52,7 @@ fn scatter_ascii(x: u64) -> u64 {
 }
 
 /// Accept `E/K/U/e/k/u` followed by zero through eight arbitrary ASCII bytes.
-#[inline]
+#[inline(always)]
 pub(super) fn try_pack(s: &[u8]) -> Option<u64> {
     let n = s.len();
     if !(1..=9).contains(&n) {
