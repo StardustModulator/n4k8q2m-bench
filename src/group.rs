@@ -36,30 +36,9 @@ pub(super) struct Scratch {
     ids: Vec<u32>,
     ev: Vec<u64>,
     cl: Vec<Hit>,
-    /// Persons in the previous bin: bins are alike, so it sizes the table.
-    persons: usize,
 }
 
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
-/// Records whose table slot is fetched ahead of their turn.
-const AHEAD: usize = 12;
-
-/// Pull the line holding `p` towards the core; a hint, never a fault.
-#[inline(always)]
-fn prefetch<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch hint has no effect beyond the caches.
-    unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast())
-    };
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: a prefetch hint has no effect beyond the caches.
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly))
-    };
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let _ = p;
-}
 
 // Within a person shard the table and cursors fit in private caches: number
 // every row by its person's slot, count, then scatter each person's events
@@ -77,11 +56,8 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         acc.rows.reserve(ne * 64);
     }
     let t0 = Instant::now();
+    let mut bits = (ne / 8).max(64).next_power_of_two().trailing_zeros();
     let mut sc = std::mem::take(&mut acc.scratch);
-    // Half-full at the previous bin's person count (events over 16 for the
-    // first); a fuller table doubles below. Smaller tables stay in cache.
-    let est = if sc.persons == 0 { ne / 16 } else { sc.persons };
-    let mut bits = (est * 2).max(64).next_power_of_two().trailing_zeros();
     // Person numbers go to a reused array rather than into the parts, which
     // stay clean and are only read twice. A table that fills up is doubled
     // and the pass redone; the numbers so far are simply overwritten.
@@ -108,30 +84,39 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
     // `number` gave every event a slot below slots.len() and counted it in
     // that slot, so each cursor stays below the next slot's start <= es (cs).
     let (ev_ids, cl_ids) = ids[..ne + nc].split_at(ne);
-    for (i, (r, &id)) in parts.iter().flat_map(|p| &p.ev).zip(ev_ids).enumerate() {
-        // SAFETY: a slot number is below slots.len(); the lookahead index is
-        // clamped to the numbered events.
-        let next = unsafe { *ev_ids.get_unchecked((i + AHEAD).min(ne - 1)) };
-        prefetch(unsafe { slots.get_unchecked(next as usize) });
-        let cursor = unsafe { &mut slots.get_unchecked_mut(id as usize).ev };
-        unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
-        *cursor += 1;
-    }
-    for (r, &id) in parts.iter().flat_map(|p| &p.cl).zip(cl_ids) {
-        if id != u32::MAX {
+    // Plain counted loops: an iterator chain over the parts kept the loop
+    // body several instructions longer than the work itself.
+    let mut n = 0;
+    for p in &parts {
+        for r in &p.ev {
+            // SAFETY: n counts the events, which have one number each.
+            let id = unsafe { *ev_ids.get_unchecked(n) } as usize;
+            n += 1;
             // SAFETY: see above.
-            let cursor = unsafe { &mut slots.get_unchecked_mut(id as usize).cl };
-            unsafe { *cl.get_unchecked_mut(*cursor as usize) = r.hit };
+            let cursor = unsafe { &mut slots.get_unchecked_mut(id).ev };
+            unsafe { *ev.get_unchecked_mut(*cursor as usize) = r.val };
             *cursor += 1;
+        }
+    }
+    let mut n = 0;
+    for p in &parts {
+        for r in &p.cl {
+            // SAFETY: n counts the clicks, which have one number each.
+            let id = unsafe { *cl_ids.get_unchecked(n) } as usize;
+            n += 1;
+            if id != u32::MAX as usize {
+                // SAFETY: see above.
+                let cursor = unsafe { &mut slots.get_unchecked_mut(id).cl };
+                unsafe { *cl.get_unchecked_mut(*cursor as usize) = r.hit };
+                *cursor += 1;
+            }
         }
     }
     let t2 = Instant::now();
     let (mut e0, mut c0) = (0, 0);
-    let mut persons = 0;
     for p in &mut slots {
         let (e1, c1) = (p.ev as usize, p.cl as usize);
         if e1 > e0 {
-            persons += 1;
             acc.person(p.key, &mut ev[e0..e1], &mut cl[c0..c1], cats, slow, first_day);
         }
         e0 = e1; c0 = c1;
@@ -139,7 +124,6 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
         *p = Slot::default();
     }
     sc.slots = slots;
-    sc.persons = persons;
     acc.scratch = sc;
     let t3 = Instant::now();
     #[cfg(test)]
@@ -159,17 +143,11 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
     let slots = &mut slots[..];
     let shift = 64 - bits;
     let mut room = mask / 4 * 3;
-    let (ev_ids, cl_ids) = ids.split_at_mut(parts.iter().map(|p| p.ev.len()).sum());
-    let mut out = ev_ids.iter_mut();
-    let home = |key: u64| (key.wrapping_mul(MUL) >> shift) as usize;
+    let mut n = 0;
     for p in parts {
-        let ev = &p.ev[..];
-        for (i, e) in ev.iter().enumerate() {
-            // The slot of a later record is fetched while this one waits.
-            // SAFETY: the index is clamped to the part; home() <= mask.
-            prefetch(unsafe { slots.get_unchecked(home(ev.get_unchecked((i + AHEAD).min(ev.len() - 1)).key)) });
+        for e in &p.ev {
             let key = e.key;
-            let s = home(key);
+            let s = (key.wrapping_mul(MUL) >> shift) as usize;
             // A key sits in its home slot or the next one unless its run is
             // long; only those and new keys take the probing path.
             // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
@@ -183,25 +161,31 @@ fn number(parts: &[Histories], slots: &mut Vec<Slot>, ids: &mut [u32], bits: u32
                     slots[id].key = key;
                 }
             }
-            // SAFETY: id <= mask + 1 < slots.len().
+            // SAFETY: id <= mask + 1 < slots.len(); ids holds one entry per
+            // record and n counts them.
             unsafe { slots.get_unchecked_mut(id) }.ev += 1;
-            if let Some(o) = out.next() { *o = id as u32; }
+            unsafe { *ids.get_unchecked_mut(n) = id as u32 };
+            n += 1;
         }
     }
-    let mut out = cl_ids.iter_mut();
-    for c in parts.iter().flat_map(|p| &p.cl) {
-        let key = c.key;
-        let s = (key.wrapping_mul(MUL) >> shift) as usize;
-        // SAFETY: as for events.
-        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-        if unsafe { slots.get_unchecked(id) }.key != key {
-            id = probe(slots, key, s, mask);
+    for p in parts {
+        for c in &p.cl {
+            let key = c.key;
+            let s = (key.wrapping_mul(MUL) >> shift) as usize;
+            // SAFETY: as for events.
+            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+            if unsafe { slots.get_unchecked(id) }.key != key {
+                id = probe(slots, key, s, mask);
+            }
+            // A person without events has no sessions to credit.
+            let found = slots[id].key == key;
+            if found { slots[id].cl += 1; }
+            // SAFETY: as for events.
+            unsafe { *ids.get_unchecked_mut(n) = if found { id as u32 } else { u32::MAX } };
+            n += 1;
         }
-        // A person without events has no sessions to credit.
-        let found = slots[id].key == key;
-        if found { slots[id].cl += 1; }
-        if let Some(o) = out.next() { *o = if found { id as u32 } else { u32::MAX }; }
     }
+    debug_assert_eq!(n, ids.len());
     true
 }
 
