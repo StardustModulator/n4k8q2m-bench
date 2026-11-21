@@ -395,7 +395,7 @@ impl Decoder<'_, '_> {
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
         let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
-        out.cl[(key >> (64 - self.b.user)) as usize].push(Click { key, hit });
+        push_far(&mut out.cl[(key >> (64 - self.b.user)) as usize], Click { key, hit });
     }
 
     /// `campaign_of` with the number decoded in one word.
@@ -721,12 +721,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
-                let m=&maps[c.file as usize];
-                // Map the chunk's pages in one call rather than by fault-around
-                // exceptions every 16 pages; an old kernel just refuses.
-                #[cfg(target_os="linux")]
-                let _=m.advise_range(Advice::PopulateRead,c.start,c.end-c.start);
-                let buf=&m[c.start..c.end];
+                let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
                     0=>{wire::records::<7, _>(buf,Events{dec:&dec,out:&mut out});}
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
@@ -1013,6 +1008,27 @@ mod bench {
             std::hint::black_box(&out.ev);
         });
         eprintln!("fallback: shape {slow} ({:.3}%), poisoned/simple {exact}", 100.0 * slow as f64 / rows_n as f64);
+        // BENCH_ALL=1: the fallback rate over every event file of the dataset.
+        if std::env::var_os("BENCH_ALL").is_some() {
+            struct S<'a, 'c, 'o> { dec: &'a Decoder<'a, 'c>, out: &'o mut Scan, rows: usize, slow: usize, exact: usize }
+            impl<'b> wire::Sink<'b, 7> for S<'_, '_, '_> {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    self.rows += 1;
+                    if !self.dec.fast(&f, self.out) { self.slow += 1; self.dec.event_exact(&f.all(), self.out); }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.rows += 1; self.exact += 1; self.dec.event_exact(&f, self.out); }
+            }
+            let (mut rows, mut slow, mut exact) = (0, 0, 0);
+            for p in list_csv(&data.join("events")).unwrap() {
+                let buf = fs::read(&p).unwrap();
+                let mut out = Scan { ev: bins(1 << b.user), cl: Vec::new(), cand: bins(1 << b.id), wide: Vec::new(), links: Vec::new() };
+                let s = wire::records::<7, _>(crate::body(&buf), S { dec: &dec, out: &mut out, rows: 0, slow: 0, exact: 0 });
+                rows += s.rows; slow += s.slow; exact += s.exact;
+            }
+            eprintln!("all files: rows {rows} fallback shape {slow} ({:.3}%) poisoned/simple {exact} ({:.3}%)",
+                      100.0 * slow as f64 / rows as f64, 100.0 * exact as f64 / rows as f64);
+        }
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
 }
