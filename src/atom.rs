@@ -19,40 +19,26 @@ const RANK: [u8; 256] = {
     t
 };
 
-/// Remove the (already checked) zero high bit of each byte.
-#[inline]
+/// Remove the (already checked) zero high bit of each byte. Shifts and masks
+/// rather than BMI2 PEXT/PDEP: those are microcoded and very slow on AMD Zen 1
+/// and 2, which also report x86-64-v3.
+#[inline(always)]
 fn gather_ascii(x: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: BMI2 is enabled for the compilation target.
-        unsafe { std::arch::x86_64::_pext_u64(x, ASCII) }
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-    {
-        // Combine adjacent groups of 7, then 14, then 28 bits.
-        let x = (x & 0x00ff_00ff_00ff_00ff) | ((x & 0xff00_ff00_ff00_ff00) >> 1);
-        let x = (x & 0x0000_ffff_0000_ffff) | ((x & 0xffff_0000_ffff_0000) >> 2);
-        u64::from(x as u32) | ((x >> 32) << 28)
-    }
+    // Combine adjacent groups of 7, then 14, then 28 bits.
+    let x = (x & 0x00ff_00ff_00ff_00ff) | ((x & 0xff00_ff00_ff00_ff00) >> 1);
+    let x = (x & 0x0000_ffff_0000_ffff) | ((x & 0xffff_0000_ffff_0000) >> 2);
+    u64::from(x as u32) | ((x >> 32) << 28)
 }
 
 #[inline]
 fn scatter_ascii(x: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: BMI2 is enabled for the compilation target.
-        unsafe { std::arch::x86_64::_pdep_u64(x, ASCII) }
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-    {
-        let x = (x & 0x0fff_ffff) | ((x >> 28) << 32);
-        let x = (x & 0x0000_3fff_0000_3fff) | ((x << 2) & 0x3fff_0000_3fff_0000);
-        (x & 0x007f_007f_007f_007f) | ((x << 1) & 0x7f00_7f00_7f00_7f00)
-    }
+    let x = (x & 0x0fff_ffff) | ((x >> 28) << 32);
+    let x = (x & 0x0000_3fff_0000_3fff) | ((x << 2) & 0x3fff_0000_3fff_0000);
+    (x & 0x007f_007f_007f_007f) | ((x << 1) & 0x7f00_7f00_7f00_7f00)
 }
 
 /// Accept `E/K/U/e/k/u` followed by zero through eight arbitrary ASCII bytes.
-#[inline]
+#[inline(always)]
 pub(super) fn try_pack(s: &[u8]) -> Option<u64> {
     let n = s.len();
     if !(1..=9).contains(&n) {

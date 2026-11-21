@@ -5,8 +5,9 @@ use super::time::{civil_from_days, format_day, parse_ts, DAY_MS};
 
 #[derive(Clone, Copy)]
 struct Day {
-    tag: [u8; 11], // the entire YYYY-MM-DDT, including punctuation
-    midnight_ms: i64,
+    lo: u64,       // "YYYY-MM-"
+    hi: u32,       // "DDT" in the low three bytes
+    midnight: i64, // seconds
 }
 
 pub(super) struct Clock {
@@ -23,15 +24,18 @@ fn slot(b: &[u8]) -> usize {
     (usize::from(b[6] & 1) << 5) | usize::from(dd & 31)
 }
 
+/// The whole "YYYY-MM-DDT" prefix as two words; the hour digit is masked off.
+#[inline(always)]
+fn tag(b: &[u8]) -> (u64, u32) {
+    (word(&b[..8]), u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xff_ffff)
+}
+
 impl Clock {
     pub(super) fn new(start: i64, end: i64) -> Self {
         // Even the default entry represents a real date: no arbitrary input
         // can match an uninitialized/all-zero tag and be mistaken for a hit.
-        let epoch = Day {
-            tag: *b"1970-01-01T",
-            midnight_ms: 0,
-        };
-        let mut days = [epoch; 64];
+        let (lo, hi) = tag(b"1970-01-01T00");
+        let mut days = [Day { lo, hi, midnight: 0 }; 64];
         // Include the click lookback and the preceding local day for F2.
         // Leave room after the window for offsets and late ingest dates too.
         // Bound the work even if passed the entire i64 range.
@@ -42,30 +46,34 @@ impl Clock {
             if !(0..=9999).contains(&civil_from_days(d).year) {
                 continue; // format_day writes a four-digit unsigned year
             }
-            let mut tag = epoch.tag;
-            format_day(day, (&mut tag[..10]).try_into().unwrap());
-            days[slot(&tag)] = Day {
-                tag,
-                midnight_ms: d * DAY_MS,
-            };
+            let mut text = *b"1970-01-01T00";
+            format_day(day, (&mut text[..10]).try_into().unwrap());
+            let (lo, hi) = tag(&text);
+            days[slot(&text)] = Day { lo, hi, midnight: d * (DAY_MS / 1000) };
         }
         Self { days }
     }
 
     /// F1, F2 or unsigned ASCII epoch milliseconds (F3).
-    #[inline]
+    #[inline(always)]
     pub(super) fn parse(&self, b: &[u8]) -> Option<i64> {
         match b.len() {
-            20 if b[19] == b'Z' => self.iso::<20>(b.try_into().unwrap()),
-            25 if matches!(b[19], b'+' | b'-') => self.iso::<25>(b.try_into().unwrap()),
+            20 if b[19] == b'Z' => Some(self.iso::<20>(b.try_into().unwrap())? * 1000),
+            25 if matches!(b[19], b'+' | b'-') => Some(self.iso::<25>(b.try_into().unwrap())? * 1000),
             _ => epoch_ms(b),
         }
     }
 
     /// The ingest column has its own F1-only entry point. In particular an
     /// old or very late ingest still participates in dedup at its real time.
-    #[inline]
+    #[cfg(test)]
     pub(super) fn ingest(&self, b: &[u8]) -> Option<i64> {
+        Some(self.ingest_s(b)? * 1000)
+    }
+
+    /// `ingest` in whole seconds, which is exact: F1 has no fraction.
+    #[inline(always)]
+    pub(super) fn ingest_s(&self, b: &[u8]) -> Option<i64> {
         let b: &[u8; 20] = b.try_into().ok()?;
         if b[19] != b'Z' {
             return None;
@@ -73,19 +81,20 @@ impl Clock {
         self.iso(b)
     }
 
+    /// Seconds since the epoch.
     #[inline(always)]
     fn iso<const N: usize>(&self, b: &[u8; N]) -> Option<i64> {
         let day = &self.days[slot(b)];
-        if day.tag != b[..11] {
+        if (day.lo, day.hi) != tag(b) {
             return uncached_iso(b);
         }
-        let local = day.midnight_ms + hms_ms(word(&b[11..19]))?;
+        let local = day.midnight + hms_s(word(&b[11..19]))?;
         if N == 25 {
             // Load exactly through the end of F2: "SS±HH:MM". Discard the
             // first three bytes and supply ":00" seconds for the same checked
-            // HH:MM:SS decoder. Keep the offset in signed milliseconds.
+            // HH:MM:SS decoder. Keep the offset in signed seconds.
             let hm = word(&b[17..25]) >> 24;
-            let offset = hms_ms(hm | (HMS_MIN & (u64::MAX << 40)))?;
+            let offset = hms_s(hm | (HMS_MIN & (u64::MAX << 40)))?;
             Some(if b[19] == b'+' {
                 local - offset
             } else {
@@ -97,11 +106,12 @@ impl Clock {
     }
 }
 
-// Keep the general calendar conversion off the row-parsing hot path.
+// Keep the general calendar conversion off the row-parsing hot path. ISO
+// forms are whole seconds (offsets are whole minutes), so the division is exact.
 #[cold]
 #[inline(never)]
 fn uncached_iso(b: &[u8]) -> Option<i64> {
-    parse_ts(b)
+    parse_ts(b).map(|ms| ms / 1000)
 }
 
 #[inline(always)]
@@ -115,7 +125,7 @@ const HMS_MIN: u64 = u64::from_le_bytes(*b"00:00:00");
 const HMS_BIAS: u64 = LOW7 - u64::from_le_bytes(*b"29:59:59");
 
 #[inline(always)]
-fn hms_ms(raw: u64) -> Option<i64> {
+fn hms_s(raw: u64) -> Option<i64> {
     // In each lane require MIN <= byte <= MAX (the two colons have min=max).
     // Valid lanes cannot carry/borrow into a neighbor, so the *first* invalid
     // lane necessarily contributes a high bit to one of these two words.
@@ -129,7 +139,7 @@ fn hms_ms(raw: u64) -> Option<i64> {
     }
     let m = i64::from((pairs >> 24) as u8);
     let s = i64::from((pairs >> 48) as u8);
-    Some(h * 3_600_000 + m * 60_000 + s * 1_000)
+    Some((h * 60 + m) * 60 + s)
 }
 
 #[inline(always)]
@@ -155,7 +165,7 @@ fn epoch_ms(b: &[u8]) -> Option<i64> {
 
 /// Reduce eight little-endian digit lanes (values 0..9) to one integer.
 #[inline(always)]
-fn decimal8(digits: u64) -> u64 {
+pub(super) fn decimal8(digits: u64) -> u64 {
     let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
     // Select pairs 0 and 2, then 1 and 3. In the high 32 bits the products
     // are weighted by 10^6, 10^2 and by 10^4, 1 respectively.
