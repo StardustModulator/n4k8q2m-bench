@@ -240,10 +240,11 @@ impl Decoder<'_, '_> {
     #[inline(always)]
     fn fast(&self, f: &wire::Fields<'_, 7>, out: &mut Scan) -> bool {
         let p = f.first();
-        // SAFETY: `Fields` guarantees p[0..=f.end(6)] readable. A quote flag
-        // reads a field's first byte, at most the LF. Every other load is
-        // bounded by a later field once that field's length is known: see
-        // each.
+        // SAFETY: `Fields` guarantees p[0..f.end(6)] readable; f.end(6) is
+        // the LF or EOF. A quote flag reads a field's first byte, which for
+        // fields 0..=5 lies before separator 6; the price is probed at its
+        // last byte. Every other load is bounded by a later field once that
+        // field's length is known: see each.
         unsafe {
             // In a clean row a field starts with a quote exactly when it also
             // ends with one; the content lies between.
@@ -311,8 +312,12 @@ impl Decoder<'_, '_> {
             let mut pay = 0u32;
             if purchase & valid {
                 let r6 = e5 + 1;
-                let q6 = quoted(r6);
-                let l6 = f.end(6) - r6 - 2 * q6;
+                let e6 = f.end(6);
+                // The price's separator is the LF, or EOF, which may lie past
+                // the buffer: probe the field's last byte instead (a wrapped
+                // field ends in a quote too); for an empty field, separator 5.
+                let q6 = u32::from(*p.add((e6 - 1) as usize) == b'"');
+                let l6 = e6 - r6 - 2 * q6;
                 match parse_price(slice(p, r6 + q6, l6)) {
                     Some(c) => pay = c | u32::from(product_cat(self.cx, slice(p, r5 + q5, l5))) << 24,
                     None => valid = false,
