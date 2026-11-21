@@ -230,6 +230,35 @@ impl Decoder<'_, '_> {
     }
 
     #[inline(never)]
+    fn events_nostore(&self, rows: &[[&[u8]; 7]]) -> u64 {
+        let mut acc = 0u64;
+        for f in rows {
+            let Some(id) = event_key(self.s, f[0]) else { continue };
+            let Some(sec) = self.clock.ingest_s(f[3]) else { continue };
+            if let Some(val) = self.payload(f, sec * 1000) {
+                let key = hash(user_key(self.s, f[1]));
+                acc ^= key ^ val;
+            }
+            acc ^= hash(id) ^ sec as u64;
+        }
+        acc
+    }
+
+    #[inline(never)]
+    fn clicks_nostore(&self, buf: &[u8], rows: &[[&[u8]; 4]]) -> u64 {
+        let mut acc = 0u64;
+        for f in rows {
+            if f[0].is_empty() || f[1].is_empty() { continue; }
+            let Some(ts) = self.clock.parse(f[3]) else { continue };
+            if ts.wrapping_sub(self.click_start) as u64 >= self.click_span { continue; }
+            let Some(camp) = self.campaign(buf, f[2]) else { continue };
+            let key = hash(user_key(self.s, f[1]));
+            acc ^= key ^ ts as u64 ^ u64::from(camp) ^ user_key(self.s, f[0]);
+        }
+        acc
+    }
+
+    #[inline(never)]
     fn clicks(&self, buf: &[u8], rows: &[[&[u8]; 4]], out: &mut Scan) {
         for f in rows {
             self.click(buf, f, out);
@@ -511,6 +540,22 @@ fn rename(mut parts: Vec<Histories>, aliases: &Aliases, dest: &mut [Histories], 
     parts
 }
 
+/// Minor faults and user+system CPU ticks of the process so far (Linux only).
+fn rusage()->(u64,u64){
+    let s=fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f:Vec<&str>=s.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+    let g=|i:usize|f.get(i).and_then(|x|x.parse::<u64>().ok()).unwrap_or(0);
+    (g(7),g(11)+g(12))
+}
+
+/// Write one byte per page of a vector's capacity, so faults happen before timing.
+fn touch<T>(v:&mut Vec<T>){
+    let bytes=v.capacity()*std::mem::size_of::<T>();
+    let p=v.as_mut_ptr() as *mut u8;
+    let mut off=0;
+    while off<bytes { unsafe{p.add(off).write_volatile(0)}; off+=4096; }
+}
+
 // One owner for each job. The lock is acquired once per shard, never per row.
 pub(super) fn consume<J:Send,S:Send>(jobs:Vec<J>,workers:usize, init:impl Fn()->S+Sync,
                             run:impl Fn(&mut S,J)+Sync)->Vec<S> {
@@ -556,27 +601,43 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     }
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
-    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048);
-    let pb=(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512);
+    let env_pow2=|k:&str,d:usize|std::env::var(k).ok().and_then(|s|s.parse::<usize>().ok()).map_or(d,|v|v.next_power_of_two().clamp(2,1<<16));
+    let eb=env_pow2("SS_EB",(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048));
+    let pb=env_pow2("SS_PB",(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512));
+    let abl=std::env::var("ABL").ok().and_then(|s|s.parse::<u8>().ok()).unwrap_or(0);
+    let prefault=std::env::var_os("PREFAULT").is_some();
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
     let next=AtomicUsize::new(0);
     let shared=Shared{slow:Mutex::new(SlowIntern::new())};
     let dec=Decoder::new(&cx,&clock,&shared,origin,b);
     let prep=total.elapsed();
+    let r0=rusage();
     // Workers take chunks dynamically; leave headroom over an even share.
     let share=|bytes:usize,row:usize,n:usize|bytes/row/threads*5/4/n+64;
     let scans=thread::scope(|scope|{
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
                 cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
+            if prefault {
+                for v in &mut out.ev { touch(v); }
+                for v in &mut out.cl { touch(v); }
+                for v in &mut out.cand { touch(v); }
+            }
+            let mut acc=0u64;
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
-                match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
-                    1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
+                match (c.kind,abl) {
+                    (0,1)=>wire::rows::<7>(buf,|f|acc+=(f[0].len()+f[6].len()) as u64),
+                    (1,1)=>wire::rows::<4>(buf,|f|acc+=(f[0].len()+f[3].len()) as u64),
+                    (0,2)=>batched::<7>(buf,|rows|acc+=rows.len() as u64),
+                    (1,2)=>batched::<4>(buf,|rows|acc+=rows.len() as u64),
+                    (0,3)=>batched::<7>(buf,|rows|acc^=dec.events_nostore(rows)),
+                    (1,3)=>batched::<4>(buf,|rows|acc^=dec.clicks_nostore(buf,rows)),
+                    (0,_)=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
+                    (1,_)=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
                             out.links.push((user_key(&shared,a),user_key(&shared,b)));
@@ -584,11 +645,17 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                     }),
                 }
             }
+            std::hint::black_box(acc);
             out
         })).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     let parsed=total.elapsed();
+    let r1=rusage();
+    if abl!=0 {
+        eprintln!("ms prep={} parse={} abl={} flt={} cpu={}",prep.as_millis(),(parsed-prep).as_millis(),abl,r1.0-r0.0,(r1.1-r0.1)*10);
+        std::process::exit(0);
+    }
     let slow=shared.slow.into_inner().unwrap();
     let mut evs=Vec::with_capacity(threads);
     let mut cls=Vec::with_capacity(threads);
@@ -640,9 +707,11 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         }
     }
     if std::env::var_os("STAGES").is_some() {
-        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={}",
+        let r2=rusage();
+        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={} pflt={} pcpu={} rflt={} rcpu={}",
             prep.as_millis(),(parsed-prep).as_millis(),(indexed-parsed).as_millis(),(reduced-indexed).as_millis(),
-            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis());
+            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis(),
+            r1.0-r0.0,(r1.1-r0.1)*10,r2.0-r1.0,(r2.1-r1.1)*10);
     }
     // The process exits right after writing; unmapping is wasted time.
     std::mem::forget(maps);
