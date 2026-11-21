@@ -7,6 +7,7 @@ mod fixture;
 mod group;
 mod links;
 mod output;
+mod persons;
 mod stream;
 mod time;
 mod wire;
