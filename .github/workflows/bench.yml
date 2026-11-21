@@ -9,7 +9,9 @@ on:
       clicks: { default: "5000000" }
       seed: { default: "20" }
       runs: { default: "5" }
-      ncpu: { default: "4" }
+      ncpu:
+        description: space-separated thread counts to time each commit under
+        default: "4"
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -65,11 +67,13 @@ jobs:
           echo "page-cache read of $(du -sh data | cut -f1): $(( (e - s) / 1000000 )) ms"
           for r in $(seq ${{ inputs.runs }}); do
             for c in ${{ inputs.commits }}; do
-              rm -rf out && mkdir out
-              t0=$(date +%s%N)
-              inner=$(docker run --rm --user $(id -u):$(id -g) -e NCPU=${{ inputs.ncpu }} -e STAGES=1 -v $PWD/data:/data:ro -v $PWD/out:/output solver:$c 2>&1 | tr '\n' ' ')
-              t1=$(date +%s%N)
-              echo "$c wall_ms=$(( (t1 - t0) / 1000000 )) $inner" | tee -a times.txt
+              for n in ${{ inputs.ncpu }}; do
+                rm -rf out && mkdir out
+                t0=$(date +%s%N)
+                inner=$(docker run --rm --user $(id -u):$(id -g) -e NCPU=$n -e STAGES=1 -v $PWD/data:/data:ro -v $PWD/out:/output solver:$c 2>&1 | tr '\n' ' ')
+                t1=$(date +%s%N)
+                echo "$c ncpu=$n wall_ms=$(( (t1 - t0) / 1000000 )) $inner" | tee -a times.txt
+              done
             done
           done
       - name: Summary
@@ -78,7 +82,7 @@ jobs:
           import re, collections, statistics as st
           wall = collections.defaultdict(list); inner = collections.defaultdict(list)
           for l in open("times.txt"):
-              c = l.split()[0]
+              c = l.split()[0][:12] + " " + l.split()[1]
               wall[c].append(int(re.search(r"wall_ms=(\d+)", l).group(1)))
               m = re.search(r"total_ms=(\d+)", l)
               if m: inner[c].append(int(m.group(1)))
