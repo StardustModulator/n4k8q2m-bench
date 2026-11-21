@@ -214,78 +214,105 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
-    /// The fixed-sequence decode of a clean event row whose shape the table
-    /// of forms covers: ids of eight or nine bytes, an F1 ingest with a
-    /// cached date, a ts of the three forms' usual lengths. Quotes are
-    /// stripped by arithmetic, every form of the ts is computed and the
-    /// row's selected by mask, and validity is a conjunction of flags: no
-    /// branch depends on a field's content except the predictable purchase
-    /// one. Returns false for any other row, which then takes the exact
+    /// The decode of a clean event row of the usual shapes: ids of eight or
+    /// nine bytes, an F1 ingest with a cached date, a ts of the three forms'
+    /// usual lengths. Fields are sliced by arithmetic from the separator
+    /// offsets, one at a time so that few values stay live, and F1 and F3
+    /// (the unpredictable pair) are both computed and the row's selected by
+    /// mask. Returns false for any other row, which then takes the exact
     /// path; both compute the same result.
     #[inline(always)]
     fn fast(&self, f: &wire::Fields<'_, 7>, out: &mut Scan) -> bool {
         let p = f.first();
-        let o = f.ends();
-        // SAFETY: `Fields` guarantees p[0..=o[6]] readable. A quote flag reads
-        // a field's first byte, at most the LF. Every other load happens after
-        // the shape check and is bounded by a later field: see each.
+        // SAFETY: `Fields` guarantees p[0..=f.end(6)] readable. A quote flag
+        // reads a field's first byte, at most the LF. Every other load is
+        // bounded by a later field once that field's length is known: see
+        // each.
         unsafe {
             // In a clean row a field starts with a quote exactly when it also
             // ends with one; the content lies between.
-            let q = |at: u32| u32::from(*p.add(at as usize) == b'"');
-            let (q0, q1, q2, q3) = (q(0), q(o[0] + 1), q(o[1] + 1), q(o[2] + 1));
-            let (q4, q5, q6) = (q(o[3] + 1), q(o[4] + 1), q(o[5] + 1));
-            let (c0, d0) = (q0, o[0] - q0);
-            let (c1, d1) = (o[0] + 1 + q1, o[1] - q1);
-            let (c2, d2) = (o[1] + 1 + q2, o[2] - q2);
-            let (c3, d3) = (o[2] + 1 + q3, o[3] - q3);
-            let (c4, d4) = (o[3] + 1 + q4, o[4] - q4);
-            let (c5, d5) = (o[4] + 1 + q5, o[5] - q5);
-            let (c6, d6) = (o[5] + 1 + q6, o[6] - q6);
-            let (l0, l1, l2, l3) = (d0 - c0, d1 - c1, d2 - c2, d3 - c3);
-            let (l4, l5, l6) = (d4 - c4, d5 - c5, d6 - c6);
-            let (f1, f2, f3) = (l2 == 20, l2 == 25, l2.wrapping_sub(9) <= 7);
-            if !((l0.wrapping_sub(8) <= 1) & (l1.wrapping_sub(8) <= 1) & (l3 == 20) & (f1 | f2 | f3)) {
-                return false;
-            }
+            let quoted = |at: u32| u32::from(*p.add(at as usize) == b'"');
             // Event id as in `event_key`: the last eight bytes, the prefix
-            // shifted out of an eight-byte id. In bounds: l0 >= 8.
-            let tail = ld8(p.add((d0 - 8) as usize));
-            let w = tail >> (8 * (9 - l0));
-            let pad = u64::from(l0 == 8) << 56;
-            let e_ok = (*p.add(c0 as usize) == b'e') & (((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0);
-            // Ingest: 20 bytes at c3.
-            let (sec, in_ok) = self.clock.iso_raw(p.add(c3 as usize));
-            let in_ok = in_ok & (*p.add((c3 + 19) as usize) == b'Z');
-            // User id: l1 bytes at c1.
-            let (ukey, u_ok) = atom::pack_raw(p.add(c1 as usize), l1);
-            if !(e_ok & in_ok & u_ok) {
+            // shifted out of an eight-byte id.
+            let e0 = f.end(0);
+            let q0 = quoted(0);
+            let l0 = e0 - 2 * q0;
+            if l0.wrapping_sub(8) > 1 {
                 return false;
             }
-            // Every form of the ts at once. Its loads reach at most 25 bytes
-            // past c2, inside the 20-byte ingest that follows.
-            let t = p.add(c2 as usize);
-            let (iso, iso_ok) = self.clock.iso_raw(t);
-            let (off, off_ok) = clock::offset_raw(t);
-            let (f3v, f3_ok) = clock::epoch_raw(t, l2);
-            let iso_ok = iso_ok & ((f1 & (*t.add(19) == b'Z')) | (f2 & off_ok));
-            let iso_s = iso + (off & -i64::from(f2));
-            let mi = -i64::from(f1 | f2);
-            let ts = (iso_s.wrapping_mul(1000) & mi) | (f3v & !mi);
-            let ts_ok = ((f1 | f2) & iso_ok) | (f3 & f3_ok);
-            // Type: the eight bytes ending at d4 hold a 4- or 8-byte word; d4
-            // follows the 20-byte ingest, so d4 - 8 lies inside the row.
-            let tw = ld8(p.add((d4 - 8) as usize)).wrapping_shr(8u32.wrapping_sub(l4).wrapping_mul(8));
+            let w = ld8(p.add((e0 - q0 - 8) as usize)) >> (8 * (9 - l0));
+            let pad = u64::from(l0 == 8) << 56;
+            if !((*p.add(q0 as usize) == b'e') & (((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0)) {
+                return false;
+            }
+            // User id.
+            let r1 = e0 + 1;
+            let e1 = f.end(1);
+            let q1 = quoted(r1);
+            let l1 = e1 - r1 - 2 * q1;
+            if l1.wrapping_sub(8) > 1 {
+                return false;
+            }
+            let (ukey, u_ok) = atom::pack_raw(p.add((r1 + q1) as usize), l1);
+            if !u_ok {
+                return false;
+            }
+            // Ingest first: its 20 bytes bound the ts loads that follow.
+            let r2 = e1 + 1;
+            let e2 = f.end(2);
+            let q2 = quoted(r2);
+            let l2 = e2 - r2 - 2 * q2;
+            let r3 = e2 + 1;
+            let e3 = f.end(3);
+            let q3 = quoted(r3);
+            if e3 - r3 - 2 * q3 != 20 {
+                return false;
+            }
+            let g = p.add((r3 + q3) as usize);
+            let (sec, in_ok) = self.clock.iso_raw(g);
+            if !(in_ok & (*g.add(19) == b'Z')) {
+                return false;
+            }
+            // The ts: F2 is rare enough for a branch; F1 and F3 are computed
+            // both and selected. Their loads reach at most 25 bytes past the
+            // content start, inside the ingest.
+            let t = p.add((r2 + q2) as usize);
+            let (ts, ts_ok) = if l2 == 25 {
+                let (iso, ok) = self.clock.iso_raw(t);
+                let (off, ok2) = clock::offset_raw(t);
+                ((iso + off) * 1000, ok & ok2)
+            } else if (l2 == 20) | (l2.wrapping_sub(9) <= 7) {
+                let (iso, ok) = self.clock.iso_raw(t);
+                let (f3v, ok3) = clock::epoch_raw(t, l2);
+                let f1 = l2 == 20;
+                let m = -i64::from(f1);
+                ((iso.wrapping_mul(1000) & m) | (f3v & !m), (f1 & ok & (*t.add(19) == b'Z')) | (!f1 & ok3))
+            } else {
+                return false;
+            };
+            // Type: the eight bytes ending at the field's end hold a 4- or
+            // 8-byte word; they start inside the row, after the ingest.
+            let r4 = e3 + 1;
+            let e4 = f.end(4);
+            let q4 = quoted(r4);
+            let l4 = e4 - r4 - 2 * q4;
+            let tw = ld8(p.add((e4 - q4 - 8) as usize)).wrapping_shr(8u32.wrapping_sub(l4).wrapping_mul(8));
             let purchase = (l4 == 8) & (tw == PURCHASE);
             let type_ok = purchase | ((l4 == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
+            let r5 = e4 + 1;
+            let e5 = f.end(5);
+            let q5 = quoted(r5);
+            let l5 = e5 - r5 - 2 * q5;
             let at = sec * 1000;
             let mut valid = ts_ok & type_ok & (l5 != 0)
                 & ((ts.wrapping_sub(self.start) as u64) < self.span) & (at.wrapping_sub(ts) <= DAY_MS);
             let mut pay = 0u32;
             if purchase & valid {
-                let (prod, price) = (slice(p, c5, l5), slice(p, c6, l6));
-                match parse_price(price) {
-                    Some(c) => pay = c | u32::from(product_cat(self.cx, prod)) << 24,
+                let r6 = e5 + 1;
+                let q6 = quoted(r6);
+                let l6 = f.end(6) - r6 - 2 * q6;
+                match parse_price(slice(p, r6 + q6, l6)) {
+                    Some(c) => pay = c | u32::from(product_cat(self.cx, slice(p, r5 + q5, l5))) << 24,
                     None => valid = false,
                 }
             }
@@ -692,7 +719,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>wire::records::<7>(buf,Events{dec:&dec,out:&mut out}),
+                    0=>{wire::records::<7, _>(buf,Events{dec:&dec,out:&mut out});}
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -945,12 +972,38 @@ mod bench {
             });
             std::hint::black_box(acc);
         });
+        report("offsets", &mut || {
+            struct S(u32);
+            impl<'b> wire::Sink<'b, 7> for S {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    let (p, o) = (f.first(), f.ends());
+                    for i in 0..7 {
+                        self.0 += o[i] + unsafe { u32::from(*p.add(if i == 0 { 0 } else { o[i - 1] as usize + 1 }) == b'"') };
+                    }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.0 += f[6].len() as u32; }
+            }
+            let s = wire::records::<7, _>(body, S(0));
+            std::hint::black_box(s.0);
+        });
+        let (mut slow, mut exact) = (0usize, 0usize);
         report("scan_events", &mut || {
+            struct S<'a, 'c, 'o> { dec: &'a Decoder<'a, 'c>, out: &'o mut Scan, slow: usize, exact: usize }
+            impl<'b> wire::Sink<'b, 7> for S<'_, '_, '_> {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    if !self.dec.fast(&f, self.out) { self.slow += 1; self.dec.event_exact(&f.all(), self.out); }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.exact += 1; self.dec.event_exact(&f, self.out); }
+            }
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            wire::records::<7>(body, Events { dec: &dec, out: &mut out });
+            let s = wire::records::<7, _>(body, S { dec: &dec, out: &mut out, slow: 0, exact: 0 });
+            (slow, exact) = (s.slow, s.exact);
             std::hint::black_box(&out.ev);
         });
+        eprintln!("fallback: shape {slow} ({:.3}%), poisoned/simple {exact}", 100.0 * slow as f64 / rows_n as f64);
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
 }

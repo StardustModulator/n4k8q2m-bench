@@ -21,14 +21,16 @@
 /// slices, and syntactic quotes are removed from returned quoted fields.
 #[inline]
 pub(super) fn rows<'b, const N: usize>(buf: &'b [u8], f: impl FnMut([&'b [u8]; N])) {
-    records::<N>(buf, f);
+    records::<N, _>(buf, f);
 }
 
 /// `rows` for a sink that can also take a record by its separator offsets.
+/// Returns the sink.
 #[inline]
-pub(super) fn records<'b, const N: usize>(buf: &'b [u8], mut s: impl Sink<'b, N>) {
+pub(super) fn records<'b, const N: usize, S: Sink<'b, N>>(buf: &'b [u8], mut s: S) -> S {
     const { assert!(2 <= N && N <= 8) };
     rows_window::<N>(buf, WINDOW, &mut s);
+    s
 }
 
 /// Receives the well-formed records of `N` fields. The window scanner hands
@@ -66,9 +68,18 @@ impl<'b, const N: usize> Fields<'b, N> {
         self.first
     }
 
-    /// The N separator offsets from `first()`, increasing; the last is the
-    /// record's LF (or EOF). Quotes are valid: a field is wrapped exactly when
-    /// its first byte is a quote, and then its last byte is one too.
+    /// Separator `i`'s offset from `first()`: the end of field `i`. The
+    /// separators increase; the last is the record's LF (or EOF). Quotes are
+    /// valid: a field is wrapped exactly when its first byte is a quote, and
+    /// then its last byte is one too.
+    #[inline(always)]
+    pub(super) fn end(&self, i: usize) -> u32 {
+        assert!(i < N);
+        // SAFETY: the N slots at `ends` belong to this record (see `get`).
+        unsafe { *self.ends.add(i) - self.first.offset_from(self.base) as u32 }
+    }
+
+    /// All N of `end`.
     #[inline(always)]
     pub(super) fn ends(&self) -> [u32; N] {
         // SAFETY: the N slots at `ends` belong to this record (see `get`).
