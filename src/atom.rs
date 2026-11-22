@@ -19,6 +19,18 @@ const RANK: [u8; 256] = {
     t
 };
 
+/// `try_pack` for a field of `n` bytes whose first byte is `first` and whose
+/// last eight (for n = 8, all eight) are `tail`, big-endian, without the early
+/// returns: the flag says whether the key is meaningful. Covers n in {8, 9},
+/// the generator's shapes; other lengths yield a clear flag.
+#[inline(always)]
+pub(super) fn pack_tail(first: u8, tail: u64, n: usize) -> (bool, u64) {
+    let rank = RANK[first as usize];
+    let word = tail.wrapping_shl((9usize.wrapping_sub(n) as u32).wrapping_mul(8));
+    let ok = ((n | 1) == 9) & (rank != 0) & (word & !ASCII == 0);
+    (ok, (u64::from(rank) << 60) | (gather_ascii(word) << 4) | n as u64)
+}
+
 /// Remove the (already checked) zero high bit of each byte. Shifts and masks
 /// rather than BMI2 PEXT/PDEP: those are microcoded and very slow on AMD Zen 1
 /// and 2, which also report x86-64-v3.

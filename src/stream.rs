@@ -71,7 +71,12 @@ struct Scan {
 impl Scan {
     #[inline(always)]
     fn candidate(&mut self, id: u64, sec: i64, at_row: Option<(usize, usize)>, b: Bits) {
-        let h = hash(id);
+        self.candidate_h(hash(id), sec, at_row, b);
+    }
+
+    /// `candidate` with the event key already mixed.
+    #[inline(always)]
+    fn candidate_h(&mut self, h: u64, sec: i64, at_row: Option<(usize, usize)>, b: Bits) {
         let part = (h >> (64 - b.id)) as usize;
         let loc = match at_row {
             None => DEAD as u64,
@@ -164,6 +169,71 @@ fn batched<'b, const N: usize>(buf: &'b [u8], mut decode: impl FnMut(&[[&'b [u8]
     decode(&batch[..n]);
 }
 
+const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+const LOW56: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// Unaligned little-endian word at `p`.
+///
+/// # Safety
+/// Eight bytes at `p` must be readable.
+#[inline(always)]
+unsafe fn ld8(p: *const u8) -> u64 {
+    // SAFETY: forwarded.
+    u64::from_le(unsafe { p.cast::<u64>().read_unaligned() })
+}
+
+/// Bytes 0..=6 of `rel` strictly increasing; byte 7 is ignored.
+#[inline(always)]
+fn ascending7(rel: u64) -> bool {
+    // Byte i of d is 0x80 + r[i] - r[i-1] (byte 0: 0x80 + r[0]): no borrow
+    // crosses a byte, since every minuend has its high bit set and every
+    // subtrahend is below 0x80. Strict increase means bytes 1..=6 are all at
+    // least 0x81: high bit set and low seven bits nonzero.
+    let d = (rel | HIGH).wrapping_sub((rel << 8) & LOW7);
+    let nz = (d & LOW7).wrapping_add(LOW7) & HIGH;
+    const BYTES: u64 = 0x0080_8080_8080_8000;
+    (d & nz) & BYTES == BYTES
+}
+
+// Per-row verdicts of the event pipeline.
+const SLOW: u8 = 1; // the exact row path decides this row
+const CAND: u8 = 2; // ingest valid: the row is a dedup candidate
+const TS_OK: u8 = 4; // ts decoded to a valid instant
+const VALID: u8 = 8; // the event is pushed
+
+/// Rows per window at most: a seven-field record needs seven bytes.
+const ROWS: usize = wire::WINDOW / 7 + 2;
+
+#[cfg(test)]
+static SLOW_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-worker scratch of the event pipeline: the stage-1 lists and one
+/// column per row of the window for each phase. Each phase is a short loop
+/// over the window's rows with independent iterations, so the core overlaps
+/// rows; one fused per-row sequence measured slower on x86.
+struct Lane {
+    lists: wire::Lists,
+    o: Vec<u32>,     // the record's first byte, as a chunk offset
+    ps: Vec<u64>,    // byte i: field i's first byte after its quote, from o
+    ns: Vec<u64>,    // byte i: field i's length without quotes
+    flags: Vec<u8>,
+    idh: Vec<u64>,   // hash(event key)
+    ukh: Vec<u64>,   // hash(user key)
+    sec: Vec<i64>,   // ingest seconds
+    ts: Vec<i64>,    // ts milliseconds
+    val: Vec<u64>,   // Event.val
+    form: Vec<u32>,  // row indexes by ts form: ISO rows, then digit rows from ROWS
+    side: Vec<(u32, u32, u32)>, // uncertified records: (rows certified before it, o, lf)
+}
+
+impl Lane {
+    fn new() -> Self {
+        Lane { lists: wire::Lists::new(), o: vec![0; ROWS], ps: vec![0; ROWS], ns: vec![0; ROWS],
+               flags: vec![0; ROWS], idh: vec![0; ROWS], ukh: vec![0; ROWS], sec: vec![0; ROWS],
+               ts: vec![0; ROWS], val: vec![0; ROWS], form: vec![0; 2 * ROWS], side: Vec::new() }
+    }
+}
+
 /// Everything a row decoder reads, hoisted out of the shared context.
 struct Decoder<'a, 'c> {
     cx: &'a Ctx<'c>,
@@ -175,20 +245,337 @@ struct Decoder<'a, 'c> {
     click_start: i64,
     click_span: u64,
     b: Bits,
+    phases: u8, // pipeline phases to run (diagnostics; all by default)
 }
 
 impl Decoder<'_, '_> {
     fn new<'a, 'c>(cx: &'a Ctx<'c>, clock: &'a Clock, s: &'a Shared, origin: i64, b: Bits) -> Decoder<'a, 'c> {
         let w = cx.window;
         Decoder { cx, clock, s, origin, start: w.start, span: (w.end - w.start) as u64,
-                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
+                  click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b, phases: u8::MAX }
     }
 
+    #[cfg(test)]
     #[inline(never)]
     fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
         for f in rows {
             self.event(f, out);
         }
+    }
+
+    /// The event rows of one chunk, which starts at a record boundary. Per
+    /// window: stage 1 lists the separators; certification turns each record
+    /// into a descriptor or hands it to the exact path; then one short loop
+    /// per phase decodes a column of every row; the last loop pushes records.
+    #[inline(never)]
+    fn event_rows(&self, buf: &[u8], out: &mut Scan, l: &mut Lane) {
+        let len = buf.len();
+        let mut start = 0usize;
+        while start < len {
+            let end = (start + wire::WINDOW).min(len);
+            let (_, nl) = wire::scan_window(buf, start, end, &mut l.lists);
+            if nl == 0 {
+                // A full window without LF: one long record.
+                let lf = memchr::memchr(b'\n', &buf[end..]).map_or(len, |i| end + i);
+                self.slow_row(buf, start, lf, out);
+                start = (lf + 1).min(len);
+                continue;
+            }
+            let (n, next) = self.certify(buf, start, nl, l);
+            start = next;
+            if self.phases < 8 { l.side.clear(); }
+            if self.phases < 2 { continue }
+            self.ids(buf, n, l);
+            if self.phases < 3 { continue }
+            self.users(buf, n, l);
+            if self.phases < 4 { continue }
+            self.ingests(buf, n, l);
+            if self.phases < 5 { continue }
+            let iso = self.forms(n, l);
+            if self.phases < 6 { continue }
+            self.iso_clocks(buf, iso, l);
+            self.digit_clocks(buf, n - iso, l);
+            if self.phases < 7 { continue }
+            self.payloads(buf, n, l);
+            if self.phases < 8 { continue }
+            self.push(buf, n, l, out);
+        }
+    }
+
+    /// Certify every record of the window from its stop bytes and write its
+    /// descriptor. Returns the row count and the offset after the last LF.
+    #[inline(never)]
+    fn certify(&self, buf: &[u8], start: usize, nl: usize, l: &mut Lane) -> (usize, usize) {
+        let len = buf.len();
+        let stops = l.lists.stops();
+        let (po, pps, pns) = (l.o.as_mut_ptr(), l.ps.as_mut_ptr(), l.ns.as_mut_ptr());
+        let mut o = start; // the record's first byte
+        let mut cur = 0usize; // its first stop
+        let mut n = 0usize;
+        for &line in &l.lists.lines[..nl] {
+            let lf = start + (line & !wire::POISON) as usize;
+            // SAFETY: every record's stops end at its own LF (or EOF), which
+            // is listed, so cur never passes the stops written; slot cur - 1
+            // is the previous LF or the sentinel, and the list has eight
+            // bytes of slack after the last stop.
+            let st = unsafe { ld8(stops.add(cur).sub(1)) };
+            // Field ends relative to the record: (stop - origin) mod 128 per
+            // byte. The seventh must be this record's LF and the seven must
+            // ascend; together they prove that exactly these seven separators
+            // lie in the record, which is under 128 bytes (an LF among the
+            // first six would repeat the seventh's byte, a comma past the
+            // sixth would push the LF out). Rows near the end of `buf` take
+            // the exact path so every phase's loads stay inside it.
+            let rel = ((st >> 8) | HIGH).wrapping_sub(u64::from((o - start) as u8 & 127) * ONES) & LOW7;
+            let certified = (rel >> 48) as u8 as usize == lf - o && ascending7(rel)
+                && line & wire::POISON == 0 && lf + 32 <= len;
+            if certified {
+                // Bit 7 of slot cur - 1 + i says field i opens with a quote.
+                let ends = rel & LOW56;
+                let qb = (st & HIGH) >> 7 & LOW56;
+                let starts = (ends << 8).wrapping_add(ONES & !0xff) & LOW56;
+                // SAFETY: n < ROWS, as a record needs at least seven bytes.
+                unsafe {
+                    *po.add(n) = o as u32;
+                    *pps.add(n) = starts.wrapping_add(qb);
+                    *pns.add(n) = ends.wrapping_sub(starts).wrapping_sub(qb << 1);
+                }
+                n += 1;
+                cur += 7;
+            } else {
+                // Decided in the push loop, in row order.
+                l.side.push((n as u32, o as u32, lf as u32));
+                cur += memchr::memchr_iter(b',', &buf[o..lf]).count() + 1;
+            }
+            o = lf + 1;
+        }
+        (n, o.min(len))
+    }
+
+    /// Event ids: `e` and seven or eight bytes in 1..=127, as `event_key`.
+    #[inline(never)]
+    fn ids(&self, buf: &[u8], n: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for i in 0..n {
+            // SAFETY: i < n <= ROWS; the row is certified, so loads from a
+            // field's first byte reach at most 32 bytes past its LF, inside `buf`.
+            unsafe {
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p0 = base.add(o + (ps as u8) as usize);
+                let n0 = (ns as u8) as usize;
+                let w = ld8(p0.add(1)) & u64::MAX.wrapping_shr((9usize.wrapping_sub(n0) as u32).wrapping_mul(8));
+                let pad = u64::from(n0 == 8) << 56;
+                let ok = ((n0 | 1) == 9) & (*p0 == b'e') & (((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0);
+                *l.idh.get_unchecked_mut(i) = hash(w | 1 << 63);
+                *l.flags.get_unchecked_mut(i) = SLOW * u8::from(!ok);
+            }
+        }
+    }
+
+    /// User keys: `try_pack`'s eight or nine byte shape; empty stays valid
+    /// (no event, still a candidate); other shapes take the exact path.
+    #[inline(never)]
+    fn users(&self, buf: &[u8], n: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for i in 0..n {
+            // SAFETY: as in `ids`.
+            unsafe {
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p1 = base.add(o + ((ps >> 8) as u8) as usize);
+                let n1 = ((ns >> 8) as u8) as usize;
+                let tail = ld8(p1.add(n1.wrapping_sub(8).min(1))).swap_bytes();
+                let (ok, key) = atom::pack_tail(*p1, tail, n1);
+                *l.ukh.get_unchecked_mut(i) = hash(key);
+                *l.flags.get_unchecked_mut(i) |= SLOW * u8::from(!ok & (n1 != 0));
+            }
+        }
+    }
+
+    /// Ingest: F1 only, as `ingest_s`. A date outside the day cache takes the
+    /// exact path; any other failure drops the row without a candidate.
+    #[inline(never)]
+    fn ingests(&self, buf: &[u8], n: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for i in 0..n {
+            // SAFETY: as in `ids`.
+            unsafe {
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p3 = base.add(o + ((ps >> 24) as u8) as usize);
+                let n3 = ((ns >> 24) as u8) as usize;
+                let z = (n3 == 20) & (*p3.add(19) == b'Z');
+                let (hit, mid) = self.clock.probe(p3);
+                let (ok, s) = clock::hms(ld8(p3.add(11)));
+                *l.sec.get_unchecked_mut(i) = mid + s;
+                *l.flags.get_unchecked_mut(i) |= CAND * u8::from(z & hit & ok) | SLOW * u8::from(z & !hit);
+            }
+        }
+    }
+
+    /// Bucket rows by the width of `ts`: 9 to 16 digits decode as a number,
+    /// everything else as a clock. Returns the clock count; digit rows start
+    /// at ROWS. Rows within a bucket are unordered, which changes nothing.
+    #[inline(never)]
+    fn forms(&self, n: usize, l: &mut Lane) -> usize {
+        let fp = l.form.as_mut_ptr();
+        let (mut ci, mut cd) = (0usize, 0usize);
+        for i in 0..n {
+            // SAFETY: i < n <= ROWS and each bucket holds ROWS slots.
+            unsafe {
+                let n2 = ((*l.ns.get_unchecked(i) >> 16) as u8) as usize;
+                let digit = n2.wrapping_sub(9) <= 7;
+                let at = if digit { ROWS + cd } else { ci };
+                *fp.add(at) = i as u32;
+                cd += usize::from(digit);
+                ci += usize::from(!digit);
+            }
+        }
+        ci
+    }
+
+    /// F1 and F2 side by side: the offset term is zero for F1. A clock whose
+    /// date misses the cache, or a width that is neither form, takes the
+    /// exact path; a failed field check drops the event, as `Clock::parse`.
+    #[inline(never)]
+    fn iso_clocks(&self, buf: &[u8], count: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for k in 0..count {
+            // SAFETY: as in `ids`; `count` indexes were written by `forms`.
+            unsafe {
+                let i = *l.form.get_unchecked(k) as usize;
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p2 = base.add(o + ((ps >> 16) as u8) as usize);
+                let n2 = ((ns >> 16) as u8) as usize;
+                let zone = *p2.add(19);
+                let (hit, mid) = self.clock.probe(p2);
+                let (ok1, s) = clock::hms(ld8(p2.add(11)));
+                let (ok2, off) = clock::offset(ld8(p2.add(17)));
+                let (f1, f2) = (n2 == 20, n2 == 25);
+                let (plus, minus) = (zone == b'+', zone == b'-');
+                // Subtract a positive offset, add a negative one, none for F1.
+                let sgn = (i64::from(minus) - i64::from(plus)) & (i64::from(f2)).wrapping_neg();
+                let form_ok = (f1 & (zone == b'Z')) | (f2 & (plus | minus));
+                *l.ts.get_unchecked_mut(i) = (mid + s + sgn * off) * 1000;
+                *l.flags.get_unchecked_mut(i) |= TS_OK * u8::from(form_ok & hit & ok1 & (ok2 | f1)) | SLOW * u8::from(!(form_ok & hit));
+            }
+        }
+    }
+
+    /// F3 of 9 to 16 digits, as `epoch_ms`.
+    #[inline(never)]
+    fn digit_clocks(&self, buf: &[u8], count: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for k in 0..count {
+            // SAFETY: as in `ids`; `count` indexes from ROWS were written by
+            // `forms`, each a row whose ts holds 9 to 16 bytes.
+            unsafe {
+                let i = *l.form.get_unchecked(ROWS + k) as usize;
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p2 = base.add(o + ((ps >> 16) as u8) as usize);
+                let n2 = ((ns >> 16) as u8) as usize;
+                let (ok, v) = clock::epoch16(ld8(p2), ld8(p2.add(n2 - 8)), n2);
+                *l.ts.get_unchecked_mut(i) = v;
+                *l.flags.get_unchecked_mut(i) |= TS_OK * u8::from(ok);
+            }
+        }
+    }
+
+    /// Type, product and user presence, window and lateness, and for a
+    /// purchase its price and category, as `payload`.
+    #[inline(never)]
+    fn payloads(&self, buf: &[u8], n: usize, l: &mut Lane) {
+        let base = buf.as_ptr();
+        for i in 0..n {
+            // SAFETY: as in `ids`.
+            unsafe {
+                let (o, ps, ns) = (*l.o.get_unchecked(i) as usize, *l.ps.get_unchecked(i), *l.ns.get_unchecked(i));
+                let p4 = base.add(o + ((ps >> 32) as u8) as usize);
+                let n4 = ((ns >> 32) as u8) as usize;
+                let w4 = ld8(p4);
+                let purchase = (n4 == 8) & (w4 == PURCHASE);
+                let type_ok = ((n4 == 4) & ((w4 as u32 == VIEW) | (w4 as u32 == CART))) | purchase;
+                let (n1, n5) = ((ns >> 8) as u8, (ns >> 40) as u8);
+                let fl = *l.flags.get_unchecked(i);
+                let (ts, sec) = (*l.ts.get_unchecked(i), *l.sec.get_unchecked(i));
+                let in_window = (ts.wrapping_sub(self.start) as u64) < self.span;
+                let late = (sec * 1000).wrapping_sub(ts) > DAY_MS;
+                let mut valid = (fl & (CAND | TS_OK) == CAND | TS_OK) & type_ok & (n1 != 0) & (n5 != 0) & in_window & !late;
+                let mut pay = 0u32;
+                if purchase & valid {
+                    let (s5, s6) = (o + ((ps >> 40) as u8) as usize, o + ((ps >> 48) as u8) as usize);
+                    let n6 = ((ns >> 48) as u8) as usize;
+                    match parse_price(&buf[s6..s6 + n6]) {
+                        Some(p) => pay = p | u32::from(product_cat(self.cx, &buf[s5..s5 + n5 as usize])) << 24,
+                        None => valid = false,
+                    }
+                }
+                *l.val.get_unchecked_mut(i) = (ts.wrapping_sub(self.origin) as u64) << 32 | u64::from(pay);
+                *l.flags.get_unchecked_mut(i) = fl | VALID * u8::from(valid);
+            }
+        }
+    }
+
+    /// Push the window's records and candidates; rows marked for the exact
+    /// path are decided there, in order.
+    #[inline(never)]
+    fn push(&self, buf: &[u8], n: usize, l: &mut Lane, out: &mut Scan) {
+        let mut side = 0usize;
+        for i in 0..=n {
+            while side < l.side.len() && l.side[side].0 as usize == i {
+                let (_, o, lf) = l.side[side];
+                self.slow_row(buf, o as usize, lf as usize, out);
+                side += 1;
+            }
+            if i == n {
+                break;
+            }
+            // SAFETY: i < n <= ROWS.
+            let fl = unsafe { *l.flags.get_unchecked(i) };
+            if fl & SLOW != 0 {
+                self.slow_desc(buf, i, l, out);
+                continue;
+            }
+            let mut at_row = None;
+            if fl & VALID != 0 {
+                // SAFETY: i < n.
+                let (key, val) = unsafe { (*l.ukh.get_unchecked(i), *l.val.get_unchecked(i)) };
+                let bin = (key >> (64 - self.b.user)) as usize;
+                let v = &mut out.ev[bin];
+                at_row = Some((bin, v.len()));
+                v.push(Event { key, val });
+            }
+            if fl & CAND != 0 {
+                // SAFETY: i < n.
+                let (h, sec) = unsafe { (*l.idh.get_unchecked(i), *l.sec.get_unchecked(i)) };
+                out.candidate_h(h, sec, at_row, self.b);
+            }
+        }
+        l.side.clear();
+    }
+
+    /// The exact path for the record `buf[o..lf]`: the general scanner on
+    /// that one record, then the scalar decoder.
+    #[cold]
+    #[inline(never)]
+    fn slow_row(&self, buf: &[u8], o: usize, lf: usize, out: &mut Scan) {
+        #[cfg(test)]
+        SLOW_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
+        wire::rows::<7>(&buf[o..lf], |f| self.event(&f, out));
+    }
+
+    /// The exact path for certified row `i`, whose fields the descriptor
+    /// locates exactly.
+    #[cold]
+    #[inline(never)]
+    fn slow_desc(&self, buf: &[u8], i: usize, l: &Lane, out: &mut Scan) {
+        #[cfg(test)]
+        SLOW_ROWS.fetch_add(1, AtomicOrdering::Relaxed);
+        let (o, ps, ns) = (l.o[i] as usize, l.ps[i], l.ns[i]);
+        let mut f = [&buf[..0]; 7];
+        for (j, fld) in f.iter_mut().enumerate() {
+            let s = o + ((ps >> (8 * j)) as u8) as usize;
+            *fld = &buf[s..s + ((ns >> (8 * j)) as u8) as usize];
+        }
+        self.event(&f, out);
     }
 
     #[inline(always)]
@@ -562,7 +949,9 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
     let next=AtomicUsize::new(0);
     let shared=Shared{slow:Mutex::new(SlowIntern::new())};
-    let dec=Decoder::new(&cx,&clock,&shared,origin,b);
+    let mut dec=Decoder::new(&cx,&clock,&shared,origin,b);
+    // Diagnostics: run only the first SS_PHASES phases of the event pipeline.
+    if let Some(p)=std::env::var("SS_PHASES").ok().and_then(|s|s.parse::<u8>().ok()) {dec.phases=p;}
     let prep=total.elapsed();
     // Workers take chunks dynamically; leave headroom over an even share.
     let share=|bytes:usize,row:usize,n:usize|bytes/row/threads*5/4/n+64;
@@ -570,12 +959,13 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         let handles:Vec<_>=(0..threads).map(|_|scope.spawn(||{
             let mut out=Scan{ev:sized(pb,share(event_bytes,77,pb)),cl:sized(pb,share(bytes[1],47,pb)),
                 cand:sized(eb,share(event_bytes,77,eb)),wide:Vec::new(),links:Vec::new()};
+            let mut lane=Lane::new();
             loop {
                 let i=next.fetch_add(1,AtomicOrdering::Relaxed);
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
+                    0=>dec.event_rows(buf,&mut out,&mut lane),
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -711,6 +1101,154 @@ mod tests {
         }
     }
 
+    /// Event rows of every form the generator writes and every dirt kind the
+    /// rules name, plus shapes only the exact path handles.
+    fn synth_events(next: &mut impl FnMut() -> u64, w: &Window, rows: usize) -> Vec<u8> {
+        const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        fn word(next: &mut impl FnMut() -> u64, prefix: u8, n: usize) -> Vec<u8> {
+            let mut v = vec![prefix];
+            for _ in 0..n { v.push(B36[(next() % 36) as usize]); }
+            v
+        }
+        fn iso(t: i64, zone: &str) -> Vec<u8> {
+            let (d, s) = (t.div_euclid(DAY_MS), t.rem_euclid(DAY_MS) / 1000);
+            let mut date = [0u8; 10];
+            format_day(d as i32, &mut date);
+            format!("{}T{:02}:{:02}:{:02}{zone}", std::str::from_utf8(&date).unwrap(), s / 3600, s / 60 % 60, s % 60).into_bytes()
+        }
+        let mut out = Vec::new();
+        for _ in 0..rows {
+            let mut f: Vec<Vec<u8>> = Vec::with_capacity(7);
+            f.push(match next() % 64 {
+                0 => Vec::new(), 1 => word(next, b'E', 8), 2 => word(next, b'e', 7), 3 => word(next, b'e', 9),
+                4 => b"x1".to_vec(), 5 => word(next, b'e', 6), 6 => b"e\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f".to_vec(),
+                7 => b"e\x00bcdefgh".to_vec(), 8 => "e\u{e9}bcdefg".as_bytes().to_vec(),
+                _ => word(next, b'e', 8),
+            });
+            f.push(match next() % 64 {
+                0 => Vec::new(), 1 => word(next, b'U', 8), 2 => word(next, b'u', 6), 3 => word(next, b'u', 9),
+                4 => b" u1".to_vec(), 5 => "u\u{e9}1234567".as_bytes().to_vec(), 6 => word(next, b'k', 7),
+                7 => b"u1234567\x7f".to_vec(), 8 => b"K".to_vec(), 9 => b"x12345678".to_vec(),
+                _ => { let n = 7 + (next() % 2) as usize; word(next, b'u', n) },
+            });
+            let t = w.start - 2 * DAY_MS + (next() % (18 * DAY_MS) as u64) as i64;
+            let t = t / 1000 * 1000 + if next() % 8 == 0 { (next() % 1000) as i64 } else { 0 };
+            let r = next() % 100;
+            f.push(if r < 50 {
+                if t % 1000 == 0 { iso(t, "Z") } else { t.to_string().into_bytes() }
+            } else if r < 62 {
+                let off = ((next() % 14) as i64 * 60 + [0, 30, 45][(next() % 3) as usize]) * 60_000;
+                let neg = next() % 2 == 0;
+                if t % 1000 == 0 {
+                    let mut s = iso(if neg { t - off } else { t + off }, "");
+                    s.extend_from_slice(format!("{}{:02}:{:02}", if neg { '-' } else { '+' }, off / 3_600_000, off / 60_000 % 60).as_bytes());
+                    s
+                } else { t.to_string().into_bytes() }
+            } else if r < 90 {
+                t.to_string().into_bytes()
+            } else {
+                match r {
+                    90 => Vec::new(), 91 => iso(t, "z"), 92 => format!("{t:020}").into_bytes(),
+                    93 => b"2028-02-30T00:00:00Z".to_vec(), 94 => iso(t, ".000Z"), 95 => b"2028-02-29T00:00:00Z".to_vec(),
+                    96 => iso(t, "+24:00"), 97 => b"1.79e12".to_vec(), 98 => format!("{t:025}").into_bytes(),
+                    _ => { let mut s = iso(t, "-00:00"); if next() % 2 == 0 { s[22] = b'0'; } s },
+                }
+            });
+            let late = match next() % 50 { 0 => DAY_MS, 1 => DAY_MS + 1000, 2 => 3 * DAY_MS, 3 => -5000, _ => (next() % 3600) as i64 * 1000 };
+            let at = (t + late) / 1000 * 1000;
+            f.push(match next() % 100 {
+                0 => Vec::new(), 1 => at.to_string().into_bytes(), 2 => iso(at, "+00:00"),
+                3 => iso(w.start + 400 * DAY_MS, "Z"), 4 => iso(at, "z"), 5 => b"2028-02-30T00:00:00Z".to_vec(),
+                _ => iso(at, "Z"),
+            });
+            f.push(match next() % 100 {
+                0..=2 => b"purchase".to_vec(), 3 => b"Purchase".to_vec(), 4 => b"cart ".to_vec(), 5 => Vec::new(),
+                6..=20 => b"cart".to_vec(), 21 => b"purchas".to_vec(), _ => b"view".to_vec(),
+            });
+            f.push(match next() % 200 {
+                0 => Vec::new(), 1 => b"P123".to_vec(), 2 => b"p0123".to_vec(), 3 => b"p99999999".to_vec(),
+                _ => format!("p{}", next() % 60_000).into_bytes(),
+            });
+            f.push(match next() % 20 {
+                0 => Vec::new(), 1 => b"0".to_vec(), 2 => b"-5".to_vec(), 3 => b"1.5".to_vec(), 4 => b"10000001".to_vec(),
+                5 => b"0250".to_vec(), _ => (1 + next() % 50_000).to_string().into_bytes(),
+            });
+            let bad = next() % 400;
+            for (i, fld) in f.iter_mut().enumerate() {
+                if next() % 5 == 0 {
+                    let mut q = vec![b'"'];
+                    q.extend_from_slice(fld);
+                    q.push(b'"');
+                    *fld = q;
+                }
+                if bad == 1 && i == 2 { let at = fld.len().min(1); fld.insert(at, b'"'); }
+            }
+            match bad {
+                2 => { f.pop(); }
+                3 => f.push(b"extra".to_vec()),
+                4 => f.clear(),
+                5 => f[5] = vec![b'x'; 140],
+                6 => f[6].push(b'\r'),
+                7 => f[0] = b"\"".to_vec(),
+                8 => f[3] = b"\"\"".to_vec(),
+                9 => f[1] = vec![b'u'; 120],
+                10 => f[5] = vec![b'p'; 9000],
+                _ => {}
+            }
+            out.extend_from_slice(&f.join(&b","[..]));
+            out.push(b'\n');
+        }
+        if next() % 3 == 0 { out.pop(); }
+        out
+    }
+
+    #[test]
+    fn phases_match_scalar_decoder() {
+        let start = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
+        let w = Window { start, end: start + 14 * DAY_MS, click_start: start - WEEK_MS, start_day: start.div_euclid(DAY_MS) as i32 };
+        let origin = w.start_day as i64 * DAY_MS - WEEK_MS;
+        let clock = Clock::new(w.start, w.end);
+        let prod_cat: Vec<u8> = (0..60_000u32).map(|i| if i % 97 == 0 { 255 } else { (i % 19) as u8 + 1 }).collect();
+        let (prod_other, camp_by_num, camp_other) = (HashMap::new(), Vec::new(), HashMap::new());
+        let cx = Ctx { prod_cat: &prod_cat, unknown: 0, prod_other: &prod_other, camp_by_num: &camp_by_num, camp_other: &camp_other, window: &w };
+        let shared = Shared { slow: Mutex::new(SlowIntern::new()) };
+        let b = Bits { user: 4, id: 5 };
+        let dec = Decoder::new(&cx, &clock, &shared, origin, b);
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let fresh = || Scan { ev: bins(16), cl: Vec::new(), cand: bins(32), wide: Vec::new(), links: Vec::new() };
+        let (mut total, mut slow) = (0usize, 0usize);
+        let mut lane = Lane::new();
+        for round in 0..80 {
+            let rows = 1 + (next() % 2500) as usize;
+            let buf = synth_events(&mut next, &w, rows);
+            let (mut a, mut c) = (fresh(), fresh());
+            batched::<7>(&buf, |rows| dec.events(rows, &mut a));
+            SLOW_ROWS.store(0, AtomicOrdering::Relaxed);
+            dec.event_rows(&buf, &mut c, &mut lane);
+            total += rows;
+            slow += SLOW_ROWS.load(AtomicOrdering::Relaxed);
+            let sorted = |mut v: Vec<Vec<u64>>| { v.iter_mut().for_each(|p| p.sort_unstable()); v };
+            // The pipeline keeps row order within a bin; the sort only guards the comparison.
+            let ev = |s: &Scan| sorted(s.ev.iter().map(|v| v.iter().map(|e| e.key ^ e.val.rotate_left(17)).collect()).collect());
+            let cand = |s: &Scan| sorted(s.cand.iter().map(|v| v.iter().map(|c| c.h ^ u64::from(c.sec).rotate_left(11) ^ u64::from(c.loc).rotate_left(37)).collect()).collect());
+            let wide = |s: &Scan| s.wide.iter().map(|v| v.iter().map(|x| (x.h, x.at, x.at_row)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            assert_eq!(ev(&a), ev(&c), "events, round {round}");
+            assert_eq!(cand(&a), cand(&c), "candidates, round {round}");
+            assert_eq!(wide(&a), wide(&c), "wide candidates, round {round}");
+            // Locations must agree row for row, not just as sets.
+            let evs = |s: &Scan| s.ev.iter().map(|v| v.iter().map(|e| (e.key, e.val)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            assert_eq!(evs(&a), evs(&c), "event order, round {round}");
+        }
+        // Most synthetic rows have a generator shape: the phases must own them.
+        assert!(slow * 2 < total, "exact path took {slow} of {total} rows");
+    }
+
     #[test]
     fn canonical8_matches_canonical_number() {
         let mut cases: Vec<Vec<u8>> = Vec::new();
@@ -834,6 +1372,19 @@ mod bench {
             batched::<7>(body, |rows| dec.events(rows, &mut out));
             std::hint::black_box(&out.ev);
         });
+        let mut lane = Lane::new();
+        for phases in 1..=8u8 {
+            let mut d = Decoder::new(&cx, &clock, &shared, origin, b);
+            d.phases = phases;
+            report(&format!("phases<={phases}"), &mut || {
+                let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
+                                     cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
+                SLOW_ROWS.store(0, AtomicOrdering::Relaxed);
+                d.event_rows(body, &mut out, &mut lane);
+                std::hint::black_box(&out.ev);
+            });
+        }
+        eprintln!("exact path: {} of {rows_n} rows", SLOW_ROWS.load(AtomicOrdering::Relaxed));
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
 }
