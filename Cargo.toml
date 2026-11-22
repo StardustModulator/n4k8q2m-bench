@@ -1,0 +1,24 @@
+[package]
+name = "solve"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[[bin]]
+name = "solve"
+path = "src/main.rs"
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "none"
+debug = 1
+overflow-checks = false
