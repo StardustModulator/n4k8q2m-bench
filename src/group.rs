@@ -190,6 +190,7 @@ pub(super) fn histories(parts: Vec<Histories>, acc: &mut Acc, cats: &[Vec<u8>], 
 // the two-slot check skip the wraparound; it stays empty. Returns false, with
 // the scratch dirty, once three quarters of the slots are taken. `sc` comes
 // in with every slot EMPTY and no persons.
+#[inline(never)]
 fn number(parts: &[Histories], sc: &mut Scratch, ne: usize, nc: usize, bits: u32) -> bool {
     let mask = (1usize << bits) - 1;
     sc.slots.resize(mask + 2, EMPTY);

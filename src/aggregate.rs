@@ -176,6 +176,7 @@ impl Acc {
     /// Up to 64 sessions, without branches on the data. The best click of
     /// each entry session is kept by selects, then carried forward; each
     /// campaign's assisted sessions are a bit mask. Returns the day mask.
+    #[inline(never)]
     fn attribute_short(&mut self, ns: usize, clicks: Chain<Hit>, slow: &SlowIntern) -> u64 {
         // Pad the starts to whole groups of eight for the counting.
         let p = (ns + 7) & !7;
@@ -243,6 +244,7 @@ impl Acc {
 
     /// Session days and same-day runs, plus the padding and chunk summary
     /// for `below2`. Returns the padded length.
+    #[inline(never)]
     fn prepare(&mut self, ns: usize) -> usize {
         // At least one padding entry keeps the last chunk's summary at MAX.
         let p = (ns + 8) & !7;
@@ -268,6 +270,7 @@ impl Acc {
     /// Credit every session from its latest click within a week and count
     /// each campaign's assists as the union of its clicks' session runs.
     /// Returns the day mask.
+    #[inline(never)]
     fn attribute(&mut self, ns: usize, clicks: Chain<Hit>, slow: &SlowIntern) -> u64 {
         let p = self.prepare(ns);
         let q = (p / 8 + 7) & !7;
@@ -326,7 +329,7 @@ impl Acc {
     /// Sessions of a few events: a fixed comparator network sorts them, and
     /// one sweep finds the breaks. Leaves starts, ends and purchases
     /// (session, pay); returns the session count.
-    #[inline]
+    #[inline(never)]
     fn sessions_sorted(&mut self, v: &mut [u64; 16], n: usize) -> usize {
         if n <= 8 {
             sort8(v);
@@ -361,6 +364,7 @@ impl Acc {
 
     /// Sessions of many events through the bucket summaries. Leaves starts,
     /// ends and purchases (session, pay); returns the session count.
+    #[inline(never)]
     fn sessions_bucketed(&mut self, events: Chain<u64>) -> usize {
         // Bucket the events instead of sorting them. Locals keep the slices
         // in registers; a 32-bit time divided by the gap indexes the fixed
@@ -448,7 +452,7 @@ impl Acc {
     }
 
     /// Session cents, and each day's top category from the purchases.
-    #[inline]
+    #[inline(never)]
     fn apply_purchases(&mut self, ns: usize, cats: &[Vec<u8>]) {
         self.cents[..ns].fill(0);
         for &(i, pay) in &self.purchases {
@@ -475,7 +479,7 @@ impl Acc {
     }
 
     /// A person without clicks: every session is organic. Returns the day mask.
-    #[inline]
+    #[inline(never)]
     fn organic(&mut self, ns: usize) -> u64 {
         let mut mask = 0u64;
         for i in 0..ns {
@@ -501,6 +505,7 @@ impl Acc {
         mask
     }
 
+    #[inline(never)]
     pub(super) fn person(
         &mut self,
         key: u64,
@@ -712,6 +717,7 @@ mod tests {
     }
 
     /// `person` on plain slices.
+    #[inline(never)]
     fn person(acc: &mut Acc, key: u64, events: &[u64], clicks: &[Hit], cats: &[Vec<u8>], slow: &SlowIntern, first_day: i32) {
         let (mut ea, mut ca) = (Vec::new(), Vec::new());
         let ev = Chain::build(events, &mut ea);
