@@ -5,8 +5,38 @@
 use super::*;
 use crate::aggregate::{Acc, Hit};
 use crate::group::{histories, Click, Event, Histories};
-use crate::clock::Clock;
+use crate::clock::{ld8, Clock};
 use crate::links::Aliases;
+
+/// `n` bytes at `p + at`.
+///
+/// # Safety
+/// The bytes must be readable, and live as long as the result is used.
+#[inline(always)]
+unsafe fn slice<'b>(p: *const u8, at: u32, n: u32) -> &'b [u8] {
+    // SAFETY: forwarded.
+    unsafe { std::slice::from_raw_parts(p.add(at as usize), n as usize) }
+}
+
+/// The event-row sink: the fast decode, the exact decode for the rest.
+struct Events<'a, 'c, 'o> {
+    dec: &'a Decoder<'a, 'c>,
+    out: &'o mut Scan,
+}
+
+impl<'b> wire::Sink<'b, 7> for Events<'_, '_, '_> {
+    #[inline(always)]
+    fn record(&mut self, f: wire::Fields<'b, 7>) {
+        if !self.dec.fast(&f, self.out) {
+            self.dec.event_exact(&f.all(), self.out);
+        }
+    }
+
+    #[inline(always)]
+    fn fields(&mut self, f: [&'b [u8]; 7]) {
+        self.dec.event_exact(&f, self.out);
+    }
+}
 
 /// The splitmix64 finalizer. Every step is invertible, so `hash` is a
 /// bijection: a mixed key identifies its key exactly, and rows carry mixed
@@ -60,6 +90,23 @@ fn sized<T>(n: usize, cap: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
 
+/// Push to one of thousands of bins, fetching the line after the tail early.
+/// A bin takes a row only every few thousand rows, so its tail's next line
+/// is one no hardware prefetcher predicted: a store to it waits in the store
+/// buffer for a cold read-for-ownership, and that wait is the scatter's
+/// stall. Fetched a line ahead, the line is in cache by the next crossing.
+#[inline(always)]
+fn push_far<T>(v: &mut Vec<T>, x: T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, whatever the address; the wrapping
+    // offset may point past the allocation.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(v.as_ptr().wrapping_add(v.len() + 64 / size_of::<T>()).cast(), _MM_HINT_T0);
+    }
+    v.push(x);
+}
+
 struct Scan {
     ev: Vec<Vec<Event>>,  // by raw user
     cl: Vec<Vec<Click>>,  // by raw user
@@ -78,7 +125,7 @@ impl Scan {
             Some((bin, row)) => (row as u64) << b.user | bin as u64,
         };
         if (loc < DEAD as u64 || at_row.is_none()) && (0..=u32::MAX as i64).contains(&sec) {
-            self.cand[part].push(Cand { h, sec: sec as u32, loc: loc as u32 });
+            push_far(&mut self.cand[part], Cand { h, sec: sec as u32, loc: loc as u32 });
         } else {
             self.push_wide(part, Wide { h, at: sec * 1000, at_row });
         }
@@ -184,11 +231,115 @@ impl Decoder<'_, '_> {
                   click_start: w.click_start, click_span: (w.end - w.click_start) as u64, b }
     }
 
-    #[inline(never)]
-    fn events(&self, rows: &[[&[u8]; 7]], out: &mut Scan) {
-        for f in rows {
-            self.event(f, out);
+    /// The decode of a clean event row of the usual shapes: ids of eight or
+    /// nine bytes and an F1 ingest with a cached date. Fields are sliced by
+    /// arithmetic from the separator offsets, one at a time so that few
+    /// values stay live (seven eager ranges spilled on x86). Returns false
+    /// for any other row, which then takes the exact path; both compute the
+    /// same result.
+    #[inline(always)]
+    fn fast(&self, f: &wire::Fields<'_, 7>, out: &mut Scan) -> bool {
+        let p = f.first();
+        // SAFETY: `Fields` guarantees p[0..f.end(6)] readable; f.end(6) is
+        // the LF or EOF. A quote flag reads a field's first byte, which for
+        // fields 0..=5 lies before separator 6; the price is probed at its
+        // last byte. Every other load is bounded by a later field once that
+        // field's length is known: see each.
+        unsafe {
+            // In a clean row a field starts with a quote exactly when it also
+            // ends with one; the content lies between.
+            let quoted = |at: u32| u32::from(*p.add(at as usize) == b'"');
+            // Event id as in `event_key`: the last eight bytes, the prefix
+            // shifted out of an eight-byte id.
+            let e0 = f.end(0);
+            let q0 = quoted(0);
+            let l0 = e0 - 2 * q0;
+            if l0.wrapping_sub(8) > 1 {
+                return false;
+            }
+            let w = ld8(p.add((e0 - q0 - 8) as usize)) >> (8 * (9 - l0));
+            let pad = u64::from(l0 == 8) << 56;
+            if !((*p.add(q0 as usize) == b'e') & (((w | pad) | (w | pad).wrapping_sub(ONES)) & HIGH == 0)) {
+                return false;
+            }
+            // User id.
+            let r1 = e0 + 1;
+            let e1 = f.end(1);
+            let q1 = quoted(r1);
+            let l1 = e1 - r1 - 2 * q1;
+            if l1.wrapping_sub(8) > 1 {
+                return false;
+            }
+            let (ukey, u_ok) = atom::pack_raw(p.add((r1 + q1) as usize), l1);
+            if !u_ok {
+                return false;
+            }
+            // Ingest first: its 20 bytes bound the ts loads that follow.
+            let r2 = e1 + 1;
+            let e2 = f.end(2);
+            let q2 = quoted(r2);
+            let l2 = e2 - r2 - 2 * q2;
+            let r3 = e2 + 1;
+            let e3 = f.end(3);
+            let q3 = quoted(r3);
+            if e3 - r3 - 2 * q3 != 20 {
+                return false;
+            }
+            let g = p.add((r3 + q3) as usize);
+            let (sec, in_ok) = self.clock.iso_raw(g);
+            if !(in_ok & (*g.add(19) == b'Z')) {
+                return false;
+            }
+            // The ts keeps the clock's dispatch by form: computing F1 and F3
+            // both and selecting by mask cost more than the branch.
+            let (ts, ts_ok) = match self.clock.parse(slice(p, r2 + q2, l2)) { Some(v) => (v, true), None => (0, false) };
+            // Type: the eight bytes ending at the field's end hold a 4- or
+            // 8-byte word; they start inside the row, after the ingest.
+            let r4 = e3 + 1;
+            let e4 = f.end(4);
+            let q4 = quoted(r4);
+            let l4 = e4 - r4 - 2 * q4;
+            let tw = ld8(p.add((e4 - q4 - 8) as usize)).wrapping_shr(8u32.wrapping_sub(l4).wrapping_mul(8));
+            let purchase = (l4 == 8) & (tw == PURCHASE);
+            let type_ok = purchase | ((l4 == 4) & ((tw as u32 == VIEW) | (tw as u32 == CART)));
+            let r5 = e4 + 1;
+            let e5 = f.end(5);
+            let q5 = quoted(r5);
+            let l5 = e5 - r5 - 2 * q5;
+            let at = sec * 1000;
+            let mut valid = ts_ok & type_ok & (l5 != 0)
+                & ((ts.wrapping_sub(self.start) as u64) < self.span) & (at.wrapping_sub(ts) <= DAY_MS);
+            let mut pay = 0u32;
+            if purchase & valid {
+                let r6 = e5 + 1;
+                let e6 = f.end(6);
+                // The price's separator is the LF, or EOF, which may lie past
+                // the buffer: probe the field's last byte instead (a wrapped
+                // field ends in a quote too); for an empty field, separator 5.
+                let q6 = u32::from(*p.add((e6 - 1) as usize) == b'"');
+                let l6 = e6 - r6 - 2 * q6;
+                match parse_price(slice(p, r6 + q6, l6)) {
+                    Some(c) => pay = c | u32::from(product_cat(self.cx, slice(p, r5 + q5, l5))) << 24,
+                    None => valid = false,
+                }
+            }
+            let key = hash(ukey);
+            let bin = (key >> (64 - self.b.user)) as usize;
+            let val = (ts.wrapping_sub(self.origin) as u64) << 32 | u64::from(pay);
+            let mut at_row = None;
+            if valid {
+                let v = &mut out.ev[bin];
+                at_row = Some((bin, v.len()));
+                push_far(v, Event { key, val });
+            }
+            out.candidate(w | 1 << 63, sec, at_row, self.b);
         }
+        true
+    }
+
+    #[inline(never)]
+    fn event_exact(&self, f: &[&[u8]; 7], out: &mut Scan) {
+        self.event(f, out);
     }
 
     #[inline(always)]
@@ -202,7 +353,7 @@ impl Decoder<'_, '_> {
             let bin = (key >> (64 - self.b.user)) as usize;
             let v = &mut out.ev[bin];
             at_row = Some((bin, v.len()));
-            v.push(Event { key, val });
+            push_far(v, Event { key, val });
         }
         out.candidate(id, sec, at_row, self.b);
     }
@@ -247,7 +398,7 @@ impl Decoder<'_, '_> {
         let Some(camp) = self.campaign(buf, f[2]) else { return };
         let key = hash(user_key(self.s, f[1]));
         let hit = Hit { ts: (ts - self.origin) as u32, id: user_key(self.s, f[0]), camp };
-        out.cl[(key >> (64 - self.b.user)) as usize].push(Click { key, hit });
+        push_far(&mut out.cl[(key >> (64 - self.b.user)) as usize], Click { key, hit });
     }
 
     /// `campaign_of` with the number decoded in one word.
@@ -556,7 +707,10 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
     }
     let event_bytes=bytes[0];
     let threads=threads.max(1).min(chunks.len().max(1));
-    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,2048);
+    // At most 512 candidate partitions: the record scatter stalls on cold
+    // destination lines, so fewer streams win more than smaller partitions
+    // give dedup (on x86, parse -5% at 20M rows, dedup unchanged).
+    let eb=(event_bytes / (77 * 16384)).next_power_of_two().clamp(8,512);
     let pb=(event_bytes / (77 * 65536)).next_power_of_two().clamp(16,512);
     let b=Bits{user:pb.trailing_zeros(),id:eb.trailing_zeros()};
     chunks.sort_unstable_by_key(|c|std::cmp::Reverse(c.end-c.start));
@@ -575,7 +729,7 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                 let Some(c)=chunks.get(i) else{break};
                 let buf=&maps[c.file as usize][c.start..c.end];
                 match c.kind {
-                    0=>batched::<7>(buf,|rows|dec.events(rows,&mut out)),
+                    0=>{wire::records::<7, _>(buf,Events{dec:&dec,out:&mut out});}
                     1=>batched::<4>(buf,|rows|dec.clicks(buf,rows,&mut out)),
                     _=>wire::rows::<2>(buf,|[a,b]| {
                         if !a.is_empty() && !b.is_empty() && a!=b {
@@ -584,11 +738,14 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
                     }),
                 }
             }
-            out
+            (out,total.elapsed())
         })).collect();
         handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
     });
     let parsed=total.elapsed();
+    // Idle tail of the parse: the first worker to run out of chunks waits this long.
+    let tail=parsed.saturating_sub(scans.iter().map(|s|s.1).min().unwrap_or(parsed));
+    let scans=scans.into_iter().map(|s|s.0);
     let slow=shared.slow.into_inner().unwrap();
     let mut evs=Vec::with_capacity(threads);
     let mut cls=Vec::with_capacity(threads);
@@ -601,10 +758,14 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         for ((c,wd),(cv,wv)) in cands.iter_mut().zip(s.cand.into_iter().zip(s.wide)) {c.push(cv);wd.push(wv);}
         lks.push(s.links);
     }
-    let aliases=links::build(lks,&slow,threads,pb);
-    let indexed=total.elapsed();
+    // Linking and dedup are independent. Side by side, dedup jobs fill the
+    // cores that the link build's serial steps leave idle.
     let rows=Rows::new(&mut evs,b.user);
-    consume(cands,threads,||(),|_,(c,wd)|dedup(c,wd,&rows,b.id));
+    let (aliases,indexed)=thread::scope(|scope|{
+        let linker=scope.spawn(||{let a=links::build(lks,&slow,threads,pb);(a,total.elapsed())});
+        consume(cands,threads,||(),|_,(c,wd)|dedup(c,wd,&rows,b.id));
+        linker.join().unwrap()
+    });
     drop(rows);
     let reduced=total.elapsed();
     let shift=64-b.user;
@@ -640,14 +801,25 @@ pub(super) fn compute(data:&Path, threads:usize)->Result<Tables,Box<dyn std::err
         }
     }
     if std::env::var_os("STAGES").is_some() {
-        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={}",
+        eprintln!("ms prep={} parse={} links={} dedup={} rename={} group={} merge={} parse_tail={}{}",
             prep.as_millis(),(parsed-prep).as_millis(),(indexed-parsed).as_millis(),(reduced-indexed).as_millis(),
-            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis());
+            (renamed-reduced).as_millis(),(grouped-renamed).as_millis(),(total.elapsed()-grouped).as_millis(),
+            tail.as_millis(),cpu_stats());
     }
     // The process exits right after writing; unmapping is wasted time.
     std::mem::forget(maps);
     std::mem::forget(aliases);
     Ok(Tables{users,camps_out,camps,cat_names,slow,organic})
+}
+
+/// CPU seconds and minor faults of this process so far (Linux), for STAGES.
+fn cpu_stats()->String {
+    let Ok(stat)=fs::read_to_string("/proc/self/stat") else {return String::new()};
+    let Some((_,rest))=stat.rsplit_once(')') else {return String::new()};
+    let f:Vec<&str>=rest.split_whitespace().collect();
+    let num=|i:usize|f.get(i).and_then(|s|s.parse::<u64>().ok()).unwrap_or(0);
+    // Fields after the command: state is index 0, so minflt=7, utime=11, stime=12 (ticks of 10 ms).
+    format!(" cpu_user_ms={} cpu_sys_ms={} minflt={}",num(11)*10,num(12)*10,num(7))
 }
 
 #[cfg(test)]
@@ -810,12 +982,60 @@ mod bench {
             });
             std::hint::black_box(acc);
         });
+        report("offsets", &mut || {
+            struct S(u32);
+            impl<'b> wire::Sink<'b, 7> for S {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    let p = f.first();
+                    for i in 0..7 {
+                        let r = if i == 0 { 0 } else { f.end(i - 1) + 1 };
+                        self.0 += f.end(i) + unsafe { u32::from(*p.add(r as usize) == b'"') };
+                    }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.0 += f[6].len() as u32; }
+            }
+            let s = wire::records::<7, _>(body, S(0));
+            std::hint::black_box(s.0);
+        });
+        let (mut slow, mut exact) = (0usize, 0usize);
         report("scan_events", &mut || {
+            struct S<'a, 'c, 'o> { dec: &'a Decoder<'a, 'c>, out: &'o mut Scan, slow: usize, exact: usize }
+            impl<'b> wire::Sink<'b, 7> for S<'_, '_, '_> {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    if !self.dec.fast(&f, self.out) { self.slow += 1; self.dec.event_exact(&f.all(), self.out); }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.exact += 1; self.dec.event_exact(&f, self.out); }
+            }
             let mut out = Scan { ev: sized(1 << b.user, rows_n >> b.user << 1), cl: Vec::new(),
                                  cand: sized(1 << b.id, rows_n >> b.id << 1), wide: Vec::new(), links: Vec::new() };
-            batched::<7>(body, |rows| dec.events(rows, &mut out));
+            let s = wire::records::<7, _>(body, S { dec: &dec, out: &mut out, slow: 0, exact: 0 });
+            (slow, exact) = (s.slow, s.exact);
             std::hint::black_box(&out.ev);
         });
+        eprintln!("fallback: shape {slow} ({:.3}%), poisoned/simple {exact}", 100.0 * slow as f64 / rows_n as f64);
+        // BENCH_ALL=1: the fallback rate over every event file of the dataset.
+        if std::env::var_os("BENCH_ALL").is_some() {
+            struct S<'a, 'c, 'o> { dec: &'a Decoder<'a, 'c>, out: &'o mut Scan, rows: usize, slow: usize, exact: usize }
+            impl<'b> wire::Sink<'b, 7> for S<'_, '_, '_> {
+                #[inline(always)]
+                fn record(&mut self, f: wire::Fields<'b, 7>) {
+                    self.rows += 1;
+                    if !self.dec.fast(&f, self.out) { self.slow += 1; self.dec.event_exact(&f.all(), self.out); }
+                }
+                fn fields(&mut self, f: [&'b [u8]; 7]) { self.rows += 1; self.exact += 1; self.dec.event_exact(&f, self.out); }
+            }
+            let (mut rows, mut slow, mut exact) = (0, 0, 0);
+            for p in list_csv(&data.join("events")).unwrap() {
+                let buf = fs::read(&p).unwrap();
+                let mut out = Scan { ev: bins(1 << b.user), cl: Vec::new(), cand: bins(1 << b.id), wide: Vec::new(), links: Vec::new() };
+                let s = wire::records::<7, _>(crate::body(&buf), S { dec: &dec, out: &mut out, rows: 0, slow: 0, exact: 0 });
+                rows += s.rows; slow += s.slow; exact += s.exact;
+            }
+            eprintln!("all files: rows {rows} fallback shape {slow} ({:.3}%) poisoned/simple {exact} ({:.3}%)",
+                      100.0 * slow as f64 / rows as f64, 100.0 * exact as f64 / rows as f64);
+        }
         eprintln!("rows={rows_n} bytes={}", body.len());
     }
 }

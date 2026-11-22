@@ -95,7 +95,8 @@ fn list_csv(dir:&Path)->io::Result<Vec<PathBuf>>{
     let iter=match fs::read_dir(dir){
         Ok(i)=>i, Err(e) if e.kind()==io::ErrorKind::NotFound=>return Ok(v), Err(e)=>return Err(e),
     };
-    for ent in iter {let p=ent?.path();if p.extension().is_some_and(|e|e=="csv"){v.push(p);}}
+    // Only regular files (through symlinks): a directory named *.csv is skipped.
+    for ent in iter {let p=ent?.path();if p.extension().is_some_and(|e|e=="csv") && p.is_file(){v.push(p);}}
     v.sort_unstable();Ok(v)
 }
 fn load_window(path:&Path)->Result<Window,Box<dyn std::error::Error>>{
