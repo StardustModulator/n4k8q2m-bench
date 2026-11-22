@@ -74,6 +74,16 @@ impl<'a, T: Link> Chain<'a, T> {
         (&self.arena[base..cur], self.arena[base + CHUNK - 1].link())
     }
 
+    /// The newest chunk's whole block of slots, how many hold values (the
+    /// rest are stale, then the link) and the index of the chunk before it.
+    #[inline(always)]
+    pub(super) fn last_block(&self) -> (&'a [T; CHUNK], usize, usize) {
+        let cur = self.cur as usize;
+        let base = cur & !(CHUNK - 1);
+        let block: &[T; CHUNK] = self.arena[base..base + CHUNK].try_into().unwrap();
+        (block, cur - base, block[CHUNK - 1].link())
+    }
+
     /// The values of the full chunk at `at` and the index of the one before it.
     #[inline(always)]
     pub(super) fn full(&self, at: usize) -> (&'a [T], usize) {
@@ -202,40 +212,44 @@ fn number(parts: &[Histories], sc: &mut Scratch, ne: usize, nc: usize, bits: u32
     let slots = &mut sc.slots[..];
     let shift = 64 - bits;
     let mut top = CHUNK as u32;
-    for e in parts.iter().flat_map(|p| &p.ev) {
-        let key = e.key;
-        let s = (key.wrapping_mul(MUL) >> shift) as usize;
-        // A key sits in its home slot or the next one unless its run is
-        // long; only those and new keys take the probing path.
-        // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
-        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-        // SAFETY: as above; probe returns a slot <= mask.
-        if unsafe { slots.get_unchecked(id) }.key != key {
-            id = probe(slots, key, s, mask);
-            if slots[id].key == 0 {
-                if room == 0 { return false; }
-                room -= 1;
-                slots[id].key = key;
-                sc.persons.push(id as u32);
+    for p in parts {
+        for e in &p.ev {
+            let key = e.key;
+            let s = (key.wrapping_mul(MUL) >> shift) as usize;
+            // A key sits in its home slot or the next one unless its run is
+            // long; only those and new keys take the probing path.
+            // SAFETY: s <= mask and s + 1 <= mask + 1 < slots.len().
+            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+            // SAFETY: as above; probe returns a slot <= mask.
+            if unsafe { slots.get_unchecked(id) }.key != key {
+                id = probe(slots, key, s, mask);
+                if slots[id].key == 0 {
+                    if room == 0 { return false; }
+                    room -= 1;
+                    slots[id].key = key;
+                    sc.persons.push(id as u32);
+                }
             }
+            // SAFETY: id <= mask + 1 < slots.len().
+            let slot = unsafe { slots.get_unchecked_mut(id) };
+            append(&mut sc.ev, &mut top, &mut slot.ev, e.val);
         }
-        // SAFETY: id <= mask + 1 < slots.len().
-        let slot = unsafe { slots.get_unchecked_mut(id) };
-        append(&mut sc.ev, &mut top, &mut slot.ev, e.val);
     }
     let mut top = CHUNK as u32;
-    for c in parts.iter().flat_map(|p| &p.cl) {
-        let key = c.key;
-        let s = (key.wrapping_mul(MUL) >> shift) as usize;
-        // SAFETY: as for events.
-        let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
-        if unsafe { slots.get_unchecked(id) }.key != key {
-            id = probe(slots, key, s, mask);
-        }
-        // A person without events has no sessions to credit.
-        let slot = &mut slots[id];
-        if slot.key == key {
-            append(&mut sc.cl, &mut top, &mut slot.cl, c.hit);
+    for p in parts {
+        for c in &p.cl {
+            let key = c.key;
+            let s = (key.wrapping_mul(MUL) >> shift) as usize;
+            // SAFETY: as for events.
+            let mut id = s + usize::from(unsafe { slots.get_unchecked(s) }.key != key);
+            if unsafe { slots.get_unchecked(id) }.key != key {
+                id = probe(slots, key, s, mask);
+            }
+            // A person without events has no sessions to credit.
+            let slot = &mut slots[id];
+            if slot.key == key {
+                append(&mut sc.cl, &mut top, &mut slot.cl, c.hit);
+            }
         }
     }
     true

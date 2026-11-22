@@ -71,9 +71,10 @@ pub(super) struct Acc {
     // assisted (long path) or its local number (short path). The table is
     // cleared whenever the tag wraps, so a stale entry never matches.
     covered: Vec<u32>,
-    // Short path: per entry session the best click, tagged with the epoch;
-    // per local campaign its number and assisted sessions.
-    top: Vec<(u64, u64, u16)>,
+    // Short path: per entry session the best click as 1 + time << 32 |
+    // campaign, with its ID (0 for none); per local campaign its number and
+    // assisted sessions, plus one spare slot written for every click.
+    top: Vec<(u64, u64)>,
     local: Vec<u16>,
     runs: Vec<u64>,
     // Short path: sessions of each day; cleared again with the rows.
@@ -85,16 +86,6 @@ pub(super) struct Acc {
     touched: Vec<u32>,
 }
 
-// LOW[i] has the i lowest bits set.
-const LOW: [u64; 65] = {
-    let mut t = [u64::MAX; 65];
-    let mut i = 0;
-    while i < 64 {
-        t[i] = (1 << i) - 1;
-        i += 1;
-    }
-    t
-};
 const GAP: u32 = GAP_MS as u32;
 const WEEK: u32 = WEEK_MS as u32;
 // Half-hour buckets of every 32-bit offset.
@@ -136,9 +127,9 @@ impl Acc {
             next: Vec::new(),
             leave: Vec::new(),
             covered: vec![0; organic],
-            top: vec![(0, 0, 0); 65],
+            top: vec![(0, 0); 65],
             local: vec![0; organic],
-            runs: vec![0; organic],
+            runs: vec![0; organic + 1],
             on_day: vec![0; ndays],
             epoch: 0,
             days: vec![NO_DAY; ndays],
@@ -177,39 +168,49 @@ impl Acc {
     /// each entry session is kept by selects, then carried forward; each
     /// campaign's assisted sessions are a bit mask. Returns the day mask.
     fn attribute_short(&mut self, ns: usize, clicks: Chain<Hit>, slow: &SlowIntern) -> u64 {
-        // Pad the starts to whole groups of eight for the counting.
+        // Pad the starts to whole groups of eight for the lane compares.
         let p = (ns + 7) & !7;
         self.starts[ns..p].fill(u32::MAX);
+        // Entry sessions 0..=ns start empty; entry ns is never read.
+        self.top[..=ns].fill((0, 0));
         let tag = self.next_tag();
-        let epoch = self.epoch;
         let mut nl = 0usize;
         let starts = &self.starts[..p];
         let (top, covered, local, runs) = (&mut self.top[..], &mut self.covered[..], &mut self.local[..], &mut self.runs[..]);
         clicks.for_each(|h| {
-            // Session i holds the click when start - WEEK <= ts <= start:
-            // a = #(start < ts) sessions come before, b = #(start <= ts + WEEK).
-            let (a, b) = below(starts, h.ts, h.ts.saturating_add(WEEK + 1));
-            // Per entry session the best click: epoch << 32 | 1 + time, its ID
-            // and campaign. An entry left by an earlier person loses to any
-            // click of this one, so nothing needs clearing. a <= b <= ns <= 64.
+            // Session i holds the click when start - WEEK <= ts <= start. The
+            // lanes below ts are the sessions before its entry session a;
+            // the lanes below ts + WEEK + 1 but not below ts hold the click.
+            let (bx, by) = lanes_below(starts, h.ts, h.ts.saturating_add(WEEK + 1));
+            let a = bx.count_ones() as usize;
+            let m = by & !bx;
+            // Per entry session the best click: 1 + time << 32 | campaign,
+            // and its ID. a <= ns <= 64.
             // SAFETY: `top` has 65 entries.
             let top = unsafe { top.get_unchecked_mut(a) };
-            let (t, id, camp) = *top;
-            let t2 = epoch << 32 | u64::from(h.ts) + 1;
+            let (t, id) = *top;
+            let t2 = (u64::from(h.ts) + 1) << 32 | u64::from(h.camp);
             // Computed before the time test, which keeps this free of branches.
             let smaller = id_lt(h.id, id, slow);
-            let better = t2 > t || (t2 == t && smaller);
-            *top = (if better { t2 } else { t }, if better { h.id } else { id }, if better { h.camp } else { camp });
+            let better = t2 >> 32 > t >> 32 || (t2 >> 32 == t >> 32 && smaller);
+            *top = (if better { t2 } else { t }, if better { h.id } else { id });
             let k = usize::from(h.camp);
-            let c = covered[k];
+            debug_assert!(k < covered.len() && nl < runs.len());
+            // SAFETY: a valid click's campaign is below `organic`, the
+            // length of `covered`; nl <= organic < runs.len().
+            let c = unsafe { *covered.get_unchecked(k) };
             let new = c >> 16 != tag;
+            // The slot a new campaign takes starts from an empty mask;
+            // writing it every time keeps the choice out of a branch.
+            unsafe { *runs.get_unchecked_mut(nl) = 0 };
             let x = if new { nl } else { (c & 0xffff) as usize };
             nl += usize::from(new);
-            covered[k] = tag << 16 | x as u32;
-            // A new local number starts from an empty mask.
-            let keep = u64::from(new).wrapping_sub(1);
-            local[x] = h.camp;
-            runs[x] = (LOW[b] & !LOW[a]) | (runs[x] & keep);
+            // SAFETY: x < nl <= organic.
+            unsafe {
+                *covered.get_unchecked_mut(k) = tag << 16 | x as u32;
+                *local.get_unchecked_mut(x) = h.camp;
+                *runs.get_unchecked_mut(x) |= m;
+            }
         });
         // Later entry sessions hold strictly later clicks, so a filled entry
         // always replaces the carried one. The same pass records each
@@ -217,14 +218,15 @@ impl Acc {
         let (mut t, mut camp) = (0u32, 0u16);
         let mut mask = 0u64;
         for i in 0..ns {
-            let (t2, _, camp2) = self.top[i];
-            let take = t2 >> 32 == epoch;
-            (t, camp) = (if take { t2 as u32 } else { t }, if take { camp2 } else { camp });
-            let d = day_index(self.starts[i]);
+            let (t2, _) = self.top[i];
+            let take = t2 != 0;
+            (t, camp) = (if take { (t2 >> 32) as u32 } else { t }, if take { t2 as u16 } else { camp });
+            let start = self.starts[i];
+            let d = day_index(start);
             self.day_of[i] = d as u8;
             self.on_day[d] |= 1 << i;
             mask |= 1 << d;
-            let c = if t > self.starts[i] - WEEK { usize::from(camp) } else { self.organic };
+            let c = if t > start - WEEK { usize::from(camp) } else { self.organic };
             self.credit(i, c, d);
         }
         for x in 0..nl {
@@ -514,18 +516,18 @@ impl Acc {
             return;
         }
         // Up to two chunks hold at most fourteen events: those are sorted.
-        let (last, prev) = events.last();
+        let (block, n, prev) = events.last_block();
         let ns = if prev == 0 {
             let mut v = [u64::MAX; 16];
-            v[..last.len()].copy_from_slice(last);
-            self.sessions_sorted(&mut v, last.len())
+            pad_copy(&mut v[..8], block, n);
+            self.sessions_sorted(&mut v, n)
         } else {
             let (full, before) = events.full(prev);
             if before == 0 {
                 let mut v = [u64::MAX; 16];
                 v[..7].copy_from_slice(full);
-                v[7..7 + last.len()].copy_from_slice(last);
-                self.sessions_sorted(&mut v, 7 + last.len())
+                pad_copy(&mut v[7..15], block, n);
+                self.sessions_sorted(&mut v, 7 + n)
             } else {
                 self.sessions_bucketed(events)
             }
@@ -638,6 +640,65 @@ fn below(a: &[u32], x: u32, y: u32) -> (usize, usize) {
     (cx, cy)
 }
 
+/// Which entries of a sorted slice of at most 64, a multiple of eight long,
+/// are below x and below y, as lane bit masks. The three versions compute
+/// the same masks.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn lanes_below(a: &[u32], x: u32, y: u32) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: AVX2 is a compile-time target feature here; every chunk holds
+    // eight u32 values, and unaligned loads need no alignment.
+    unsafe {
+        let flip = _mm256_set1_epi32(i32::MIN);
+        let vx = _mm256_xor_si256(_mm256_set1_epi32(x as i32), flip);
+        let vy = _mm256_xor_si256(_mm256_set1_epi32(y as i32), flip);
+        let (mut bx, mut by) = (0u64, 0u64);
+        for (j, c) in a.chunks_exact(8).enumerate() {
+            let v = _mm256_xor_si256(_mm256_loadu_si256(c.as_ptr().cast()), flip);
+            bx |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vx, v))) as u32 as u64) << (8 * j);
+            by |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vy, v))) as u32 as u64) << (8 * j);
+        }
+        (bx, by)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn lanes_below(a: &[u32], x: u32, y: u32) -> (u64, u64) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is always present on aarch64; every chunk holds eight u32
+    // values, loaded from in-bounds pointers.
+    unsafe {
+        let vx = vdupq_n_u32(x);
+        let vy = vdupq_n_u32(y);
+        // A true lane is all ones: keep its lane bit and add the lanes up.
+        let lo_bits = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+        let hi_bits = vld1q_u32([16u32, 32, 64, 128].as_ptr());
+        let (mut bx, mut by) = (0u64, 0u64);
+        for (j, c) in a.chunks_exact(8).enumerate() {
+            let lo = vld1q_u32(c.as_ptr());
+            let hi = vld1q_u32(c.as_ptr().add(4));
+            let mx = vaddvq_u32(vorrq_u32(vandq_u32(vcgtq_u32(vx, lo), lo_bits), vandq_u32(vcgtq_u32(vx, hi), hi_bits)));
+            let my = vaddvq_u32(vorrq_u32(vandq_u32(vcgtq_u32(vy, lo), lo_bits), vandq_u32(vcgtq_u32(vy, hi), hi_bits)));
+            bx |= u64::from(mx) << (8 * j);
+            by |= u64::from(my) << (8 * j);
+        }
+        (bx, by)
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+#[inline(always)]
+fn lanes_below(a: &[u32], x: u32, y: u32) -> (u64, u64) {
+    let (mut bx, mut by) = (0u64, 0u64);
+    for (j, &s) in a.iter().enumerate() {
+        bx |= u64::from(s < x) << j;
+        by |= u64::from(s < y) << j;
+    }
+    (bx, by)
+}
+
 /// `below` over a long slice in two steps: `summary` holds the last entry
 /// of each chunk of eight (padded with u32::MAX, like the slice), so the
 /// chunks wholly below a value are counted first, then that value's chunk.
@@ -685,6 +746,16 @@ fn sort16(v: &mut [u64; 16]) {
         (3, 4), (5, 6), (7, 8), (9, 10), (11, 12),
         (6, 7), (8, 9),
     );
+}
+
+/// The first n slots of a chunk's block, the rest padded with MAX: eight
+/// selects rather than a copy whose length depends on the data.
+#[inline(always)]
+fn pad_copy(dst: &mut [u64], block: &[u64; 8], n: usize) {
+    let dst: &mut [u64; 8] = dst.try_into().unwrap();
+    for i in 0..8 {
+        dst[i] = if i < n { block[i] } else { u64::MAX };
+    }
 }
 
 #[inline]
